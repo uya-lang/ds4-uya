@@ -1,0 +1,501 @@
+use ds4.kernels.kernels_f16_load;
+use ds4.kernels.kernels_f32_dot;
+use ds4.moe.moe_matvec;
+use ds4.tensor.TensorDType;
+use ds4.tensor.TensorView;
+use libc.expf;
+use libc.sqrtf;
+
+const FLASH_NEG_INF: f32 = -1000000000.0f32;
+
+fn flash_sigmoid(x: f32) f32 {
+    if x >= 0.0f32 {
+        const e: f32 = expf(-x);
+        return 1.0f32 / (1.0f32 + e);
+    }
+    const e2: f32 = expf(x);
+    return e2 / (1.0f32 + e2);
+}
+
+fn flash_view_f32_at(view: &TensorView, idx: u64) f32 {
+    if view == null || view.data == null {
+        return 0.0f32;
+    }
+    if view.dtype == TensorDType.F32 {
+        const data: &const f32 = view.data as &const f32;
+        return data[idx as usize];
+    }
+    if view.dtype == TensorDType.F16 {
+        return kernels_f16_load(view.data as &const byte, idx);
+    }
+    return 0.0f32;
+}
+
+fn flash_rms_norm_no_weight(out: &f32, x: &const f32, n: u64, eps: f32) void {
+    var ss: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < n {
+        ss = ss + x[i as usize] * x[i as usize];
+        i = i + 1;
+    }
+    const inv: f32 = 1.0f32 / sqrtf(ss / (n as f32) + eps);
+    i = 0;
+    while i < n {
+        out[i as usize] = x[i as usize] * inv;
+        i = i + 1;
+    }
+}
+
+export fn flash_hc_split_sinkhorn_one(
+    out: &f32,
+    mix: &const f32,
+    scale: &const f32,
+    base: &const f32,
+    n_hc: u64,
+    iters: u64,
+    eps: f32,
+    tmp: &f32,
+) bool {
+    if out == null || mix == null || scale == null || base == null || tmp == null || n_hc == 0 {
+        return false;
+    }
+
+    const pre_scale: f32 = scale[0];
+    const post_scale: f32 = scale[1];
+    const comb_scale: f32 = scale[2];
+
+    var i: u64 = 0;
+    while i < n_hc {
+        const z: f32 = mix[i as usize] * pre_scale + base[i as usize];
+        out[i as usize] = flash_sigmoid(z) + eps;
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < n_hc {
+        const off: u64 = n_hc + i;
+        const z2: f32 = mix[off as usize] * post_scale + base[off as usize];
+        out[off as usize] = 2.0f32 * flash_sigmoid(z2);
+        i = i + 1;
+    }
+
+    var dst: u64 = 0;
+    while dst < n_hc {
+        var row_max: f32 = FLASH_NEG_INF;
+        var src: u64 = 0;
+        while src < n_hc {
+            const idx: u64 = src + dst * n_hc;
+            const off2: u64 = 2 * n_hc + idx;
+            const v: f32 = mix[off2 as usize] * comb_scale + base[off2 as usize];
+            tmp[idx as usize] = v;
+            if v > row_max {
+                row_max = v;
+            }
+            src = src + 1;
+        }
+
+        var row_sum: f32 = 0.0f32;
+        src = 0;
+        while src < n_hc {
+            const idx2: u64 = src + dst * n_hc;
+            const ev: f32 = expf(tmp[idx2 as usize] - row_max);
+            tmp[idx2 as usize] = ev;
+            row_sum = row_sum + ev;
+            src = src + 1;
+        }
+        const inv: f32 = 1.0f32 / row_sum;
+        src = 0;
+        while src < n_hc {
+            const idx3: u64 = src + dst * n_hc;
+            tmp[idx3 as usize] = tmp[idx3 as usize] * inv + eps;
+            src = src + 1;
+        }
+        dst = dst + 1;
+    }
+
+    var src2: u64 = 0;
+    while src2 < n_hc {
+        var sum: f32 = 0.0f32;
+        dst = 0;
+        while dst < n_hc {
+            sum = sum + tmp[(src2 + dst * n_hc) as usize];
+            dst = dst + 1;
+        }
+        const inv2: f32 = 1.0f32 / (sum + eps);
+        dst = 0;
+        while dst < n_hc {
+            const idx4: u64 = src2 + dst * n_hc;
+            tmp[idx4 as usize] = tmp[idx4 as usize] * inv2;
+            dst = dst + 1;
+        }
+        src2 = src2 + 1;
+    }
+
+    var iter: u64 = 1;
+    while iter < iters {
+        dst = 0;
+        while dst < n_hc {
+            var sum2: f32 = 0.0f32;
+            var src3: u64 = 0;
+            while src3 < n_hc {
+                sum2 = sum2 + tmp[(src3 + dst * n_hc) as usize];
+                src3 = src3 + 1;
+            }
+            const inv3: f32 = 1.0f32 / (sum2 + eps);
+            src3 = 0;
+            while src3 < n_hc {
+                const idx5: u64 = src3 + dst * n_hc;
+                tmp[idx5 as usize] = tmp[idx5 as usize] * inv3;
+                src3 = src3 + 1;
+            }
+            dst = dst + 1;
+        }
+
+        src2 = 0;
+        while src2 < n_hc {
+            var sum3: f32 = 0.0f32;
+            var dst2: u64 = 0;
+            while dst2 < n_hc {
+                sum3 = sum3 + tmp[(src2 + dst2 * n_hc) as usize];
+                dst2 = dst2 + 1;
+            }
+            const inv4: f32 = 1.0f32 / (sum3 + eps);
+            dst2 = 0;
+            while dst2 < n_hc {
+                const idx6: u64 = src2 + dst2 * n_hc;
+                tmp[idx6 as usize] = tmp[idx6 as usize] * inv4;
+                dst2 = dst2 + 1;
+            }
+            src2 = src2 + 1;
+        }
+        iter = iter + 1;
+    }
+
+    i = 0;
+    while i < n_hc * n_hc {
+        out[(2 * n_hc + i) as usize] = tmp[i as usize];
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn flash_hc_weighted_sum_one(out: &f32, x_hc: &const f32, weights: &const f32, n_embd: u64, n_hc: u64) bool {
+    if out == null || x_hc == null || weights == null || n_embd == 0 || n_hc == 0 {
+        return false;
+    }
+    var d: u64 = 0;
+    while d < n_embd {
+        var acc: f32 = 0.0f32;
+        var h: u64 = 0;
+        while h < n_hc {
+            acc = acc + x_hc[(h * n_embd + d) as usize] * weights[h as usize];
+            h = h + 1;
+        }
+        out[d as usize] = acc;
+        d = d + 1;
+    }
+    return true;
+}
+
+export fn flash_hc_pre_from_state_one(
+    out: &f32,
+    post: &f32,
+    comb: &f32,
+    fn_weight: &TensorView,
+    scale: &TensorView,
+    base: &TensorView,
+    residual_hc: &const f32,
+    n_embd: u64,
+    n_hc: u64,
+    eps: f32,
+    flat: &f32,
+    mix: &f32,
+    split: &f32,
+    sinkhorn_tmp: &f32,
+) bool {
+    const hc_dim: u64 = n_embd * n_hc;
+    const mix_dim: u64 = 2 * n_hc + n_hc * n_hc;
+    if fn_weight == null || scale == null || base == null ||
+        scale.data == null || base.data == null ||
+        scale.n_dims != 1 || scale.shape[0] < 3 ||
+        base.n_dims != 1 || base.shape[0] < mix_dim {
+        return false;
+    }
+    flash_rms_norm_no_weight(flat, residual_hc, hc_dim, eps);
+    if !moe_matvec(mix, fn_weight, flat, mix_dim, hc_dim) {
+        return false;
+    }
+    const scale_data: &const f32 = scale.data as &const f32;
+    const base_data: &const f32 = base.data as &const f32;
+    if !flash_hc_split_sinkhorn_one(split, mix, scale_data, base_data, n_hc, 20, eps, sinkhorn_tmp) {
+        return false;
+    }
+    if !flash_hc_weighted_sum_one(out, residual_hc, split, n_embd, n_hc) {
+        return false;
+    }
+
+    var i: u64 = 0;
+    while i < n_hc {
+        post[i as usize] = split[(n_hc + i) as usize];
+        i = i + 1;
+    }
+    i = 0;
+    while i < n_hc * n_hc {
+        comb[i as usize] = split[(2 * n_hc + i) as usize];
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn flash_hc_post_one(out_hc: &f32, block_out: &const f32, residual_hc: &const f32, post: &const f32, comb: &const f32, n_embd: u64, n_hc: u64) bool {
+    if out_hc == null || block_out == null || residual_hc == null || post == null || comb == null {
+        return false;
+    }
+    var dst: u64 = 0;
+    while dst < n_hc {
+        var d: u64 = 0;
+        while d < n_embd {
+            var acc: f32 = block_out[d as usize] * post[dst as usize];
+            var src: u64 = 0;
+            while src < n_hc {
+                acc = acc + comb[(dst + src * n_hc) as usize] * residual_hc[(src * n_embd + d) as usize];
+                src = src + 1;
+            }
+            out_hc[(dst * n_embd + d) as usize] = acc;
+            d = d + 1;
+        }
+        dst = dst + 1;
+    }
+    return true;
+}
+
+export fn flash_compressor_pool_decode_state(out: &f32, state_kv: &f32, state_score: &f32, head_dim: u64, compress_ratio: u64) bool {
+    if out == null || state_kv == null || state_score == null || head_dim == 0 || compress_ratio == 0 {
+        return false;
+    }
+    var coff: u64 = 1;
+    if compress_ratio == 4 {
+        coff = 2;
+    }
+    const width: u64 = coff * head_dim;
+    var j: u64 = 0;
+    while j < head_dim {
+        var max_score: f32 = FLASH_NEG_INF;
+        var r: u64 = 0;
+        if compress_ratio == 4 {
+            while r < compress_ratio {
+                const sp: f32 = state_score[(r * width + j) as usize];
+                const sc: f32 = state_score[((compress_ratio + r) * width + head_dim + j) as usize];
+                if sp > max_score { max_score = sp; }
+                if sc > max_score { max_score = sc; }
+                r = r + 1;
+            }
+        } else {
+            while r < compress_ratio {
+                const s: f32 = state_score[(r * width + j) as usize];
+                if s > max_score { max_score = s; }
+                r = r + 1;
+            }
+        }
+
+        if max_score <= FLASH_NEG_INF * 0.5f32 {
+            out[j as usize] = 0.0f32;
+            j = j + 1;
+            continue;
+        }
+
+        var denom: f32 = 0.0f32;
+        var sum: f32 = 0.0f32;
+        r = 0;
+        if compress_ratio == 4 {
+            while r < compress_ratio {
+                const wp: f32 = expf(state_score[(r * width + j) as usize] - max_score);
+                const wc: f32 = expf(state_score[((compress_ratio + r) * width + head_dim + j) as usize] - max_score);
+                denom = denom + wp + wc;
+                sum = sum + wp * state_kv[(r * width + j) as usize];
+                sum = sum + wc * state_kv[((compress_ratio + r) * width + head_dim + j) as usize];
+                r = r + 1;
+            }
+        } else {
+            while r < compress_ratio {
+                const w: f32 = expf(state_score[(r * width + j) as usize] - max_score);
+                denom = denom + w;
+                sum = sum + w * state_kv[(r * width + j) as usize];
+                r = r + 1;
+            }
+        }
+        if denom > 0.0f32 {
+            out[j as usize] = sum / denom;
+        } else {
+            out[j as usize] = 0.0f32;
+        }
+        j = j + 1;
+    }
+    return true;
+}
+
+export fn flash_compressor_decode_one(
+    out_comp: &f32,
+    wkv: &TensorView,
+    wgate: &TensorView,
+    ape: &TensorView,
+    norm: &TensorView,
+    x: &const f32,
+    state_kv: &f32,
+    state_score: &f32,
+    head_dim: u64,
+    compress_ratio: u64,
+    pos: u64,
+    kv_cur: &f32,
+    sc_cur: &f32,
+    pooled: &f32,
+) bool {
+    if compress_ratio == 0 || head_dim == 0 || wkv == null || wgate == null || ape == null || norm == null {
+        return false;
+    }
+    var coff: u64 = 1;
+    if compress_ratio == 4 {
+        coff = 2;
+    }
+    const width: u64 = coff * head_dim;
+    if wkv.n_dims != 2 || wgate.n_dims != 2 || wkv.shape[1] != width ||
+        wgate.shape[1] != width || wkv.shape[0] != wgate.shape[0] ||
+        ape.n_dims != 2 || ape.shape[0] < width || ape.shape[1] < compress_ratio ||
+        norm.n_dims != 1 || norm.shape[0] < head_dim {
+        return false;
+    }
+    const pos_mod: u64 = pos % compress_ratio;
+    var row: u64 = pos_mod;
+    if compress_ratio == 4 {
+        row = compress_ratio + pos_mod;
+    }
+    const should_compress: bool = ((pos + 1) % compress_ratio) == 0;
+
+    if !moe_matvec(kv_cur, wkv, x, width, wkv.shape[0]) ||
+        !moe_matvec(sc_cur, wgate, x, width, wgate.shape[0]) {
+        return false;
+    }
+    var j: u64 = 0;
+    while j < width {
+        sc_cur[j as usize] = sc_cur[j as usize] + flash_view_f32_at(ape, j + pos_mod * ape.shape[0]);
+        state_kv[(row * width + j) as usize] = kv_cur[j as usize];
+        state_score[(row * width + j) as usize] = sc_cur[j as usize];
+        j = j + 1;
+    }
+
+    if !should_compress {
+        return false;
+    }
+    if !flash_compressor_pool_decode_state(pooled, state_kv, state_score, head_dim, compress_ratio) {
+        return false;
+    }
+
+    var ss: f32 = 0.0f32;
+    j = 0;
+    while j < head_dim {
+        ss = ss + pooled[j as usize] * pooled[j as usize];
+        j = j + 1;
+    }
+    const inv_rms: f32 = 1.0f32 / sqrtf(ss / (head_dim as f32) + 0.000001f32);
+    j = 0;
+    while j < head_dim {
+        out_comp[j as usize] = pooled[j as usize] * inv_rms * flash_view_f32_at(norm, j);
+        j = j + 1;
+    }
+
+    if compress_ratio == 4 {
+        var r: u64 = 0;
+        while r < compress_ratio {
+            j = 0;
+            while j < width {
+                state_kv[(r * width + j) as usize] = state_kv[((compress_ratio + r) * width + j) as usize];
+                state_score[(r * width + j) as usize] = state_score[((compress_ratio + r) * width + j) as usize];
+                j = j + 1;
+            }
+            r = r + 1;
+        }
+        r = 0;
+        while r < compress_ratio {
+            j = 0;
+            while j < width {
+                state_kv[((compress_ratio + r) * width + j) as usize] = state_kv[(r * width + j) as usize];
+                state_score[((compress_ratio + r) * width + j) as usize] = state_score[(r * width + j) as usize];
+                j = j + 1;
+            }
+            r = r + 1;
+        }
+    }
+    return true;
+}
+
+export fn flash_indexer_select_allowed(
+    allowed: &bool,
+    cur: &const f32,
+    qr_norm: &const f32,
+    index_comp: &const f32,
+    n_comp: u64,
+    n_head: u64,
+    head_dim: u64,
+    top_k: u64,
+    q_proj: &TensorView,
+    weights_proj: &TensorView,
+    q: &f32,
+    weights: &f32,
+    scores: &f32,
+) bool {
+    if n_comp == 0 || n_head == 0 || head_dim == 0 || top_k == 0 ||
+        allowed == null || cur == null || qr_norm == null || index_comp == null {
+        return false;
+    }
+    const q_dim: u64 = n_head * head_dim;
+    if !moe_matvec(q, q_proj, qr_norm, q_dim, q_proj.shape[0]) ||
+        !moe_matvec(weights, weights_proj, cur, n_head, weights_proj.shape[0]) {
+        return false;
+    }
+    const scale: f32 = 1.0f32 / sqrtf(q_dim as f32);
+    var h: u64 = 0;
+    while h < n_head {
+        weights[h as usize] = weights[h as usize] * scale;
+        h = h + 1;
+    }
+
+    var c: u64 = 0;
+    while c < n_comp {
+        allowed[c as usize] = false;
+        var s: f32 = 0.0f32;
+        h = 0;
+        while h < n_head {
+            const qh: &const f32 = &q[(h * head_dim) as usize] as &const f32;
+            const kv: &const f32 = &index_comp[(c * head_dim) as usize] as &const f32;
+            var dot: f32 = kernels_f32_dot(kv, qh, head_dim);
+            if dot < 0.0f32 {
+                dot = 0.0f32;
+            }
+            s = s + dot * weights[h as usize];
+            h = h + 1;
+        }
+        scores[c as usize] = s;
+        c = c + 1;
+    }
+
+    var k_limit: u64 = n_comp;
+    if top_k < n_comp {
+        k_limit = top_k;
+    }
+    var k: u64 = 0;
+    while k < k_limit {
+        var best: u64 = 0;
+        var best_score: f32 = FLASH_NEG_INF;
+        c = 0;
+        while c < n_comp {
+            if !allowed[c as usize] && scores[c as usize] > best_score {
+                best = c;
+                best_score = scores[c as usize];
+            }
+            c = c + 1;
+        }
+        allowed[best as usize] = true;
+        k = k + 1;
+    }
+    return true;
+}

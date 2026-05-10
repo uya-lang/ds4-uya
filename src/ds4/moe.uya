@@ -1,7 +1,24 @@
+use ds4.kernels.kernels_f16_load;
+use ds4.kernels.kernels_f32_dot;
+use ds4.kernels.kernels_iq2_s_dot_f32;
+use ds4.kernels.kernels_iq2_xs_dot_f32;
+use ds4.kernels.kernels_iq2_xxs_dot_f32;
+use ds4.kernels.kernels_q2_k_dot_f32;
+use ds4.kernels.kernels_q4_k_dot_f32;
+use ds4.kernels.kernels_q8_0_dot_f32;
+use ds4.tensor.TensorDType;
+use ds4.tensor.TensorView;
+use ds4.tensor.TensorWeightTable;
+use ds4.tensor.tensor_weight_table_find;
+use libc.expf;
 use libc.free;
+use libc.logf;
 use libc.malloc;
+use libc.snprintf;
+use libc.sqrtf;
 
 const MOE_U64_MAX: u64 = 0xffffffffffffffff;
+const MOE_MIN_ROUTE_SUM: f32 = 0.00006103515625f32;
 
 export struct MoeDispatchPlan {
     n_tokens: u64,
@@ -15,6 +32,27 @@ export struct MoeDispatchPlan {
     ranks: &u64,
 }
 
+export struct MoeConfig {
+    n_embd: u64,
+    n_expert: u64,
+    n_expert_used: u64,
+    n_ff: u64,
+    expert_weight_scale: f32,
+    swiglu_clamp: f32,
+}
+
+export struct MoeLayerWeights {
+    ffn_gate_tid2eid: &TensorView,
+    ffn_gate_inp: &TensorView,
+    ffn_exp_probs_b: &TensorView,
+    ffn_gate_exps: &TensorView,
+    ffn_up_exps: &TensorView,
+    ffn_down_exps: &TensorView,
+    ffn_gate_shexp: &TensorView,
+    ffn_up_shexp: &TensorView,
+    ffn_down_shexp: &TensorView,
+}
+
 export fn moe_dispatch_plan_init() MoeDispatchPlan {
     return MoeDispatchPlan{
         n_tokens: 0,
@@ -26,6 +64,31 @@ export fn moe_dispatch_plan_init() MoeDispatchPlan {
         next: null,
         token_ids: null,
         ranks: null,
+    };
+}
+
+export fn moe_config_init(n_embd: u64, n_expert: u64, n_expert_used: u64, n_ff: u64) MoeConfig {
+    return MoeConfig{
+        n_embd: n_embd,
+        n_expert: n_expert,
+        n_expert_used: n_expert_used,
+        n_ff: n_ff,
+        expert_weight_scale: 1.5f32,
+        swiglu_clamp: 10.0f32,
+    };
+}
+
+export fn moe_layer_weights_init() MoeLayerWeights {
+    return MoeLayerWeights{
+        ffn_gate_tid2eid: null,
+        ffn_gate_inp: null,
+        ffn_exp_probs_b: null,
+        ffn_gate_exps: null,
+        ffn_up_exps: null,
+        ffn_down_exps: null,
+        ffn_gate_shexp: null,
+        ffn_up_shexp: null,
+        ffn_down_shexp: null,
     };
 }
 
@@ -120,6 +183,439 @@ export fn moe_dispatch_plan_build(expert_ids: &const i32, n_tokens: u64, top_k: 
     plan.n_expert = n_expert;
     plan.n_items = n_items;
     return true;
+}
+
+fn moe_make_layer_name(out: &byte, cap: usize, layer: u64, suffix: &const byte) bool {
+    const rc: i32 = snprintf(out, cap, "blk.%llu.%s\0" as &const byte, layer, suffix);
+    return rc > 0 && (rc as usize) < cap;
+}
+
+fn moe_find_layer_tensor(table: &TensorWeightTable, layer: u64, suffix: &const byte) &TensorView {
+    var name: [byte: 128] = [];
+    if !moe_make_layer_name(&name[0], 128, layer, suffix) {
+        return null;
+    }
+    return tensor_weight_table_find(table, &name[0] as &const byte);
+}
+
+fn moe_dtype_is_matvec_supported(dtype: TensorDType) bool {
+    return dtype == TensorDType.F32 || dtype == TensorDType.F16 ||
+        dtype == TensorDType.Q8_0 || dtype == TensorDType.Q2_K ||
+        dtype == TensorDType.Q4_K || dtype == TensorDType.IQ2_XXS ||
+        dtype == TensorDType.IQ2_XS || dtype == TensorDType.IQ2_S;
+}
+
+fn moe_view_is_matrix(view: &TensorView, in_dim: u64, out_dim: u64) bool {
+    return view != null && view.n_dims == 2 && view.shape[0] == in_dim &&
+        view.shape[1] == out_dim && moe_dtype_is_matvec_supported(view.dtype);
+}
+
+fn moe_view_is_vector_f32(view: &TensorView, n: u64) bool {
+    return view != null && view.n_dims == 1 && view.shape[0] == n && view.dtype == TensorDType.F32;
+}
+
+fn moe_view_is_i32_hash(view: &TensorView, top_k: u64, n_vocab: u64) bool {
+    return view != null && view.n_dims == 2 && view.dtype == TensorDType.I32 &&
+        view.shape[0] == top_k && view.shape[1] >= n_vocab;
+}
+
+fn moe_view_is_expert_matrix(view: &TensorView, in_dim: u64, out_dim: u64, n_expert: u64) bool {
+    return view != null && view.n_dims == 3 && view.shape[0] == in_dim &&
+        view.shape[1] == out_dim && view.shape[2] == n_expert &&
+        moe_dtype_is_matvec_supported(view.dtype);
+}
+
+export fn moe_layer_weights_validate(layer: &MoeLayerWeights, config: &MoeConfig) bool {
+    if config.n_embd == 0 || config.n_expert == 0 || config.n_expert_used == 0 || config.n_ff == 0 {
+        return false;
+    }
+    if layer.ffn_gate_tid2eid != null && !moe_view_is_i32_hash(layer.ffn_gate_tid2eid, config.n_expert_used, 1) {
+        return false;
+    }
+    if !moe_view_is_matrix(layer.ffn_gate_inp, config.n_embd, config.n_expert) {
+        return false;
+    }
+    if layer.ffn_exp_probs_b != null && !moe_view_is_vector_f32(layer.ffn_exp_probs_b, config.n_expert) {
+        return false;
+    }
+    return moe_view_is_expert_matrix(layer.ffn_gate_exps, config.n_embd, config.n_ff, config.n_expert) &&
+        moe_view_is_expert_matrix(layer.ffn_up_exps, config.n_embd, config.n_ff, config.n_expert) &&
+        moe_view_is_expert_matrix(layer.ffn_down_exps, config.n_ff, config.n_embd, config.n_expert) &&
+        moe_view_is_matrix(layer.ffn_gate_shexp, config.n_embd, config.n_ff) &&
+        moe_view_is_matrix(layer.ffn_up_shexp, config.n_embd, config.n_ff) &&
+        moe_view_is_matrix(layer.ffn_down_shexp, config.n_ff, config.n_embd);
+}
+
+export fn moe_layer_weights_bind_from_table(table: &TensorWeightTable, layer_index: u64, out: &MoeLayerWeights) bool {
+    *out = moe_layer_weights_init();
+    out.ffn_gate_tid2eid = moe_find_layer_tensor(table, layer_index, "ffn_gate_tid2eid.weight\0" as &const byte);
+    out.ffn_gate_inp = moe_find_layer_tensor(table, layer_index, "ffn_gate_inp.weight\0" as &const byte);
+    out.ffn_exp_probs_b = moe_find_layer_tensor(table, layer_index, "exp_probs_b.bias\0" as &const byte);
+    out.ffn_gate_exps = moe_find_layer_tensor(table, layer_index, "ffn_gate_exps.weight\0" as &const byte);
+    out.ffn_up_exps = moe_find_layer_tensor(table, layer_index, "ffn_up_exps.weight\0" as &const byte);
+    out.ffn_down_exps = moe_find_layer_tensor(table, layer_index, "ffn_down_exps.weight\0" as &const byte);
+    out.ffn_gate_shexp = moe_find_layer_tensor(table, layer_index, "ffn_gate_shexp.weight\0" as &const byte);
+    out.ffn_up_shexp = moe_find_layer_tensor(table, layer_index, "ffn_up_shexp.weight\0" as &const byte);
+    out.ffn_down_shexp = moe_find_layer_tensor(table, layer_index, "ffn_down_shexp.weight\0" as &const byte);
+    return out.ffn_gate_inp != null && out.ffn_gate_exps != null && out.ffn_up_exps != null &&
+        out.ffn_down_exps != null && out.ffn_gate_shexp != null && out.ffn_up_shexp != null &&
+        out.ffn_down_shexp != null;
+}
+
+fn moe_byte_ptr_add(data: &byte, off: u64) &const byte {
+    const base: usize = @usize_from_ptr(data as &void);
+    return @ptr_from_usize(base + (off as usize)) as &const byte;
+}
+
+export fn moe_matvec(out: &f32, view: &TensorView, x: &const f32, out_dim: u64, in_dim: u64) bool {
+    if view == null || view.data == null || view.n_dims != 2 || view.shape[0] != in_dim || view.shape[1] != out_dim {
+        return false;
+    }
+    if view.dtype == TensorDType.F32 {
+        var row: u64 = 0;
+        const data: &const f32 = view.data as &const f32;
+        while row < out_dim {
+            out[row as usize] = kernels_f32_dot(&data[(row * in_dim) as usize], x, in_dim);
+            row = row + 1;
+        }
+        return true;
+    }
+    if view.dtype == TensorDType.F16 {
+        var row2: u64 = 0;
+        while row2 < out_dim {
+            var acc: f32 = 0.0f32;
+            var col: u64 = 0;
+            const base: u64 = row2 * in_dim;
+            while col < in_dim {
+                acc = acc + kernels_f16_load(view.data as &const byte, base + col) * x[col as usize];
+                col = col + 1;
+            }
+            out[row2 as usize] = acc;
+            row2 = row2 + 1;
+        }
+        return true;
+    }
+    var qrow: u64 = 0;
+    while qrow < out_dim {
+        const row_data: &const byte = moe_byte_ptr_add(view.data, qrow * view.stride_bytes[1]);
+        if view.dtype == TensorDType.Q8_0 {
+            out[qrow as usize] = kernels_q8_0_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.Q2_K {
+            out[qrow as usize] = kernels_q2_k_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.Q4_K {
+            out[qrow as usize] = kernels_q4_k_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.IQ2_XXS {
+            out[qrow as usize] = kernels_iq2_xxs_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.IQ2_XS {
+            out[qrow as usize] = kernels_iq2_xs_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.IQ2_S {
+            out[qrow as usize] = kernels_iq2_s_dot_f32(row_data, x, in_dim);
+        } else {
+            return false;
+        }
+        qrow = qrow + 1;
+    }
+    return true;
+}
+
+export fn moe_expert_matvec(out: &f32, view: &TensorView, x: &const f32, expert: u64, out_dim: u64, in_dim: u64) bool {
+    if view == null || view.data == null || view.n_dims != 3 || view.shape[0] != in_dim ||
+        view.shape[1] != out_dim || expert >= view.shape[2] {
+        return false;
+    }
+    if view.dtype == TensorDType.F32 {
+        const base_off: u64 = expert * view.stride_bytes[2];
+        const data: &const f32 = moe_byte_ptr_add(view.data, base_off) as &const f32;
+        var row: u64 = 0;
+        while row < out_dim {
+            out[row as usize] = kernels_f32_dot(&data[(row * in_dim) as usize], x, in_dim);
+            row = row + 1;
+        }
+        return true;
+    }
+    if view.dtype == TensorDType.F16 {
+        const base_off2: u64 = expert * view.stride_bytes[2];
+        var row2: u64 = 0;
+        while row2 < out_dim {
+            var acc: f32 = 0.0f32;
+            var col: u64 = 0;
+            const elem_base: u64 = (base_off2 / 2) + row2 * in_dim;
+            while col < in_dim {
+                acc = acc + kernels_f16_load(view.data as &const byte, elem_base + col) * x[col as usize];
+                col = col + 1;
+            }
+            out[row2 as usize] = acc;
+            row2 = row2 + 1;
+        }
+        return true;
+    }
+    const expert_base: u64 = expert * view.stride_bytes[2];
+    var qrow: u64 = 0;
+    while qrow < out_dim {
+        const row_data: &const byte = moe_byte_ptr_add(view.data, expert_base + qrow * view.stride_bytes[1]);
+        if view.dtype == TensorDType.Q8_0 {
+            out[qrow as usize] = kernels_q8_0_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.Q2_K {
+            out[qrow as usize] = kernels_q2_k_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.Q4_K {
+            out[qrow as usize] = kernels_q4_k_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.IQ2_XXS {
+            out[qrow as usize] = kernels_iq2_xxs_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.IQ2_XS {
+            out[qrow as usize] = kernels_iq2_xs_dot_f32(row_data, x, in_dim);
+        } else if view.dtype == TensorDType.IQ2_S {
+            out[qrow as usize] = kernels_iq2_s_dot_f32(row_data, x, in_dim);
+        } else {
+            return false;
+        }
+        qrow = qrow + 1;
+    }
+    return true;
+}
+
+fn moe_silu(x: f32) f32 {
+    return x / (1.0f32 + expf(-x));
+}
+
+fn moe_softplus(x: f32) f32 {
+    if x > 20.0f32 {
+        return x;
+    }
+    if x < -20.0f32 {
+        return expf(x);
+    }
+    return logf(1.0f32 + expf(x));
+}
+
+fn moe_zero_f32(x: &f32, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        x[i as usize] = 0.0f32;
+        i = i + 1;
+    }
+}
+
+fn moe_router_probs(probs: &f32, layer: &MoeLayerWeights, config: &MoeConfig, x: &const f32) bool {
+    if !moe_matvec(probs, layer.ffn_gate_inp, x, config.n_expert, config.n_embd) {
+        return false;
+    }
+    var i: u64 = 0;
+    while i < config.n_expert {
+        probs[i as usize] = sqrtf(moe_softplus(probs[i as usize]));
+        i = i + 1;
+    }
+    return true;
+}
+
+fn moe_normalize_selected_weights(weights: &f32, selected: &i32, probs: &const f32, config: &MoeConfig) bool {
+    var sum: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < config.n_expert_used {
+        const expert: i32 = selected[i as usize];
+        if expert < 0 || (expert as u64) >= config.n_expert {
+            return false;
+        }
+        const w: f32 = probs[expert as usize];
+        weights[i as usize] = w;
+        sum = sum + w;
+        i = i + 1;
+    }
+    if sum < MOE_MIN_ROUTE_SUM {
+        sum = MOE_MIN_ROUTE_SUM;
+    }
+    i = 0;
+    while i < config.n_expert_used {
+        weights[i as usize] = weights[i as usize] / sum * config.expert_weight_scale;
+        i = i + 1;
+    }
+    return true;
+}
+
+fn moe_select_hash(selected: &i32, layer: &MoeLayerWeights, config: &MoeConfig, token_id: u64) bool {
+    const table: &TensorView = layer.ffn_gate_tid2eid;
+    if table == null || table.data == null || table.dtype != TensorDType.I32 ||
+        table.n_dims != 2 || table.shape[0] != config.n_expert_used || token_id >= table.shape[1] {
+        return false;
+    }
+    const data: &const i32 = table.data as &const i32;
+    var i: u64 = 0;
+    while i < config.n_expert_used {
+        selected[i as usize] = data[(token_id * config.n_expert_used + i) as usize];
+        i = i + 1;
+    }
+    return true;
+}
+
+fn moe_select_topk(selected: &i32, layer: &MoeLayerWeights, config: &MoeConfig, probs: &const f32) bool {
+    var i: u64 = 0;
+    while i < config.n_expert_used {
+        selected[i as usize] = -1;
+        i = i + 1;
+    }
+
+    var expert: u64 = 0;
+    while expert < config.n_expert {
+        var score: f32 = probs[expert as usize];
+        if layer.ffn_exp_probs_b != null {
+            const bias: &const f32 = layer.ffn_exp_probs_b.data as &const f32;
+            score = score + bias[expert as usize];
+        }
+        var slot: u64 = 0;
+        while slot < config.n_expert_used {
+            const cur: i32 = selected[slot as usize];
+            var cur_score: f32 = 0.0f32;
+            if cur >= 0 {
+                cur_score = probs[cur as usize];
+                if layer.ffn_exp_probs_b != null {
+                    const bias2: &const f32 = layer.ffn_exp_probs_b.data as &const f32;
+                    cur_score = cur_score + bias2[cur as usize];
+                }
+            }
+            if cur < 0 || score > cur_score {
+                var move: u64 = config.n_expert_used - 1;
+                while move > slot {
+                    selected[move as usize] = selected[(move - 1) as usize];
+                    move = move - 1;
+                }
+                selected[slot as usize] = expert as i32;
+                break;
+            }
+            slot = slot + 1;
+        }
+        expert = expert + 1;
+    }
+    return true;
+}
+
+fn moe_select_experts(selected: &i32, weights: &f32, layer: &MoeLayerWeights, config: &MoeConfig, x: &const f32, token_id: u64, probs: &f32) bool {
+    if !moe_router_probs(probs, layer, config, x) {
+        return false;
+    }
+    if layer.ffn_gate_tid2eid != null {
+        if !moe_select_hash(selected, layer, config, token_id) {
+            return false;
+        }
+    } else if !moe_select_topk(selected, layer, config, probs) {
+        return false;
+    }
+    return moe_normalize_selected_weights(weights, selected, probs, config);
+}
+
+fn moe_shared_forward(out: &f32, layer: &MoeLayerWeights, config: &MoeConfig, x: &const f32, gate: &f32, up: &f32, mid: &f32) bool {
+    if !moe_matvec(gate, layer.ffn_gate_shexp, x, config.n_ff, config.n_embd) ||
+        !moe_matvec(up, layer.ffn_up_shexp, x, config.n_ff, config.n_embd) {
+        return false;
+    }
+    var i: u64 = 0;
+    while i < config.n_ff {
+        mid[i as usize] = moe_silu(gate[i as usize]) * up[i as usize];
+        i = i + 1;
+    }
+    return moe_matvec(out, layer.ffn_down_shexp, mid, config.n_embd, config.n_ff);
+}
+
+fn moe_routed_forward(out: &f32, layer: &MoeLayerWeights, config: &MoeConfig, x: &const f32, token_id: u64, selected: &i32, route_weights: &f32, probs: &f32, gate: &f32, up: &f32, mid: &f32, down: &f32) bool {
+    moe_zero_f32(out, config.n_embd);
+    if !moe_select_experts(selected, route_weights, layer, config, x, token_id, probs) {
+        return false;
+    }
+
+    var slot: u64 = 0;
+    while slot < config.n_expert_used {
+        const expert: u64 = selected[slot as usize] as u64;
+        if !moe_expert_matvec(gate, layer.ffn_gate_exps, x, expert, config.n_ff, config.n_embd) ||
+            !moe_expert_matvec(up, layer.ffn_up_exps, x, expert, config.n_ff, config.n_embd) {
+            return false;
+        }
+
+        var j: u64 = 0;
+        while j < config.n_ff {
+            var g: f32 = gate[j as usize];
+            var u: f32 = up[j as usize];
+            if config.swiglu_clamp > 0.000001f32 {
+                if g > config.swiglu_clamp {
+                    g = config.swiglu_clamp;
+                }
+                if u > config.swiglu_clamp {
+                    u = config.swiglu_clamp;
+                }
+                if u < -config.swiglu_clamp {
+                    u = -config.swiglu_clamp;
+                }
+            }
+            mid[j as usize] = moe_silu(g) * u * route_weights[slot as usize];
+            j = j + 1;
+        }
+
+        if !moe_expert_matvec(down, layer.ffn_down_exps, mid, expert, config.n_embd, config.n_ff) {
+            return false;
+        }
+        j = 0;
+        while j < config.n_embd {
+            out[j as usize] = out[j as usize] + down[j as usize];
+            j = j + 1;
+        }
+        slot = slot + 1;
+    }
+    return true;
+}
+
+export fn moe_forward_one(
+    out: &f32,
+    layer: &MoeLayerWeights,
+    config: &MoeConfig,
+    x: &const f32,
+    token_id: u64,
+) bool {
+    if !moe_layer_weights_validate(layer, config) {
+        return false;
+    }
+
+    const selected: &i32 = malloc((config.n_expert_used as usize) * (@size_of(i32) as usize)) as &i32;
+    const route_weights: &f32 = malloc((config.n_expert_used as usize) * (@size_of(f32) as usize)) as &f32;
+    const probs: &f32 = malloc((config.n_expert as usize) * (@size_of(f32) as usize)) as &f32;
+    const gate: &f32 = malloc((config.n_ff as usize) * (@size_of(f32) as usize)) as &f32;
+    const up: &f32 = malloc((config.n_ff as usize) * (@size_of(f32) as usize)) as &f32;
+    const mid: &f32 = malloc((config.n_ff as usize) * (@size_of(f32) as usize)) as &f32;
+    const down: &f32 = malloc((config.n_embd as usize) * (@size_of(f32) as usize)) as &f32;
+    const routed: &f32 = malloc((config.n_embd as usize) * (@size_of(f32) as usize)) as &f32;
+    const shared: &f32 = malloc((config.n_embd as usize) * (@size_of(f32) as usize)) as &f32;
+    if selected == null || route_weights == null || probs == null || gate == null || up == null ||
+        mid == null || down == null || routed == null || shared == null {
+        if selected != null { free(selected as &void); }
+        if route_weights != null { free(route_weights as &void); }
+        if probs != null { free(probs as &void); }
+        if gate != null { free(gate as &void); }
+        if up != null { free(up as &void); }
+        if mid != null { free(mid as &void); }
+        if down != null { free(down as &void); }
+        if routed != null { free(routed as &void); }
+        if shared != null { free(shared as &void); }
+        return false;
+    }
+
+    var ok: bool = moe_routed_forward(routed, layer, config, x, token_id, selected, route_weights, probs, gate, up, mid, down);
+    if ok {
+        ok = moe_shared_forward(shared, layer, config, x, gate, up, mid);
+    }
+    if ok {
+        var i: u64 = 0;
+        while i < config.n_embd {
+            out[i as usize] = routed[i as usize] + shared[i as usize];
+            i = i + 1;
+        }
+    }
+
+    free(shared as &void);
+    free(routed as &void);
+    free(down as &void);
+    free(mid as &void);
+    free(up as &void);
+    free(gate as &void);
+    free(probs as &void);
+    free(route_weights as &void);
+    free(selected as &void);
+    return ok;
 }
 
 export fn moe_dispatch_expert_start(plan: &MoeDispatchPlan, expert: u64) u64 {

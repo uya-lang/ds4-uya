@@ -1,5 +1,9 @@
 use ds4.bench.BenchResult;
 use ds4.bench.bench_run_synthetic;
+use ds4.flash.flash_compressor_decode_one;
+use ds4.flash.flash_compressor_pool_decode_state;
+use ds4.flash.flash_hc_split_sinkhorn_one;
+use ds4.flash.flash_indexer_select_allowed;
 use ds4.kernels.kernels_f32_dot_reference;
 use ds4.kernels.kernels_f32_dot_simd;
 use ds4.kernels.kernels_q4_k_dot_f32_fast;
@@ -7,19 +11,26 @@ use ds4.kernels.kernels_q4_k_dot_f32_reference;
 use ds4.kernels.kernels_q8_0_dot_f32_fast;
 use ds4.kernels.kernels_q8_0_dot_f32_reference;
 use ds4.moe.MoeDispatchPlan;
+use ds4.moe.MoeConfig;
+use ds4.moe.MoeLayerWeights;
+use ds4.moe.moe_config_init;
 use ds4.moe.moe_dispatch_expert_end;
 use ds4.moe.moe_dispatch_expert_start;
 use ds4.moe.moe_dispatch_plan_build;
 use ds4.moe.moe_dispatch_plan_deinit;
 use ds4.moe.moe_dispatch_plan_init;
+use ds4.moe.moe_forward_one;
+use ds4.moe.moe_layer_weights_init;
 use ds4.tensor.TensorDType;
 use ds4.tensor.TensorKvCache;
+use ds4.tensor.TensorView;
 use ds4.tensor.tensor_kv_cache_deinit;
 use ds4.tensor.tensor_kv_cache_empty;
 use ds4.tensor.tensor_kv_cache_init;
 use ds4.tensor.tensor_kv_cache_key_offset;
 use ds4.tensor.tensor_kv_cache_key_row;
 use ds4.tensor.tensor_kv_cache_value_row;
+use ds4.tensor.tensor_view_init_memory;
 use libc.fabsf;
 use std.testing.assert_eq_i32;
 use std.testing.expect;
@@ -144,6 +155,224 @@ test "moe dispatch groups token routes by expert" {
     try assert_eq_i32(plan.token_ids[5] as i32, 1);
 
     moe_dispatch_plan_deinit(&plan);
+}
+
+test "moe forward routes top-k expert and shared path" {
+    var config: MoeConfig = moe_config_init(2, 2, 1, 1);
+    config.expert_weight_scale = 1.0f32;
+
+    var router: [f32: 4] = [];
+    router[0] = 0.0f32;
+    router[1] = 0.0f32;
+    router[2] = 0.5f32;
+    router[3] = 0.0f32;
+
+    var gate_exps: [f32: 4] = [];
+    gate_exps[2] = 0.5f32;
+    var up_exps: [f32: 4] = [];
+    up_exps[2] = 1.0f32;
+    var down_exps: [f32: 4] = [];
+    down_exps[2] = 2.0f32;
+    down_exps[3] = 3.0f32;
+
+    var shared_gate_data: [f32: 2] = [];
+    var shared_up_data: [f32: 2] = [];
+    var shared_down_data: [f32: 2] = [];
+
+    var views: [TensorView: 7] = [];
+    const router_v: &TensorView = &views[0];
+    const gate_v: &TensorView = &views[1];
+    const up_v: &TensorView = &views[2];
+    const down_v: &TensorView = &views[3];
+    const shared_gate_v: &TensorView = &views[4];
+    const shared_up_v: &TensorView = &views[5];
+    const shared_down_v: &TensorView = &views[6];
+    try expect(tensor_view_init_memory(&router[0] as &byte, TensorDType.F32, 2, 2, 2, 0, 0, false, router_v));
+    try expect(tensor_view_init_memory(&gate_exps[0] as &byte, TensorDType.F32, 3, 2, 1, 2, 0, false, gate_v));
+    try expect(tensor_view_init_memory(&up_exps[0] as &byte, TensorDType.F32, 3, 2, 1, 2, 0, false, up_v));
+    try expect(tensor_view_init_memory(&down_exps[0] as &byte, TensorDType.F32, 3, 1, 2, 2, 0, false, down_v));
+    try expect(tensor_view_init_memory(&shared_gate_data[0] as &byte, TensorDType.F32, 2, 2, 1, 0, 0, false, shared_gate_v));
+    try expect(tensor_view_init_memory(&shared_up_data[0] as &byte, TensorDType.F32, 2, 2, 1, 0, 0, false, shared_up_v));
+    try expect(tensor_view_init_memory(&shared_down_data[0] as &byte, TensorDType.F32, 2, 1, 2, 0, 0, false, shared_down_v));
+
+    var layer: MoeLayerWeights = moe_layer_weights_init();
+    layer.ffn_gate_inp = router_v;
+    layer.ffn_gate_exps = gate_v;
+    layer.ffn_up_exps = up_v;
+    layer.ffn_down_exps = down_v;
+    layer.ffn_gate_shexp = shared_gate_v;
+    layer.ffn_up_shexp = shared_up_v;
+    layer.ffn_down_shexp = shared_down_v;
+
+    var x: [f32: 2] = [];
+    x[0] = 2.0f32;
+    var out: [f32: 2] = [];
+    try expect(moe_forward_one(&out[0], &layer, &config, &x[0], 0));
+    try assert_close(out[0], 2.9242344f32, 0.00002f32);
+    try assert_close(out[1], 4.3863516f32, 0.00002f32);
+}
+
+test "moe forward hash routing overrides router top-k choice" {
+    var config: MoeConfig = moe_config_init(2, 2, 1, 1);
+    config.expert_weight_scale = 1.0f32;
+
+    var hash_ids: [i32: 2] = [];
+    hash_ids[0] = 1;
+    hash_ids[1] = 0;
+    var router: [f32: 4] = [];
+    router[2] = 0.5f32;
+
+    var gate_exps: [f32: 4] = [];
+    gate_exps[0] = 0.5f32;
+    gate_exps[2] = 0.25f32;
+    var up_exps: [f32: 4] = [];
+    up_exps[0] = 1.0f32;
+    up_exps[2] = 1.0f32;
+    var down_exps: [f32: 4] = [];
+    down_exps[0] = 7.0f32;
+    down_exps[1] = 11.0f32;
+    down_exps[2] = 2.0f32;
+    down_exps[3] = 3.0f32;
+
+    var shared_gate_data: [f32: 2] = [];
+    var shared_up_data: [f32: 2] = [];
+    var shared_down_data: [f32: 2] = [];
+
+    var views: [TensorView: 8] = [];
+    const hash_v: &TensorView = &views[0];
+    const router_v: &TensorView = &views[1];
+    const gate_v: &TensorView = &views[2];
+    const up_v: &TensorView = &views[3];
+    const down_v: &TensorView = &views[4];
+    const shared_gate_v: &TensorView = &views[5];
+    const shared_up_v: &TensorView = &views[6];
+    const shared_down_v: &TensorView = &views[7];
+    try expect(tensor_view_init_memory(&hash_ids[0] as &byte, TensorDType.I32, 2, 1, 2, 0, 0, false, hash_v));
+    try expect(tensor_view_init_memory(&router[0] as &byte, TensorDType.F32, 2, 2, 2, 0, 0, false, router_v));
+    try expect(tensor_view_init_memory(&gate_exps[0] as &byte, TensorDType.F32, 3, 2, 1, 2, 0, false, gate_v));
+    try expect(tensor_view_init_memory(&up_exps[0] as &byte, TensorDType.F32, 3, 2, 1, 2, 0, false, up_v));
+    try expect(tensor_view_init_memory(&down_exps[0] as &byte, TensorDType.F32, 3, 1, 2, 2, 0, false, down_v));
+    try expect(tensor_view_init_memory(&shared_gate_data[0] as &byte, TensorDType.F32, 2, 2, 1, 0, 0, false, shared_gate_v));
+    try expect(tensor_view_init_memory(&shared_up_data[0] as &byte, TensorDType.F32, 2, 2, 1, 0, 0, false, shared_up_v));
+    try expect(tensor_view_init_memory(&shared_down_data[0] as &byte, TensorDType.F32, 2, 1, 2, 0, 0, false, shared_down_v));
+
+    var layer: MoeLayerWeights = moe_layer_weights_init();
+    layer.ffn_gate_tid2eid = hash_v;
+    layer.ffn_gate_inp = router_v;
+    layer.ffn_gate_exps = gate_v;
+    layer.ffn_up_exps = up_v;
+    layer.ffn_down_exps = down_v;
+    layer.ffn_gate_shexp = shared_gate_v;
+    layer.ffn_up_shexp = shared_up_v;
+    layer.ffn_down_shexp = shared_down_v;
+
+    var x: [f32: 2] = [];
+    x[0] = 2.0f32;
+    var out: [f32: 2] = [];
+    try expect(moe_forward_one(&out[0], &layer, &config, &x[0], 1));
+    try assert_close(out[0], 10.234821f32, 0.00002f32);
+    try assert_close(out[1], 16.083290f32, 0.00002f32);
+}
+
+test "flash hc sinkhorn split emits stable pre post and combine weights" {
+    var mix: [f32: 8] = [];
+    var scale: [f32: 3] = [];
+    scale[0] = 1.0f32;
+    scale[1] = 1.0f32;
+    scale[2] = 1.0f32;
+    var base: [f32: 8] = [];
+    var out: [f32: 8] = [];
+    var tmp: [f32: 4] = [];
+
+    try expect(flash_hc_split_sinkhorn_one(&out[0], &mix[0], &scale[0], &base[0], 2, 2, 0.0f32, &tmp[0]));
+    try assert_close(out[0], 0.5f32, 0.00002f32);
+    try assert_close(out[1], 0.5f32, 0.00002f32);
+    try assert_close(out[2], 1.0f32, 0.00002f32);
+    try assert_close(out[3], 1.0f32, 0.00002f32);
+    try assert_close(out[4], 0.5f32, 0.00002f32);
+    try assert_close(out[5], 0.5f32, 0.00002f32);
+    try assert_close(out[6], 0.5f32, 0.00002f32);
+    try assert_close(out[7], 0.5f32, 0.00002f32);
+}
+
+test "flash compressor pools decode state and emits normalized row" {
+    var state_kv_pool: [f32: 4] = [];
+    state_kv_pool[0] = 10.0f32;
+    state_kv_pool[1] = 20.0f32;
+    state_kv_pool[2] = 30.0f32;
+    state_kv_pool[3] = 40.0f32;
+    var state_score_pool: [f32: 4] = [];
+    var pooled_simple: [f32: 2] = [];
+    try expect(flash_compressor_pool_decode_state(&pooled_simple[0], &state_kv_pool[0], &state_score_pool[0], 2, 2));
+    try assert_close(pooled_simple[0], 20.0f32, 0.00002f32);
+    try assert_close(pooled_simple[1], 30.0f32, 0.00002f32);
+
+    var wkv_data: [f32: 4] = [];
+    wkv_data[0] = 1.0f32;
+    wkv_data[3] = 1.0f32;
+    var wgate_data: [f32: 4] = [];
+    var ape_data: [f32: 4] = [];
+    var norm_data: [f32: 2] = [];
+    norm_data[0] = 1.0f32;
+    norm_data[1] = 1.0f32;
+    var views: [TensorView: 4] = [];
+    const wkv_v: &TensorView = &views[0];
+    const wgate_v: &TensorView = &views[1];
+    const ape_v: &TensorView = &views[2];
+    const norm_v: &TensorView = &views[3];
+    try expect(tensor_view_init_memory(&wkv_data[0] as &byte, TensorDType.F32, 2, 2, 2, 0, 0, false, wkv_v));
+    try expect(tensor_view_init_memory(&wgate_data[0] as &byte, TensorDType.F32, 2, 2, 2, 0, 0, false, wgate_v));
+    try expect(tensor_view_init_memory(&ape_data[0] as &byte, TensorDType.F32, 2, 2, 2, 0, 0, false, ape_v));
+    try expect(tensor_view_init_memory(&norm_data[0] as &byte, TensorDType.F32, 1, 2, 0, 0, 0, false, norm_v));
+
+    var state_kv: [f32: 4] = [];
+    var state_score: [f32: 4] = [];
+    var x0: [f32: 2] = [];
+    x0[0] = 2.0f32;
+    x0[1] = 4.0f32;
+    var out_comp: [f32: 2] = [];
+    var kv_cur: [f32: 2] = [];
+    var sc_cur: [f32: 2] = [];
+    var pooled: [f32: 2] = [];
+    try expect(!flash_compressor_decode_one(&out_comp[0], wkv_v, wgate_v, ape_v, norm_v, &x0[0], &state_kv[0], &state_score[0], 2, 2, 0, &kv_cur[0], &sc_cur[0], &pooled[0]));
+
+    var x1: [f32: 2] = [];
+    x1[0] = 6.0f32;
+    x1[1] = 8.0f32;
+    try expect(flash_compressor_decode_one(&out_comp[0], wkv_v, wgate_v, ape_v, norm_v, &x1[0], &state_kv[0], &state_score[0], 2, 2, 1, &kv_cur[0], &sc_cur[0], &pooled[0]));
+    try assert_close(out_comp[0], 0.7844645f32, 0.00002f32);
+    try assert_close(out_comp[1], 1.1766968f32, 0.00002f32);
+}
+
+test "flash indexer selects highest relu weighted compressed rows" {
+    var q_proj_data: [f32: 4] = [];
+    q_proj_data[0] = 1.0f32;
+    q_proj_data[3] = 1.0f32;
+    var weights_proj_data: [f32: 2] = [];
+    weights_proj_data[0] = 1.0f32;
+    var views: [TensorView: 2] = [];
+    const q_proj_v: &TensorView = &views[0];
+    const weights_proj_v: &TensorView = &views[1];
+    try expect(tensor_view_init_memory(&q_proj_data[0] as &byte, TensorDType.F32, 2, 2, 2, 0, 0, false, q_proj_v));
+    try expect(tensor_view_init_memory(&weights_proj_data[0] as &byte, TensorDType.F32, 2, 2, 1, 0, 0, false, weights_proj_v));
+
+    var cur: [f32: 2] = [];
+    cur[0] = 2.0f32;
+    var qr_norm: [f32: 2] = [];
+    qr_norm[0] = 1.0f32;
+    var index_comp: [f32: 6] = [];
+    index_comp[0] = 1.0f32;
+    index_comp[3] = 1.0f32;
+    index_comp[4] = 3.0f32;
+    var allowed: [bool: 3] = [];
+    var q: [f32: 2] = [];
+    var weights: [f32: 1] = [];
+    var scores: [f32: 3] = [];
+
+    try expect(flash_indexer_select_allowed(&allowed[0], &cur[0], &qr_norm[0], &index_comp[0], 3, 1, 2, 1, q_proj_v, weights_proj_v, &q[0], &weights[0], &scores[0]));
+    try expect(!allowed[0]);
+    try expect(!allowed[1]);
+    try expect(allowed[2]);
 }
 
 test "synthetic benchmark reports token rates" {
