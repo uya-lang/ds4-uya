@@ -1,0 +1,412 @@
+use ds4.binary.le_u32_from_bytes;
+use ds4.binary.le_u64_from_bytes;
+use libc.FILE;
+use libc.fclose;
+use libc.fopen;
+use libc.fread;
+use libc.fseek;
+use libc.ftell;
+use libc.printf;
+
+const GGUF_MAGIC: u32 = 0x46554747;
+const SEEK_SET: i32 = 0;
+const SEEK_END: i32 = 2;
+
+const GGUF_TYPE_UINT8: u32 = 0;
+const GGUF_TYPE_INT8: u32 = 1;
+const GGUF_TYPE_UINT16: u32 = 2;
+const GGUF_TYPE_INT16: u32 = 3;
+const GGUF_TYPE_UINT32: u32 = 4;
+const GGUF_TYPE_INT32: u32 = 5;
+const GGUF_TYPE_FLOAT32: u32 = 6;
+const GGUF_TYPE_BOOL: u32 = 7;
+const GGUF_TYPE_STRING: u32 = 8;
+const GGUF_TYPE_ARRAY: u32 = 9;
+const GGUF_TYPE_UINT64: u32 = 10;
+const GGUF_TYPE_INT64: u32 = 11;
+const GGUF_TYPE_FLOAT64: u32 = 12;
+
+struct Reader {
+    fp: &FILE,
+    size: u64,
+    pos: u64,
+}
+
+struct SampleString {
+    len: u64,
+    shown: usize,
+    data: [byte: 256],
+}
+
+fn sample_clear(out: &SampleString) void {
+    out.len = 0;
+    out.shown = 0;
+    var i: usize = 0;
+    while i < 256 {
+        out.data[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn reader_remaining(r: &Reader) u64 {
+    if r.pos > r.size {
+        return 0;
+    }
+    return r.size - r.pos;
+}
+
+fn reader_read(r: &Reader, buf: &byte, n: usize) bool {
+    const want: u64 = n as u64;
+    if want > reader_remaining(r) {
+        return false;
+    }
+    const got: usize = fread(buf, 1, n, r.fp);
+    if got != n {
+        return false;
+    }
+    r.pos = r.pos + want;
+    return true;
+}
+
+fn reader_skip(r: &Reader, n: u64) bool {
+    if n > reader_remaining(r) {
+        return false;
+    }
+    const next: u64 = r.pos + n;
+    const seek_result: i32 = fseek(r.fp, next as i64, SEEK_SET);
+    if seek_result < 0 {
+        return false;
+    }
+    r.pos = next;
+    return true;
+}
+
+fn read_u32(r: &Reader, out: &u32) bool {
+    var buf: [byte: 4] = [];
+    if !reader_read(r, &buf[0], 4) {
+        return false;
+    }
+    *out = le_u32_from_bytes(buf[0], buf[1], buf[2], buf[3]);
+    return true;
+}
+
+fn read_u64(r: &Reader, out: &u64) bool {
+    var buf: [byte: 8] = [];
+    if !reader_read(r, &buf[0], 8) {
+        return false;
+    }
+    *out = le_u64_from_bytes(buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+    return true;
+}
+
+fn read_string_sample(r: &Reader, out: &SampleString) bool {
+    sample_clear(out);
+
+    var len: u64 = 0;
+    if !read_u64(r, &len) {
+        return false;
+    }
+    out.len = len;
+
+    var take: usize = 0;
+    if len > 255 {
+        take = 255;
+    } else {
+        take = len as usize;
+    }
+
+    if take > 0 {
+        if !reader_read(r, &out.data[0], take) {
+            return false;
+        }
+    }
+    out.shown = take;
+    if take < 256 {
+        out.data[take] = 0;
+    }
+
+    const rest: u64 = len - (take as u64);
+    if rest > 0 {
+        if !reader_skip(r, rest) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn skip_string(r: &Reader) bool {
+    var len: u64 = 0;
+    if !read_u64(r, &len) {
+        return false;
+    }
+    return reader_skip(r, len);
+}
+
+fn scalar_value_size(value_type: u32) u64 {
+    if value_type == GGUF_TYPE_UINT8 || value_type == GGUF_TYPE_INT8 || value_type == GGUF_TYPE_BOOL {
+        return 1;
+    }
+    if value_type == GGUF_TYPE_UINT16 || value_type == GGUF_TYPE_INT16 {
+        return 2;
+    }
+    if value_type == GGUF_TYPE_UINT32 || value_type == GGUF_TYPE_INT32 || value_type == GGUF_TYPE_FLOAT32 {
+        return 4;
+    }
+    if value_type == GGUF_TYPE_UINT64 || value_type == GGUF_TYPE_INT64 || value_type == GGUF_TYPE_FLOAT64 {
+        return 8;
+    }
+    return 0;
+}
+
+fn skip_array(r: &Reader) bool {
+    var elem_type: u32 = 0;
+    var count: u64 = 0;
+    if !read_u32(r, &elem_type) {
+        return false;
+    }
+    if !read_u64(r, &count) {
+        return false;
+    }
+
+    if elem_type == GGUF_TYPE_STRING {
+        var i: u64 = 0;
+        while i < count {
+            if !skip_string(r) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    const item_size: u64 = scalar_value_size(elem_type);
+    if item_size == 0 {
+        return false;
+    }
+
+    const remaining: u64 = reader_remaining(r);
+    if count > (remaining / item_size) {
+        return false;
+    }
+    return reader_skip(r, count * item_size);
+}
+
+fn skip_metadata_value(r: &Reader, value_type: u32) bool {
+    if value_type == GGUF_TYPE_STRING {
+        return skip_string(r);
+    }
+    if value_type == GGUF_TYPE_ARRAY {
+        return skip_array(r);
+    }
+
+    const size: u64 = scalar_value_size(value_type);
+    if size == 0 {
+        return false;
+    }
+    return reader_skip(r, size);
+}
+
+fn print_value_type(value_type: u32) void {
+    if value_type == GGUF_TYPE_UINT8 {
+        _ = printf("u8");
+    } else if value_type == GGUF_TYPE_INT8 {
+        _ = printf("i8");
+    } else if value_type == GGUF_TYPE_UINT16 {
+        _ = printf("u16");
+    } else if value_type == GGUF_TYPE_INT16 {
+        _ = printf("i16");
+    } else if value_type == GGUF_TYPE_UINT32 {
+        _ = printf("u32");
+    } else if value_type == GGUF_TYPE_INT32 {
+        _ = printf("i32");
+    } else if value_type == GGUF_TYPE_FLOAT32 {
+        _ = printf("f32");
+    } else if value_type == GGUF_TYPE_BOOL {
+        _ = printf("bool");
+    } else if value_type == GGUF_TYPE_STRING {
+        _ = printf("string");
+    } else if value_type == GGUF_TYPE_ARRAY {
+        _ = printf("array");
+    } else if value_type == GGUF_TYPE_UINT64 {
+        _ = printf("u64");
+    } else if value_type == GGUF_TYPE_INT64 {
+        _ = printf("i64");
+    } else if value_type == GGUF_TYPE_FLOAT64 {
+        _ = printf("f64");
+    } else {
+        _ = printf("unknown(%u)", value_type);
+    }
+}
+
+fn align_up_u64(value: u64, alignment: u64) u64 {
+    if alignment == 0 {
+        return value;
+    }
+    const rem: u64 = value % alignment;
+    if rem == 0 {
+        return value;
+    }
+    return value + (alignment - rem);
+}
+
+export fn inspect_gguf(path: &const byte) i32 {
+    const fp: &FILE = fopen(path, "rb\0" as &const byte);
+    if fp == null {
+        _ = printf("ds4-uya: cannot open file: %s\n", path);
+        return 2;
+    }
+
+    if fseek(fp, 0, SEEK_END) < 0 {
+        _ = printf("ds4-uya: cannot seek file\n");
+        _ = fclose(fp);
+        return 2;
+    }
+    const size_i64: i64 = ftell(fp);
+    if size_i64 < 0 {
+        _ = printf("ds4-uya: cannot determine file size\n");
+        _ = fclose(fp);
+        return 2;
+    }
+    if fseek(fp, 0, SEEK_SET) < 0 {
+        _ = printf("ds4-uya: cannot rewind file\n");
+        _ = fclose(fp);
+        return 2;
+    }
+
+    var r: Reader = Reader{ fp: fp, size: size_i64 as u64, pos: 0 };
+    var magic: u32 = 0;
+    var version: u32 = 0;
+    var tensor_count: u64 = 0;
+    var metadata_count: u64 = 0;
+
+    if !read_u32(&r, &magic) || !read_u32(&r, &version) || !read_u64(&r, &tensor_count) || !read_u64(&r, &metadata_count) {
+        _ = printf("ds4-uya: truncated GGUF header, size=%llu bytes\n", r.size);
+        _ = fclose(fp);
+        return 3;
+    }
+
+    _ = printf("file: %s\n", path);
+    _ = printf("size: %llu bytes\n", r.size);
+
+    if magic != GGUF_MAGIC {
+        _ = printf("format: not GGUF, magic=0x%08x\n", magic);
+        _ = fclose(fp);
+        return 4;
+    }
+
+    _ = printf("format: GGUF v%u\n", version);
+    _ = printf("tensors: %llu\n", tensor_count);
+    _ = printf("metadata: %llu\n", metadata_count);
+
+    var key: SampleString = SampleString{ len: 0, shown: 0, data: [] };
+    var i: u64 = 0;
+    while i < metadata_count {
+        if !read_string_sample(&r, &key) {
+            _ = printf("ds4-uya: truncated while reading metadata key %llu at offset %llu/%llu\n", i, r.pos, r.size);
+            _ = fclose(fp);
+            return 3;
+        }
+
+        var value_type: u32 = 0;
+        if !read_u32(&r, &value_type) {
+            _ = printf("ds4-uya: truncated while reading metadata type %llu at offset %llu/%llu\n", i, r.pos, r.size);
+            _ = fclose(fp);
+            return 3;
+        }
+
+        if i < 24 {
+            _ = printf("  meta[%llu] %s: ", i, &key.data[0]);
+            print_value_type(value_type);
+            if key.len > key.shown as u64 {
+                _ = printf(" (key truncated, len=%llu)", key.len);
+            }
+            _ = printf("\n");
+        }
+
+        if !skip_metadata_value(&r, value_type) {
+            _ = printf("ds4-uya: cannot skip metadata value %llu at offset %llu/%llu, type=", i, r.pos, r.size);
+            print_value_type(value_type);
+            _ = printf("\n");
+            _ = fclose(fp);
+            return 3;
+        }
+
+        i = i + 1;
+    }
+
+    _ = printf("metadata_end: %llu\n", r.pos);
+
+    var tensor_name: SampleString = SampleString{ len: 0, shown: 0, data: [] };
+    var t: u64 = 0;
+    var max_tensor_offset: u64 = 0;
+    var max_tensor_offset_index: u64 = 0;
+    while t < tensor_count {
+        if !read_string_sample(&r, &tensor_name) {
+            _ = printf("ds4-uya: truncated while reading tensor name %llu at offset %llu/%llu\n", t, r.pos, r.size);
+            _ = fclose(fp);
+            return 3;
+        }
+
+        var n_dims: u32 = 0;
+        if !read_u32(&r, &n_dims) {
+            _ = printf("ds4-uya: truncated while reading tensor dims %llu at offset %llu/%llu\n", t, r.pos, r.size);
+            _ = fclose(fp);
+            return 3;
+        }
+        if n_dims > 8 {
+            _ = printf("ds4-uya: invalid tensor dimension count %u for tensor %llu\n", n_dims, t);
+            _ = fclose(fp);
+            return 5;
+        }
+
+        var d: u32 = 0;
+        var dim_value: u64 = 0;
+        while d < n_dims {
+            if !read_u64(&r, &dim_value) {
+                _ = printf("ds4-uya: truncated while reading tensor shape %llu at offset %llu/%llu\n", t, r.pos, r.size);
+                _ = fclose(fp);
+                return 3;
+            }
+            d = d + 1;
+        }
+
+        var ggml_type: u32 = 0;
+        var offset: u64 = 0;
+        if !read_u32(&r, &ggml_type) || !read_u64(&r, &offset) {
+            _ = printf("ds4-uya: truncated while reading tensor info %llu at offset %llu/%llu\n", t, r.pos, r.size);
+            _ = fclose(fp);
+            return 3;
+        }
+        if offset > max_tensor_offset {
+            max_tensor_offset = offset;
+            max_tensor_offset_index = t;
+        }
+
+        if t < 24 {
+            _ = printf("  tensor[%llu] %s dims=%u ggml_type=%u data_offset=%llu\n", t, &tensor_name.data[0], n_dims, ggml_type, offset);
+        }
+
+        t = t + 1;
+    }
+
+    _ = printf("tensor_directory_end: %llu\n", r.pos);
+    const data_start: u64 = align_up_u64(r.pos, 32);
+    _ = printf("data_start_estimate: %llu (alignment=32)\n", data_start);
+    if data_start > r.size {
+        _ = printf("inspect: incomplete, tensor data section is missing\n");
+        _ = fclose(fp);
+        return 6;
+    }
+
+    const available_tensor_data: u64 = r.size - data_start;
+    _ = printf("available_tensor_data: %llu bytes\n", available_tensor_data);
+    if max_tensor_offset > available_tensor_data {
+        _ = printf("inspect: incomplete, tensor[%llu] offset %llu exceeds available tensor data %llu\n", max_tensor_offset_index, max_tensor_offset, available_tensor_data);
+        _ = fclose(fp);
+        return 6;
+    }
+
+    _ = printf("inspect: ok\n");
+    _ = fclose(fp);
+    return 0;
+}

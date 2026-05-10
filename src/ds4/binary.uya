@@ -1,0 +1,29 @@
+// Little-endian binary helpers shared by GGUF and future tensor loaders.
+
+export fn le_u32_from_bytes(b0: byte, b1: byte, b2: byte, b3: byte) u32 {
+    return (b0 as u32)
+        | ((b1 as u32) << 8)
+        | ((b2 as u32) << 16)
+        | ((b3 as u32) << 24);
+}
+
+export fn le_u64_from_bytes(
+    b0: byte,
+    b1: byte,
+    b2: byte,
+    b3: byte,
+    b4: byte,
+    b5: byte,
+    b6: byte,
+    b7: byte,
+) u64 {
+    return (b0 as u64)
+        | ((b1 as u64) << 8)
+        | ((b2 as u64) << 16)
+        | ((b3 as u64) << 24)
+        | ((b4 as u64) << 32)
+        | ((b5 as u64) << 40)
+        | ((b6 as u64) << 48)
+        | ((b7 as u64) << 56);
+}
+

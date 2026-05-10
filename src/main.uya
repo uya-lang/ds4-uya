@@ -1,0 +1,45 @@
+use ds4.gguf.inspect_gguf;
+use libc.printf;
+use libc.strcmp;
+
+fn print_help() void {
+    _ = printf("ds4-uya - pure Uya CPU DS4 runtime\n");
+    _ = printf("\n");
+    _ = printf("usage:\n");
+    _ = printf("  ds4-uya --help\n");
+    _ = printf("  ds4-uya inspect <model.gguf>\n");
+    _ = printf("\n");
+    _ = printf("status:\n");
+    _ = printf("  implemented: GGUF inspection\n");
+    _ = printf("  planned: tokenizer, CPU tensors, quant kernels, generation\n");
+}
+
+export extern fn main(argc: i32, argv: & &byte) i32 {
+    if argc <= 1 {
+        print_help();
+        return 0;
+    }
+
+    const cmd: &byte = argv[1];
+    if strcmp(cmd as *const byte, "--help\0" as *const byte) == 0 {
+        print_help();
+        return 0;
+    }
+    if strcmp(cmd as *const byte, "help\0" as *const byte) == 0 {
+        print_help();
+        return 0;
+    }
+
+    if strcmp(cmd as *const byte, "inspect\0" as *const byte) == 0 {
+        if argc < 3 {
+            _ = printf("ds4-uya: inspect requires a GGUF file path\n");
+            return 1;
+        }
+        return inspect_gguf(argv[2] as &const byte);
+    }
+
+    _ = printf("ds4-uya: unknown command: %s\n", cmd);
+    print_help();
+    return 1;
+}
+

@@ -1,0 +1,17 @@
+use ds4.binary.le_u32_from_bytes;
+use ds4.binary.le_u64_from_bytes;
+use std.testing.assert_eq_i32;
+
+test "le_u32_from_bytes" {
+    const value: u32 = le_u32_from_bytes(0x47, 0x47, 0x55, 0x46);
+    try assert_eq_i32(value as i32, 0x46554747);
+}
+
+test "le_u64_from_bytes" {
+    const value: u64 = le_u64_from_bytes(1, 2, 3, 4, 5, 6, 7, 8);
+    const low: u32 = value as u32;
+    const high: u32 = (value >> 32) as u32;
+    try assert_eq_i32(low as i32, 0x04030201);
+    try assert_eq_i32(high as i32, 0x08070605);
+}
+
