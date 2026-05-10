@@ -120,3 +120,19 @@
 
 - 优化版与 reference 误差在阈值内。
 - benchmark 能报告 prompt/decode tokens/s。
+
+## Phase 8: GGUF-backed 端到端文本生成
+
+- [x] 从 GGUF tensor data 区读取实际权重 bytes。
+- [x] 把文件权重挂到 `TensorView.data`，再绑定进 `ModelWeights`。
+- [x] 从 GGUF metadata/tensor shape 推导 dense CPU forward 所需 config。
+- [x] forward 支持 F16 norm/matrix，并放行 F32/F16/Q8_0/Q4_K dense matvec。
+- [x] `generate` 子命令执行 encode -> prefill -> decode loop -> decode text。
+- [x] `chat` 子命令加载一次模型并进入 stdin REPL。
+- [x] 增加真实 GGUF fixture 的 runtime 端到端测试。
+
+验收标准：
+
+- 测试会写入一个小型 GGUF 文件，并从文件 tensor offsets 加载权重。
+- `runtime_session_generate_to_buffer` 能基于 GGUF 权重生成可 decode 文本。
+- 不支持的 DS4 MoE/GQA/命名布局返回明确 unsupported-layout 错误，而不是静默假生成。

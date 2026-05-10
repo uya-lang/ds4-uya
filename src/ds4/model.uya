@@ -168,8 +168,19 @@ fn model_view_is_dense_f32(view: &TensorView, in_dim: u64, out_dim: u64) bool {
     return view != null && tensor_view_expect_shape(view, TensorDType.F32, 2, in_dim, out_dim, 0, 0);
 }
 
-fn model_view_is_vector_f32(view: &TensorView, n: u64) bool {
-    return view != null && tensor_view_expect_shape(view, TensorDType.F32, 1, n, 0, 0, 0);
+fn model_view_is_dense_supported(view: &TensorView, in_dim: u64, out_dim: u64) bool {
+    if view == null || view.n_dims != 2 || view.shape[0] != in_dim || view.shape[1] != out_dim {
+        return false;
+    }
+    return view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 ||
+        view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q4_K;
+}
+
+fn model_view_is_vector_norm(view: &TensorView, n: u64) bool {
+    if view == null || view.n_dims != 1 || view.shape[0] != n {
+        return false;
+    }
+    return view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16;
 }
 
 fn model_view_is_embedding(view: &TensorView, config: &ModelConfig) bool {
@@ -183,19 +194,20 @@ fn model_view_is_output(view: &TensorView, config: &ModelConfig) bool {
     if view == null || view.n_dims != 2 || view.shape[0] != config.n_embd || view.shape[1] != config.n_vocab {
         return false;
     }
-    return view.dtype == TensorDType.F32 || view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q4_K;
+    return view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 ||
+        view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q4_K;
 }
 
 fn model_layer_weights_validate(layer: &ModelLayerWeights, config: &ModelConfig) bool {
-    return model_view_is_vector_f32(layer.attn_norm, config.n_embd) &&
-        model_view_is_dense_f32(layer.attn_q, config.n_embd, config.n_embd) &&
-        model_view_is_dense_f32(layer.attn_k, config.n_embd, config.n_embd) &&
-        model_view_is_dense_f32(layer.attn_v, config.n_embd, config.n_embd) &&
-        model_view_is_dense_f32(layer.attn_output, config.n_embd, config.n_embd) &&
-        model_view_is_vector_f32(layer.ffn_norm, config.n_embd) &&
-        model_view_is_dense_f32(layer.ffn_gate, config.n_embd, config.n_ff) &&
-        model_view_is_dense_f32(layer.ffn_up, config.n_embd, config.n_ff) &&
-        model_view_is_dense_f32(layer.ffn_down, config.n_ff, config.n_embd);
+    return model_view_is_vector_norm(layer.attn_norm, config.n_embd) &&
+        model_view_is_dense_supported(layer.attn_q, config.n_embd, config.n_embd) &&
+        model_view_is_dense_supported(layer.attn_k, config.n_embd, config.n_embd) &&
+        model_view_is_dense_supported(layer.attn_v, config.n_embd, config.n_embd) &&
+        model_view_is_dense_supported(layer.attn_output, config.n_embd, config.n_embd) &&
+        model_view_is_vector_norm(layer.ffn_norm, config.n_embd) &&
+        model_view_is_dense_supported(layer.ffn_gate, config.n_embd, config.n_ff) &&
+        model_view_is_dense_supported(layer.ffn_up, config.n_embd, config.n_ff) &&
+        model_view_is_dense_supported(layer.ffn_down, config.n_ff, config.n_embd);
 }
 
 fn model_bind_one_layer(table: &TensorWeightTable, layer_index: u64, out: &ModelLayerWeights) bool {
@@ -222,7 +234,7 @@ export fn model_weights_bind_from_table(config: &ModelConfig, table: &TensorWeig
     const token_embd: &TensorView = tensor_weight_table_find(table, "token_embd.weight\0" as &const byte);
     const output_norm: &TensorView = tensor_weight_table_find(table, "output_norm.weight\0" as &const byte);
     const output: &TensorView = tensor_weight_table_find(table, "output.weight\0" as &const byte);
-    if !model_view_is_embedding(token_embd, config) || !model_view_is_vector_f32(output_norm, config.n_embd) || !model_view_is_output(output, config) {
+    if !model_view_is_embedding(token_embd, config) || !model_view_is_vector_norm(output_norm, config.n_embd) || !model_view_is_output(output, config) {
         return false;
     }
 
@@ -262,7 +274,7 @@ export fn model_validate(model: &Model) bool {
         return false;
     }
     if !model_view_is_embedding(model.weights.token_embd, &model.config) ||
-        !model_view_is_vector_f32(model.weights.output_norm, model.config.n_embd) ||
+        !model_view_is_vector_norm(model.weights.output_norm, model.config.n_embd) ||
         !model_view_is_output(model.weights.output, &model.config) {
         return false;
     }
@@ -318,6 +330,31 @@ fn model_read_vector_f32(view: &TensorView, index: u64) f32 {
     return data[index as usize];
 }
 
+fn model_rms_norm(out: &f32, x: &const f32, weight: &TensorView, n: u64, eps: f32) bool {
+    if !model_require_data(weight) || !model_view_is_vector_norm(weight, n) {
+        return false;
+    }
+    if weight.dtype == TensorDType.F32 {
+        kernels_rms_norm(out, x, weight.data as &const f32, n, eps);
+        return true;
+    }
+
+    var sum: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < n {
+        const v: f32 = x[i as usize];
+        sum = sum + v * v;
+        i = i + 1;
+    }
+    const scale: f32 = 1.0f32 / sqrtf(sum / (n as f32) + eps);
+    i = 0;
+    while i < n {
+        out[i as usize] = x[i as usize] * scale * kernels_f16_load(weight.data as &const byte, i);
+        i = i + 1;
+    }
+    return true;
+}
+
 fn model_copy_embedding(out: &f32, view: &TensorView, token_id: u64, n_embd: u64) bool {
     if !model_require_data(view) || token_id >= view.shape[1] {
         return false;
@@ -353,6 +390,21 @@ fn model_matvec(out: &f32, view: &TensorView, x: &const f32, out_dim: u64, in_di
     }
     if view.dtype == TensorDType.F32 {
         kernels_dense_matvec_f32(out, view.data as &const f32, x, out_dim, in_dim);
+        return true;
+    }
+    if view.dtype == TensorDType.F16 {
+        var row0: u64 = 0;
+        while row0 < out_dim {
+            var acc: f32 = 0.0f32;
+            var col0: u64 = 0;
+            const base: u64 = row0 * in_dim;
+            while col0 < in_dim {
+                acc = acc + kernels_f16_load(view.data as &const byte, base + col0) * x[col0 as usize];
+                col0 = col0 + 1;
+            }
+            out[row0 as usize] = acc;
+            row0 = row0 + 1;
+        }
         return true;
     }
     if view.dtype == TensorDType.Q8_0 {
@@ -541,10 +593,9 @@ fn model_forward_layer(
     const config: &ModelConfig = &model.config;
     const layer: &ModelLayerWeights = &model.weights.layers[layer_index as usize];
 
-    if !model_require_data(layer.attn_norm) || !model_require_data(layer.ffn_norm) {
+    if !model_rms_norm(norm, x, layer.attn_norm, config.n_embd, config.rms_eps) {
         return false;
     }
-    kernels_rms_norm(norm, x, layer.attn_norm.data as &const f32, config.n_embd, config.rms_eps);
     if !model_matvec(q, layer.attn_q, norm, config.n_embd, config.n_embd) ||
         !model_matvec(k, layer.attn_k, norm, config.n_embd, config.n_embd) ||
         !model_matvec(v, layer.attn_v, norm, config.n_embd, config.n_embd) {
@@ -563,7 +614,9 @@ fn model_forward_layer(
     }
     model_add_inplace(x, attn_out, config.n_embd);
 
-    kernels_rms_norm(norm, x, layer.ffn_norm.data as &const f32, config.n_embd, config.rms_eps);
+    if !model_rms_norm(norm, x, layer.ffn_norm, config.n_embd, config.rms_eps) {
+        return false;
+    }
     if !model_matvec(ffn_gate, layer.ffn_gate, norm, config.n_ff, config.n_embd) ||
         !model_matvec(ffn_up, layer.ffn_up, norm, config.n_ff, config.n_embd) {
         return false;
@@ -613,10 +666,9 @@ export fn model_forward_token(model: &Model, state: &ModelState, token_id: u64, 
         layer = layer + 1;
     }
 
-    if !model_require_data(model.weights.output_norm) {
+    if !model_rms_norm(norm, x, model.weights.output_norm, model.config.n_embd, model.config.rms_eps) {
         return false;
     }
-    kernels_rms_norm(norm, x, model.weights.output_norm.data as &const f32, model.config.n_embd, model.config.rms_eps);
     if !model_matvec(logits, model.weights.output, norm, model.config.n_vocab, model.config.n_embd) {
         return false;
     }

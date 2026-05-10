@@ -5,8 +5,8 @@
 The current milestone is intentionally small and runnable on this Linux x86_64
 machine: it provides project docs, GGUF loading, tokenizer support, CPU tensor
 views, scalar and optimized kernels, a reference transformer forward path, a
-sampler, an in-memory greedy generation loop, and generation/chat CLI
-entrypoints.
+sampler, an in-memory greedy generation loop, GGUF-backed generation/chat CLI
+paths, and a benchmark.
 
 ## Build
 
@@ -58,9 +58,12 @@ build/ds4-uya inspect /home/winger/uya/ds4/gguf/DeepSeek-V4-Flash-Q4KExperts-F16
   diagnostics, scalar reference kernels for F32/F16 math, RMSNorm, RoPE,
   Softmax, dense matvec, Q8_0/Q4_K dot, SiLU/SwiGLU, Uya `@vector` F32 dot,
   fused Q8_0/Q4_K dequant-dot fast paths, KV row access, MoE dispatch planning,
-  a dense F32 transformer forward fixture path with logits output,
+  a dense transformer forward path with logits output,
   deterministic greedy/temperature/top-k/top-p/repeat-penalty sampling, an
-  in-memory greedy generation loop, `generate`/`chat` command entrypoints, and
-  a synthetic prompt/decode tokens/s benchmark.
-- Not implemented yet: end-to-end GGUF-backed token generation from mapped
-  model weights.
+  in-memory greedy generation loop, GGUF tensor-data loading into bound model
+  weights, `generate`/`chat` output backed by file weights, and a synthetic
+  prompt/decode tokens/s benchmark.
+- Current GGUF-backed generation supports the dense decoder subset used by the
+  CPU forward path: `blk.N.*` tensor names, `n_head == n_head_kv`, F32/F16
+  embeddings/norms/matrices, plus Q8_0/Q4_K matrix matvec. DS4 MoE/GQA-specific
+  production layouts still fail with an explicit unsupported-layout diagnostic.

@@ -1,0 +1,512 @@
+use ds4.generation.GenerationConfig;
+use ds4.generation.generation_config_greedy;
+use ds4.generation.generation_generate;
+use ds4.gguf.GgufInfo;
+use ds4.gguf.gguf_info_deinit;
+use ds4.gguf.gguf_info_init;
+use ds4.gguf.load_gguf;
+use ds4.model.Model;
+use ds4.model.ModelConfig;
+use ds4.model.ModelState;
+use ds4.model.ModelWeights;
+use ds4.model.model_config_init;
+use ds4.model.model_config_validate;
+use ds4.model.model_init;
+use ds4.model.model_state_deinit;
+use ds4.model.model_state_empty;
+use ds4.model.model_state_init;
+use ds4.model.model_weights_bind_from_table;
+use ds4.model.model_weights_deinit;
+use ds4.model.model_weights_init;
+use ds4.sampler.SamplerState;
+use ds4.sampler.sampler_state_init;
+use ds4.tensor.TensorView;
+use ds4.tensor.TensorWeightTable;
+use ds4.tensor.tensor_view_data_available;
+use ds4.tensor.tensor_weight_table_deinit;
+use ds4.tensor.tensor_weight_table_find;
+use ds4.tensor.tensor_weight_table_init;
+use ds4.tensor.tensor_weight_table_load_from_gguf;
+use ds4.tokenizer.TokenizerByteBuffer;
+use ds4.tokenizer.TokenizerTokenVec;
+use ds4.tokenizer.TokenizerVocab;
+use ds4.tokenizer.tokenizer_byte_buffer_deinit;
+use ds4.tokenizer.tokenizer_byte_buffer_init;
+use ds4.tokenizer.tokenizer_decode_tokens;
+use ds4.tokenizer.tokenizer_encode_text;
+use ds4.tokenizer.tokenizer_token_vec_deinit;
+use ds4.tokenizer.tokenizer_token_vec_init;
+use ds4.tokenizer.tokenizer_token_vec_push;
+use ds4.tokenizer.tokenizer_vocab_deinit;
+use ds4.tokenizer.tokenizer_vocab_init;
+use ds4.tokenizer.tokenizer_vocab_load_from_gguf;
+use libc.FILE;
+use libc.fclose;
+use libc.fflush;
+use libc.fopen;
+use libc.fread;
+use libc.free;
+use libc.fseek;
+use libc.malloc;
+use libc.printf;
+use libc.read;
+use libc.snprintf;
+use libc.stdout;
+use libc.strcmp;
+use libc.strlen;
+
+const RUNTIME_SEEK_SET: i32 = 0;
+const RUNTIME_DEFAULT_MAX_NEW: u64 = 64;
+const RUNTIME_CHAT_MAX_NEW: u64 = 96;
+
+export struct RuntimeSession {
+    info: GgufInfo,
+    table: TensorWeightTable,
+    vocab: TokenizerVocab,
+    config: ModelConfig,
+    weights: ModelWeights,
+    model: Model,
+    state: ModelState,
+    tensor_data: & &byte,
+    tensor_data_count: u64,
+    loaded: bool,
+}
+
+fn runtime_empty_model() Model {
+    var config: ModelConfig = model_config_init(0, 0, 0, 0, 0, 0);
+    return Model{ config: config, weights: null };
+}
+
+export fn runtime_session_init() RuntimeSession {
+    return RuntimeSession{
+        info: gguf_info_init(),
+        table: tensor_weight_table_init(),
+        vocab: tokenizer_vocab_init(),
+        config: model_config_init(0, 0, 0, 0, 0, 0),
+        weights: model_weights_init(),
+        model: runtime_empty_model(),
+        state: model_state_empty(),
+        tensor_data: null,
+        tensor_data_count: 0,
+        loaded: false,
+    };
+}
+
+fn runtime_free_tensor_data(session: &RuntimeSession) void {
+    if session.tensor_data != null {
+        var i: u64 = 0;
+        while i < session.tensor_data_count {
+            if session.tensor_data[i as usize] != null {
+                free(session.tensor_data[i as usize] as &void);
+            }
+            i = i + 1;
+        }
+        free(session.tensor_data as &void);
+    }
+    session.tensor_data = null;
+    session.tensor_data_count = 0;
+}
+
+export fn runtime_session_deinit(session: &RuntimeSession) void {
+    model_state_deinit(&session.state);
+    model_weights_deinit(&session.weights);
+    tokenizer_vocab_deinit(&session.vocab);
+    runtime_free_tensor_data(session);
+    tensor_weight_table_deinit(&session.table);
+    gguf_info_deinit(&session.info);
+    *session = runtime_session_init();
+}
+
+fn runtime_load_tensor_data(path: &const byte, session: &RuntimeSession) i32 {
+    runtime_free_tensor_data(session);
+    if session.table.count == 0 {
+        return 3;
+    }
+
+    const pointer_bytes: usize = (session.table.count as usize) * (@size_of(&byte) as usize);
+    session.tensor_data = malloc(pointer_bytes) as & &byte;
+    if session.tensor_data == null {
+        return 2;
+    }
+    session.tensor_data_count = session.table.count;
+    var i: u64 = 0;
+    while i < session.tensor_data_count {
+        session.tensor_data[i as usize] = null;
+        i = i + 1;
+    }
+
+    const fp: &FILE = fopen(path, "rb\0" as &const byte);
+    if fp == null {
+        runtime_free_tensor_data(session);
+        return 2;
+    }
+
+    i = 0;
+    while i < session.table.count {
+        const view: &TensorView = &session.table.views[i as usize];
+        if !tensor_view_data_available(view) {
+            _ = fclose(fp);
+            runtime_free_tensor_data(session);
+            return 3;
+        }
+        const data: &byte = malloc(view.byte_size as usize) as &byte;
+        if data == null {
+            _ = fclose(fp);
+            runtime_free_tensor_data(session);
+            return 2;
+        }
+        if fseek(fp, view.file_offset as i64, RUNTIME_SEEK_SET) < 0 {
+            free(data as &void);
+            _ = fclose(fp);
+            runtime_free_tensor_data(session);
+            return 2;
+        }
+        const got: usize = fread(data, 1 as usize, view.byte_size as usize, fp);
+        if got != view.byte_size as usize {
+            free(data as &void);
+            _ = fclose(fp);
+            runtime_free_tensor_data(session);
+            return 3;
+        }
+        view.data = data;
+        session.tensor_data[i as usize] = data;
+        i = i + 1;
+    }
+
+    _ = fclose(fp);
+    return 0;
+}
+
+fn runtime_make_layer_name(out: &byte, cap: usize, layer: u64, suffix: &const byte) bool {
+    const rc: i32 = snprintf(out, cap, "blk.%llu.%s\0" as &const byte, layer, suffix);
+    return rc > 0 && (rc as usize) < cap;
+}
+
+fn runtime_find_layer_tensor(table: &TensorWeightTable, layer: u64, suffix: &const byte) &TensorView {
+    var name: [byte: 128] = [];
+    if !runtime_make_layer_name(&name[0], 128, layer, suffix) {
+        return null;
+    }
+    return tensor_weight_table_find(table, &name[0] as &const byte);
+}
+
+fn runtime_count_layers(table: &TensorWeightTable) u64 {
+    var count: u64 = 0;
+    while count < table.count {
+        if runtime_find_layer_tensor(table, count, "attn_norm.weight\0" as &const byte) == null {
+            return count;
+        }
+        count = count + 1;
+    }
+    return count;
+}
+
+fn runtime_build_config(session: &RuntimeSession) bool {
+    if session.table.token_embd == null || session.table.output_norm == null || session.table.output == null {
+        return false;
+    }
+    if session.table.token_embd.n_dims != 2 {
+        return false;
+    }
+
+    const n_embd: u64 = session.table.token_embd.shape[0];
+    const n_vocab: u64 = session.table.token_embd.shape[1];
+    var n_layer: u64 = runtime_count_layers(&session.table);
+    if session.info.has_block_count {
+        n_layer = session.info.block_count;
+    }
+    if n_layer == 0 {
+        return false;
+    }
+
+    const gate0: &TensorView = runtime_find_layer_tensor(&session.table, 0, "ffn_gate.weight\0" as &const byte);
+    if gate0 == null || gate0.n_dims != 2 || gate0.shape[0] != n_embd {
+        return false;
+    }
+    const n_ff: u64 = gate0.shape[1];
+
+    var n_ctx: u64 = 2048;
+    if session.info.has_context_length {
+        n_ctx = session.info.context_length;
+    }
+    var n_head: u64 = 1;
+    if session.info.has_head_count {
+        n_head = session.info.head_count;
+    }
+    var n_head_kv: u64 = n_head;
+    if session.info.has_head_count_kv {
+        n_head_kv = session.info.head_count_kv;
+    }
+    if n_head == 0 || n_head_kv == 0 || n_head != n_head_kv {
+        return false;
+    }
+    if (n_embd % n_head) != 0 {
+        return false;
+    }
+
+    var config: ModelConfig = model_config_init(n_vocab, n_embd, n_layer, n_ctx, n_head, n_ff);
+    config.n_head_kv = n_head_kv;
+    config.head_dim = n_embd / n_head;
+    if session.info.has_key_length && session.info.key_length != config.head_dim {
+        return false;
+    }
+    if session.info.has_value_length && session.info.value_length != config.head_dim {
+        return false;
+    }
+    if session.info.has_embedding_length && session.info.embedding_length != n_embd {
+        return false;
+    }
+    if (config.head_dim % (2 as u64)) == 0 {
+        config.rope_dim = config.head_dim;
+    } else {
+        config.rope_dim = 0;
+    }
+
+    if !model_config_validate(&config) {
+        return false;
+    }
+    session.config = config;
+    return true;
+}
+
+fn runtime_print_load_error(path: &const byte, rc: i32) void {
+    if rc == 2 {
+        _ = printf("ds4-uya: cannot open model or allocate runtime memory: %s\n", path);
+    } else if rc == 3 {
+        _ = printf("ds4-uya: GGUF tensor data is truncated or unreadable: %s\n", path);
+    } else if rc == 7 {
+        _ = printf("ds4-uya: GGUF is missing required root tensors token_embd/output_norm/output\n");
+    } else if rc == 8 {
+        _ = printf("ds4-uya: GGUF is missing tokenizer.ggml.tokens or tokenizer.ggml.merges metadata\n");
+    } else if rc == 9 {
+        _ = printf("ds4-uya: unsupported model layout for current CPU forward path\n");
+        _ = printf("ds4-uya: supported now: dense decoder tensors named blk.N.*, n_head == n_head_kv, F32/F16/Q8_0/Q4_K matrices\n");
+    } else {
+        _ = printf("ds4-uya: failed to load GGUF-backed runtime, rc=%d\n", rc);
+    }
+}
+
+export fn runtime_session_load_gguf(path: &const byte, session: &RuntimeSession) i32 {
+    runtime_session_deinit(session);
+
+    const load_rc: i32 = load_gguf(path, &session.info);
+    if load_rc != 0 {
+        return load_rc;
+    }
+
+    const vocab_rc: i32 = tokenizer_vocab_load_from_gguf(path, &session.vocab);
+    if vocab_rc != 0 {
+        runtime_session_deinit(session);
+        return vocab_rc;
+    }
+
+    const table_rc: i32 = tensor_weight_table_load_from_gguf(path, &session.table);
+    if table_rc != 0 {
+        runtime_session_deinit(session);
+        return table_rc;
+    }
+
+    const data_rc: i32 = runtime_load_tensor_data(path, session);
+    if data_rc != 0 {
+        runtime_session_deinit(session);
+        return data_rc;
+    }
+
+    if !runtime_build_config(session) {
+        runtime_session_deinit(session);
+        return 9;
+    }
+
+    if !model_weights_bind_from_table(&session.config, &session.table, &session.weights) {
+        runtime_session_deinit(session);
+        return 9;
+    }
+    session.model = model_init(&session.config, &session.weights);
+    if !model_state_init(&session.state, &session.config) {
+        runtime_session_deinit(session);
+        return 2;
+    }
+    session.loaded = true;
+    return 0;
+}
+
+fn runtime_clear_byte_buffer(out: &TokenizerByteBuffer) void {
+    out.len = 0;
+    if out.data != null {
+        out.data[0] = 0;
+    }
+}
+
+fn runtime_decode_generated(session: &RuntimeSession, tokens: &i32, start: u64, generated: u64, out: &TokenizerByteBuffer) bool {
+    var gen_tokens: TokenizerTokenVec = tokenizer_token_vec_init();
+    var i: u64 = 0;
+    while i < generated {
+        const token: i32 = tokens[(start + i) as usize];
+        if session.vocab.eos_id >= 0 && token == session.vocab.eos_id {
+            break;
+        }
+        if !tokenizer_token_vec_push(&gen_tokens, token) {
+            tokenizer_token_vec_deinit(&gen_tokens);
+            return false;
+        }
+        i = i + 1;
+    }
+    const rc: i32 = tokenizer_decode_tokens(&session.vocab, &gen_tokens, out);
+    tokenizer_token_vec_deinit(&gen_tokens);
+    return rc == 0;
+}
+
+export fn runtime_session_generate_to_buffer(
+    session: &RuntimeSession,
+    prompt: &const byte,
+    max_new_tokens: u64,
+    out: &TokenizerByteBuffer,
+) i32 {
+    runtime_clear_byte_buffer(out);
+    if !session.loaded || max_new_tokens == 0 {
+        return 10;
+    }
+
+    var prompt_tokens: TokenizerTokenVec = tokenizer_token_vec_init();
+    const encode_rc: i32 = tokenizer_encode_text(&session.vocab, prompt, &prompt_tokens, true, session.vocab.add_bos, false);
+    if encode_rc != 0 || prompt_tokens.len == 0 {
+        tokenizer_token_vec_deinit(&prompt_tokens);
+        return 10;
+    }
+
+    const token_cap: u64 = prompt_tokens.len + max_new_tokens;
+    if token_cap > session.config.n_ctx {
+        tokenizer_token_vec_deinit(&prompt_tokens);
+        return 10;
+    }
+
+    const token_bytes: usize = (token_cap as usize) * (@size_of(i32) as usize);
+    const tokens: &i32 = malloc(token_bytes) as &i32;
+    const logits: &f32 = malloc((session.config.n_vocab as usize) * (@size_of(f32) as usize)) as &f32;
+    if tokens == null || logits == null {
+        if tokens != null { free(tokens as &void); }
+        if logits != null { free(logits as &void); }
+        tokenizer_token_vec_deinit(&prompt_tokens);
+        return 2;
+    }
+
+    var i: u64 = 0;
+    while i < prompt_tokens.len {
+        tokens[i as usize] = prompt_tokens.data[i as usize];
+        i = i + 1;
+    }
+
+    var gen_config: GenerationConfig = generation_config_greedy(max_new_tokens);
+    if session.vocab.eos_id >= 0 {
+        gen_config.eos_token = session.vocab.eos_id;
+        gen_config.stop_on_eos = true;
+    }
+    var sampler_state: SamplerState = sampler_state_init(1);
+    var generated: u64 = 0;
+    const ok: bool = generation_generate(&session.model, &session.state, tokens, prompt_tokens.len, token_cap, logits, &gen_config, &sampler_state, &generated);
+    var rc: i32 = 0;
+    if !ok || !runtime_decode_generated(session, tokens, prompt_tokens.len, generated, out) {
+        rc = 10;
+    }
+
+    free(tokens as &void);
+    free(logits as &void);
+    tokenizer_token_vec_deinit(&prompt_tokens);
+    return rc;
+}
+
+export fn runtime_generate_to_buffer(path: &const byte, prompt: &const byte, max_new_tokens: u64, out: &TokenizerByteBuffer) i32 {
+    var session: RuntimeSession = runtime_session_init();
+    const load_rc: i32 = runtime_session_load_gguf(path, &session);
+    if load_rc != 0 {
+        runtime_session_deinit(&session);
+        return load_rc;
+    }
+    const rc: i32 = runtime_session_generate_to_buffer(&session, prompt, max_new_tokens, out);
+    runtime_session_deinit(&session);
+    return rc;
+}
+
+export fn print_runtime_generate(path: &const byte, prompt: &const byte) i32 {
+    var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
+    const rc: i32 = runtime_generate_to_buffer(path, prompt, RUNTIME_DEFAULT_MAX_NEW, &out);
+    if rc == 0 {
+        if out.data != null {
+            _ = printf("%s", &out.data[0]);
+        }
+        _ = printf("\n");
+    } else {
+        runtime_print_load_error(path, rc);
+    }
+    tokenizer_byte_buffer_deinit(&out);
+    return rc;
+}
+
+fn runtime_read_line(buf: &byte, cap: usize) i64 {
+    if cap == 0 {
+        return -1;
+    }
+    var pos: usize = 0;
+    while pos + 1 < cap {
+        const got: i64 = read(0, &buf[pos], 1 as usize);
+        if got < 0 {
+            return -1;
+        }
+        if got == 0 {
+            if pos == 0 {
+                return 0;
+            }
+            break;
+        }
+        if buf[pos] == (10 as byte) {
+            break;
+        }
+        pos = pos + 1;
+    }
+    if pos > 0 && buf[pos - 1] == (13 as byte) {
+        pos = pos - 1;
+    }
+    buf[pos] = 0;
+    return pos as i64;
+}
+
+export fn print_runtime_chat(path: &const byte) i32 {
+    var session: RuntimeSession = runtime_session_init();
+    const load_rc: i32 = runtime_session_load_gguf(path, &session);
+    if load_rc != 0 {
+        runtime_print_load_error(path, load_rc);
+        runtime_session_deinit(&session);
+        return load_rc;
+    }
+
+    _ = printf("ds4-uya chat ready. Type /quit to exit.\n");
+    var line: [byte: 4096] = [];
+    var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
+    while true {
+        _ = printf("> ");
+        _ = fflush(stdout);
+        const n: i64 = runtime_read_line(&line[0], 4096);
+        if n <= 0 {
+            break;
+        }
+        if strcmp(&line[0] as *const byte, "/quit\0" as *const byte) == 0 ||
+            strcmp(&line[0] as *const byte, "/exit\0" as *const byte) == 0 {
+            break;
+        }
+        const rc: i32 = runtime_session_generate_to_buffer(&session, &line[0] as &const byte, RUNTIME_CHAT_MAX_NEW, &out);
+        if rc != 0 {
+            runtime_print_load_error(path, rc);
+            tokenizer_byte_buffer_deinit(&out);
+            runtime_session_deinit(&session);
+            return rc;
+        }
+        if out.data != null {
+            _ = printf("%s", &out.data[0]);
+        }
+        _ = printf("\n");
+    }
+
+    tokenizer_byte_buffer_deinit(&out);
+    runtime_session_deinit(&session);
+    return 0;
+}

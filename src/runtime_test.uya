@@ -1,0 +1,185 @@
+use ds4.gguf.GGML_TYPE_F32;
+use ds4.runtime.RuntimeSession;
+use ds4.runtime.runtime_session_deinit;
+use ds4.runtime.runtime_session_generate_to_buffer;
+use ds4.runtime.runtime_session_init;
+use ds4.runtime.runtime_session_load_gguf;
+use ds4.tokenizer.TokenizerByteBuffer;
+use ds4.tokenizer.tokenizer_byte_buffer_deinit;
+use ds4.tokenizer.tokenizer_byte_buffer_init;
+use libc.FILE;
+use libc.fclose;
+use libc.fopen;
+use libc.fwrite;
+use libc.remove;
+use libc.strlen;
+use std.testing.assert_eq_i32;
+use std.testing.expect;
+
+const TEST_GGUF_MAGIC: u32 = 0x46554747;
+const TEST_GGUF_TYPE_UINT32: u32 = 4;
+const TEST_GGUF_TYPE_STRING: u32 = 8;
+const TEST_GGUF_TYPE_ARRAY: u32 = 9;
+
+fn write_u32_le(fp: &FILE, value: u32) bool {
+    var buf: [byte: 4] = [];
+    buf[0] = value as byte;
+    buf[1] = (value >> 8) as byte;
+    buf[2] = (value >> 16) as byte;
+    buf[3] = (value >> 24) as byte;
+    return fwrite(&buf[0], 1 as usize, 4 as usize, fp) == 4;
+}
+
+fn write_u64_le(fp: &FILE, value: u64) bool {
+    var buf: [byte: 8] = [];
+    buf[0] = value as byte;
+    buf[1] = (value >> 8) as byte;
+    buf[2] = (value >> 16) as byte;
+    buf[3] = (value >> 24) as byte;
+    buf[4] = (value >> 32) as byte;
+    buf[5] = (value >> 40) as byte;
+    buf[6] = (value >> 48) as byte;
+    buf[7] = (value >> 56) as byte;
+    return fwrite(&buf[0], 1 as usize, 8 as usize, fp) == 8;
+}
+
+fn write_cstr_bytes(fp: &FILE, text: &const byte) bool {
+    const len: usize = strlen(text as *const byte);
+    return fwrite(text, 1 as usize, len, fp) == len;
+}
+
+fn write_gguf_string(fp: &FILE, text: &const byte) bool {
+    const len: usize = strlen(text as *const byte);
+    if !write_u64_le(fp, len as u64) {
+        return false;
+    }
+    return write_cstr_bytes(fp, text);
+}
+
+fn write_meta_u32(fp: &FILE, key: &const byte, value: u32) bool {
+    return write_gguf_string(fp, key) &&
+        write_u32_le(fp, TEST_GGUF_TYPE_UINT32) &&
+        write_u32_le(fp, value);
+}
+
+fn write_meta_string(fp: &FILE, key: &const byte, value: &const byte) bool {
+    return write_gguf_string(fp, key) &&
+        write_u32_le(fp, TEST_GGUF_TYPE_STRING) &&
+        write_gguf_string(fp, value);
+}
+
+fn write_meta_tokens(fp: &FILE) bool {
+    return write_gguf_string(fp, "tokenizer.ggml.tokens\0" as &const byte) &&
+        write_u32_le(fp, TEST_GGUF_TYPE_ARRAY) &&
+        write_u32_le(fp, TEST_GGUF_TYPE_STRING) &&
+        write_u64_le(fp, 2) &&
+        write_gguf_string(fp, "a\0" as &const byte) &&
+        write_gguf_string(fp, "b\0" as &const byte);
+}
+
+fn write_meta_empty_merges(fp: &FILE) bool {
+    return write_gguf_string(fp, "tokenizer.ggml.merges\0" as &const byte) &&
+        write_u32_le(fp, TEST_GGUF_TYPE_ARRAY) &&
+        write_u32_le(fp, TEST_GGUF_TYPE_STRING) &&
+        write_u64_le(fp, 0);
+}
+
+fn write_tensor_entry(fp: &FILE, name: &const byte, n_dims: u32, d0: u64, d1: u64, rel_offset: u64) bool {
+    if !write_gguf_string(fp, name) { return false; }
+    if !write_u32_le(fp, n_dims) { return false; }
+    if !write_u64_le(fp, d0) { return false; }
+    if n_dims > 1 {
+        if !write_u64_le(fp, d1) { return false; }
+    }
+    if !write_u32_le(fp, GGML_TYPE_F32) { return false; }
+    return write_u64_le(fp, rel_offset);
+}
+
+fn write_f32_bits(fp: &FILE, bits: u32) bool {
+    return write_u32_le(fp, bits);
+}
+
+fn write_fixture_alignment_padding(fp: &FILE) bool {
+    var padding: [byte: 12] = [];
+    return fwrite(&padding[0], 1 as usize, 12 as usize, fp) == 12;
+}
+
+fn write_runtime_fixture(path: &const byte) bool {
+    const fp: &FILE = fopen(path, "wb\0" as &const byte);
+    if fp == null {
+        return false;
+    }
+
+    var ok: bool = true;
+    ok = ok && write_u32_le(fp, TEST_GGUF_MAGIC);
+    ok = ok && write_u32_le(fp, 3);
+    ok = ok && write_u64_le(fp, 12);
+    ok = ok && write_u64_le(fp, 10);
+
+    ok = ok && write_meta_string(fp, "general.architecture\0" as &const byte, "deepseek4\0" as &const byte);
+    ok = ok && write_meta_string(fp, "general.name\0" as &const byte, "tiny-runtime\0" as &const byte);
+    ok = ok && write_meta_u32(fp, "deepseek4.block_count\0" as &const byte, 1);
+    ok = ok && write_meta_u32(fp, "deepseek4.context_length\0" as &const byte, 8);
+    ok = ok && write_meta_u32(fp, "deepseek4.embedding_length\0" as &const byte, 1);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.head_count\0" as &const byte, 1);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.head_count_kv\0" as &const byte, 1);
+    ok = ok && write_meta_u32(fp, "tokenizer.ggml.add_bos_token\0" as &const byte, 0);
+    ok = ok && write_meta_tokens(fp);
+    ok = ok && write_meta_empty_merges(fp);
+
+    ok = ok && write_tensor_entry(fp, "token_embd.weight\0" as &const byte, 2, 1, 2, 0);
+    ok = ok && write_tensor_entry(fp, "output_norm.weight\0" as &const byte, 1, 1, 0, 8);
+    ok = ok && write_tensor_entry(fp, "output.weight\0" as &const byte, 2, 1, 2, 12);
+    ok = ok && write_tensor_entry(fp, "blk.0.attn_norm.weight\0" as &const byte, 1, 1, 0, 20);
+    ok = ok && write_tensor_entry(fp, "blk.0.attn_q.weight\0" as &const byte, 2, 1, 1, 24);
+    ok = ok && write_tensor_entry(fp, "blk.0.attn_k.weight\0" as &const byte, 2, 1, 1, 28);
+    ok = ok && write_tensor_entry(fp, "blk.0.attn_v.weight\0" as &const byte, 2, 1, 1, 32);
+    ok = ok && write_tensor_entry(fp, "blk.0.attn_output.weight\0" as &const byte, 2, 1, 1, 36);
+    ok = ok && write_tensor_entry(fp, "blk.0.ffn_norm.weight\0" as &const byte, 1, 1, 0, 40);
+    ok = ok && write_tensor_entry(fp, "blk.0.ffn_gate.weight\0" as &const byte, 2, 1, 1, 44);
+    ok = ok && write_tensor_entry(fp, "blk.0.ffn_up.weight\0" as &const byte, 2, 1, 1, 48);
+    ok = ok && write_tensor_entry(fp, "blk.0.ffn_down.weight\0" as &const byte, 2, 1, 1, 52);
+
+    ok = ok && write_fixture_alignment_padding(fp);
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x40000000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x40000000) { ok = false; }
+    if !write_f32_bits(fp, 0xbf800000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f800000) { ok = false; }
+    if !write_f32_bits(fp, 0x40000000) { ok = false; }
+    if !write_f32_bits(fp, 0x3f000000) { ok = false; }
+
+    _ = fclose(fp);
+    return ok;
+}
+
+test "runtime maps GGUF tensors into forward and generates decoded text" {
+    const path: &const byte = "/tmp/ds4-uya-runtime-test.gguf\0" as &const byte;
+    _ = remove(path);
+    try expect(write_runtime_fixture(path));
+
+    var session: RuntimeSession = runtime_session_init();
+    try assert_eq_i32(runtime_session_load_gguf(path, &session), 0);
+    try assert_eq_i32(session.config.n_vocab as i32, 2);
+    try assert_eq_i32(session.config.n_embd as i32, 1);
+    try expect(session.table.token_embd.data != null);
+    try expect(session.weights.output.data != null);
+
+    var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
+    try assert_eq_i32(runtime_session_generate_to_buffer(&session, "b\0" as &const byte, 3, &out), 0);
+    try assert_eq_i32(out.len as i32, 3);
+    try assert_eq_i32(out.data[0] as i32, 97);
+    try assert_eq_i32(out.data[1] as i32, 97);
+    try assert_eq_i32(out.data[2] as i32, 97);
+
+    tokenizer_byte_buffer_deinit(&out);
+    runtime_session_deinit(&session);
+    _ = remove(path);
+}

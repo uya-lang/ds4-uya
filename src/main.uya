@@ -1,7 +1,8 @@
 use ds4.bench.print_benchmark;
 use ds4.gguf.inspect_gguf;
 use ds4.gguf.print_gguf_tensor;
-use ds4.sampler.print_generation_not_ready;
+use ds4.runtime.print_runtime_chat;
+use ds4.runtime.print_runtime_generate;
 use ds4.tensor.print_tensor_weight_view;
 use ds4.tokenizer.TokenizerTokenVec;
 use ds4.tokenizer.print_tokenizer_decode_ids;
@@ -30,8 +31,8 @@ fn print_help() void {
     _ = printf("  ds4-uya bench\n");
     _ = printf("\n");
     _ = printf("status:\n");
-    _ = printf("  implemented: GGUF loader, tokenizer, CPU tensor views, reference/optimized kernels, transformer forward, sampler, generation CLI entrypoints, benchmark\n");
-    _ = printf("  planned: GGUF-backed token generation\n");
+    _ = printf("  implemented: GGUF loader, tokenizer, CPU tensor views, reference/optimized kernels, transformer forward, sampler, GGUF-backed generation/chat, benchmark\n");
+    _ = printf("  current CPU generation supports dense decoder GGUFs with n_head == n_head_kv and F32/F16/Q8_0/Q4_K matrices\n");
 }
 
 export extern fn main(argc: i32, argv: & &byte) i32 {
@@ -126,7 +127,7 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
             _ = printf("ds4-uya: generate requires a GGUF file path and prompt\n");
             return 1;
         }
-        return print_generation_not_ready("generate\0" as &const byte);
+        return print_runtime_generate(argv[2] as &const byte, argv[3] as &const byte);
     }
 
     if strcmp(cmd as *const byte, "chat\0" as *const byte) == 0 {
@@ -134,7 +135,7 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
             _ = printf("ds4-uya: chat requires a GGUF file path\n");
             return 1;
         }
-        return print_generation_not_ready("chat\0" as &const byte);
+        return print_runtime_chat(argv[2] as &const byte);
     }
 
     if strcmp(cmd as *const byte, "bench\0" as *const byte) == 0 {
