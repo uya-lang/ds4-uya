@@ -7,6 +7,10 @@ export fn le_u32_from_bytes(b0: byte, b1: byte, b2: byte, b3: byte) u32 {
         | ((b3 as u32) << 24);
 }
 
+export fn le_u16_from_bytes(b0: byte, b1: byte) u16 {
+    return (b0 as u16) | ((b1 as u16) << 8);
+}
+
 export fn le_u64_from_bytes(
     b0: byte,
     b1: byte,
@@ -26,4 +30,3 @@ export fn le_u64_from_bytes(
         | ((b6 as u64) << 48)
         | ((b7 as u64) << 56);
 }
-

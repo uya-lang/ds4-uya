@@ -31,6 +31,7 @@ make build UYA=/path/to/uya
 ```sh
 build/ds4-uya --help
 build/ds4-uya inspect /path/to/model.gguf
+build/ds4-uya tensor /path/to/model.gguf output_norm.weight
 ```
 
 For the partial model currently present in the sibling `ds4` project:
@@ -43,6 +44,6 @@ build/ds4-uya inspect /home/winger/uya/ds4/gguf/DeepSeek-V4-Flash-Q4KExperts-F16
 
 - Pure Uya source only; no Metal, no C runtime reuse from the original DS4 code.
 - CPU target: Linux x86_64 first.
-- Implemented now: CLI plus GGUF header/metadata/tensor-directory inspection.
+- Implemented now: CLI plus GGUF loader, metadata/tensor-directory inspection,
+  tensor lookup, tensor offsets, and truncation diagnostics.
 - Not implemented yet: tokenizer and token generation.
-

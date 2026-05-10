@@ -1,4 +1,5 @@
 use ds4.gguf.inspect_gguf;
+use ds4.gguf.print_gguf_tensor;
 use libc.printf;
 use libc.strcmp;
 
@@ -8,9 +9,10 @@ fn print_help() void {
     _ = printf("usage:\n");
     _ = printf("  ds4-uya --help\n");
     _ = printf("  ds4-uya inspect <model.gguf>\n");
+    _ = printf("  ds4-uya tensor <model.gguf> <tensor-name>\n");
     _ = printf("\n");
     _ = printf("status:\n");
-    _ = printf("  implemented: GGUF inspection\n");
+    _ = printf("  implemented: GGUF loader and inspection\n");
     _ = printf("  planned: tokenizer, CPU tensors, quant kernels, generation\n");
 }
 
@@ -38,8 +40,15 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
         return inspect_gguf(argv[2] as &const byte);
     }
 
+    if strcmp(cmd as *const byte, "tensor\0" as *const byte) == 0 {
+        if argc < 4 {
+            _ = printf("ds4-uya: tensor requires a GGUF file path and tensor name\n");
+            return 1;
+        }
+        return print_gguf_tensor(argv[2] as &const byte, argv[3] as &const byte);
+    }
+
     _ = printf("ds4-uya: unknown command: %s\n", cmd);
     print_help();
     return 1;
 }
-

@@ -1,0 +1,23 @@
+use ds4.gguf.GGML_TYPE_F32;
+use ds4.gguf.GGML_TYPE_Q4_K;
+use ds4.gguf.GGML_TYPE_Q8_0;
+use ds4.gguf.gguf_tensor_nbytes;
+use std.testing.assert_eq_i32;
+
+test "gguf_tensor_nbytes_plain" {
+    var bytes: u64 = 0;
+    const ok: bool = gguf_tensor_nbytes(GGML_TYPE_F32, 6, &bytes);
+    try assert_eq_i32(ok as i32, 1);
+    try assert_eq_i32(bytes as i32, 24);
+}
+
+test "gguf_tensor_nbytes_block_quantized" {
+    var bytes: u64 = 0;
+    const ok_q8: bool = gguf_tensor_nbytes(GGML_TYPE_Q8_0, 64, &bytes);
+    try assert_eq_i32(ok_q8 as i32, 1);
+    try assert_eq_i32(bytes as i32, 68);
+
+    const ok_q4k: bool = gguf_tensor_nbytes(GGML_TYPE_Q4_K, 257, &bytes);
+    try assert_eq_i32(ok_q4k as i32, 1);
+    try assert_eq_i32(bytes as i32, 288);
+}

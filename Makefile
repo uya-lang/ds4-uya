@@ -10,6 +10,7 @@ build:
 
 test:
 	$(UYA) test src/binary_test.uya
+	$(UYA) test src/gguf_test.uya
 
 help: build
 	$(BIN) --help

@@ -21,13 +21,13 @@
 
 ## Phase 1: GGUF loader
 
-- [ ] 把 inspector 扩展成持久化 loader。
-- [ ] 记录 metadata key/value 中的关键模型超参。
-- [ ] 记录 tokenizer metadata。
-- [ ] 记录完整 tensor info 表。
-- [ ] 计算每个 tensor 的绝对文件 offset 和 byte size。
-- [ ] 支持 alignment。
-- [ ] 对 `.part` 文件报出截断发生在 metadata、tensor directory 还是 tensor data。
+- [x] 把 inspector 扩展成持久化 loader。
+- [x] 记录 metadata key/value 中的关键模型超参。
+- [x] 记录 tokenizer metadata。
+- [x] 记录完整 tensor info 表。
+- [x] 计算每个 tensor 的绝对文件 offset 和 byte size。
+- [x] 支持 alignment。
+- [x] 对 `.part` 文件报出截断发生在 metadata、tensor directory 还是 tensor data。
 
 验收标准：
 
@@ -37,7 +37,7 @@
 
 ## Phase 2: tokenizer
 
-- [ ] 解析 GGUF tokenizer metadata。
+- [x] 解析 GGUF tokenizer metadata。
 - [ ] 实现 token id 到 piece。
 - [ ] 实现 encode。
 - [ ] 实现 decode。
@@ -120,4 +120,3 @@
 
 - 优化版与 reference 误差在阈值内。
 - benchmark 能报告 prompt/decode tokens/s。
-

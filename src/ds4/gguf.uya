@@ -1,16 +1,21 @@
+use ds4.binary.le_u16_from_bytes;
 use ds4.binary.le_u32_from_bytes;
 use ds4.binary.le_u64_from_bytes;
 use libc.FILE;
 use libc.fclose;
 use libc.fopen;
 use libc.fread;
+use libc.free;
 use libc.fseek;
 use libc.ftell;
+use libc.malloc;
 use libc.printf;
+use libc.strlen;
 
 const GGUF_MAGIC: u32 = 0x46554747;
 const SEEK_SET: i32 = 0;
 const SEEK_END: i32 = 2;
+const U64_MAX: u64 = 0xffffffffffffffff;
 
 const GGUF_TYPE_UINT8: u32 = 0;
 const GGUF_TYPE_INT8: u32 = 1;
@@ -26,26 +31,238 @@ const GGUF_TYPE_UINT64: u32 = 10;
 const GGUF_TYPE_INT64: u32 = 11;
 const GGUF_TYPE_FLOAT64: u32 = 12;
 
+const GGUF_STAGE_NONE: u32 = 0;
+const GGUF_STAGE_HEADER: u32 = 1;
+const GGUF_STAGE_METADATA: u32 = 2;
+const GGUF_STAGE_TENSOR_DIRECTORY: u32 = 3;
+const GGUF_STAGE_TENSOR_DATA: u32 = 4;
+const GGUF_STAGE_ALLOC: u32 = 5;
+
+export const GGML_TYPE_F32: u32 = 0;
+export const GGML_TYPE_F16: u32 = 1;
+export const GGML_TYPE_Q4_0: u32 = 2;
+export const GGML_TYPE_Q4_1: u32 = 3;
+export const GGML_TYPE_Q5_0: u32 = 6;
+export const GGML_TYPE_Q5_1: u32 = 7;
+export const GGML_TYPE_Q8_0: u32 = 8;
+export const GGML_TYPE_Q8_1: u32 = 9;
+export const GGML_TYPE_Q2_K: u32 = 10;
+export const GGML_TYPE_Q3_K: u32 = 11;
+export const GGML_TYPE_Q4_K: u32 = 12;
+export const GGML_TYPE_Q5_K: u32 = 13;
+export const GGML_TYPE_Q6_K: u32 = 14;
+export const GGML_TYPE_Q8_K: u32 = 15;
+export const GGML_TYPE_IQ2_XXS: u32 = 16;
+export const GGML_TYPE_IQ2_XS: u32 = 17;
+export const GGML_TYPE_IQ3_XXS: u32 = 18;
+export const GGML_TYPE_IQ1_S: u32 = 19;
+export const GGML_TYPE_IQ4_NL: u32 = 20;
+export const GGML_TYPE_IQ3_S: u32 = 21;
+export const GGML_TYPE_IQ2_S: u32 = 22;
+export const GGML_TYPE_IQ4_XS: u32 = 23;
+export const GGML_TYPE_I8: u32 = 24;
+export const GGML_TYPE_I16: u32 = 25;
+export const GGML_TYPE_I32: u32 = 26;
+export const GGML_TYPE_I64: u32 = 27;
+export const GGML_TYPE_F64: u32 = 28;
+export const GGML_TYPE_IQ1_M: u32 = 29;
+export const GGML_TYPE_BF16: u32 = 30;
+
 struct Reader {
     fp: &FILE,
     size: u64,
     pos: u64,
 }
 
-struct SampleString {
+export struct GgufString {
     len: u64,
     shown: usize,
     data: [byte: 256],
 }
 
-fn sample_clear(out: &SampleString) void {
-    out.len = 0;
-    out.shown = 0;
-    var i: usize = 0;
-    while i < 256 {
-        out.data[i] = 0;
-        i = i + 1;
+export struct GgufMetadataInfo {
+    key: GgufString,
+    value_type: u32,
+    value_offset: u64,
+    array_type: u32,
+    array_len: u64,
+    array_data_offset: u64,
+    scalar_u64: u64,
+    string_sample: GgufString,
+}
+
+export struct GgufTensorInfo {
+    name: GgufString,
+    n_dims: u32,
+    shape: [u64: 8],
+    ggml_type: u32,
+    rel_offset: u64,
+    abs_offset: u64,
+    elements: u64,
+    byte_size: u64,
+    byte_size_known: bool,
+}
+
+export struct GgufInfo {
+    magic: u32,
+    version: u32,
+    file_size: u64,
+    tensor_count: u64,
+    metadata_count: u64,
+    loaded_tensor_count: u64,
+    loaded_metadata_count: u64,
+    metadata_end: u64,
+    tensor_directory_end: u64,
+    tensor_data_start: u64,
+    alignment: u64,
+    metadata: &GgufMetadataInfo,
+    tensors: &GgufTensorInfo,
+    tokenizer_metadata_count: u64,
+
+    general_architecture: GgufString,
+    general_name: GgufString,
+    has_file_type: bool,
+    file_type: u64,
+    has_block_count: bool,
+    block_count: u64,
+    has_context_length: bool,
+    context_length: u64,
+    has_embedding_length: bool,
+    embedding_length: u64,
+    has_head_count: bool,
+    head_count: u64,
+    has_head_count_kv: bool,
+    head_count_kv: u64,
+    has_key_length: bool,
+    key_length: u64,
+    has_value_length: bool,
+    value_length: u64,
+    has_expert_count: bool,
+    expert_count: u64,
+    has_expert_used_count: bool,
+    expert_used_count: u64,
+
+    tokenizer_model: GgufString,
+    tokenizer_pre: GgufString,
+    tokenizer_chat_template: GgufString,
+    has_tokenizer_tokens: bool,
+    tokenizer_tokens_count: u64,
+    tokenizer_tokens_offset: u64,
+    has_tokenizer_token_types: bool,
+    tokenizer_token_types_count: u64,
+    tokenizer_token_types_offset: u64,
+    has_tokenizer_merges: bool,
+    tokenizer_merges_count: u64,
+    tokenizer_merges_offset: u64,
+    has_bos_token_id: bool,
+    bos_token_id: u64,
+    has_eos_token_id: bool,
+    eos_token_id: u64,
+    has_unk_token_id: bool,
+    unk_token_id: u64,
+    has_padding_token_id: bool,
+    padding_token_id: u64,
+    has_add_bos_token: bool,
+    add_bos_token: bool,
+    has_add_eos_token: bool,
+    add_eos_token: bool,
+
+    error_stage: u32,
+    error_index: u64,
+    error_offset: u64,
+    error_value_type: u32,
+    required_end: u64,
+}
+
+fn gguf_string_zero() GgufString {
+    return GgufString{ len: 0, shown: 0, data: [] };
+}
+
+export fn gguf_info_init() GgufInfo {
+    return GgufInfo{
+        magic: 0,
+        version: 0,
+        file_size: 0,
+        tensor_count: 0,
+        metadata_count: 0,
+        loaded_tensor_count: 0,
+        loaded_metadata_count: 0,
+        metadata_end: 0,
+        tensor_directory_end: 0,
+        tensor_data_start: 0,
+        alignment: 32,
+        metadata: null,
+        tensors: null,
+        tokenizer_metadata_count: 0,
+        general_architecture: gguf_string_zero(),
+        general_name: gguf_string_zero(),
+        has_file_type: false,
+        file_type: 0,
+        has_block_count: false,
+        block_count: 0,
+        has_context_length: false,
+        context_length: 0,
+        has_embedding_length: false,
+        embedding_length: 0,
+        has_head_count: false,
+        head_count: 0,
+        has_head_count_kv: false,
+        head_count_kv: 0,
+        has_key_length: false,
+        key_length: 0,
+        has_value_length: false,
+        value_length: 0,
+        has_expert_count: false,
+        expert_count: 0,
+        has_expert_used_count: false,
+        expert_used_count: 0,
+        tokenizer_model: gguf_string_zero(),
+        tokenizer_pre: gguf_string_zero(),
+        tokenizer_chat_template: gguf_string_zero(),
+        has_tokenizer_tokens: false,
+        tokenizer_tokens_count: 0,
+        tokenizer_tokens_offset: 0,
+        has_tokenizer_token_types: false,
+        tokenizer_token_types_count: 0,
+        tokenizer_token_types_offset: 0,
+        has_tokenizer_merges: false,
+        tokenizer_merges_count: 0,
+        tokenizer_merges_offset: 0,
+        has_bos_token_id: false,
+        bos_token_id: 0,
+        has_eos_token_id: false,
+        eos_token_id: 0,
+        has_unk_token_id: false,
+        unk_token_id: 0,
+        has_padding_token_id: false,
+        padding_token_id: 0,
+        has_add_bos_token: false,
+        add_bos_token: false,
+        has_add_eos_token: false,
+        add_eos_token: false,
+        error_stage: GGUF_STAGE_NONE,
+        error_index: 0,
+        error_offset: 0,
+        error_value_type: 0,
+        required_end: 0,
+    };
+}
+
+export fn gguf_info_deinit(info: &GgufInfo) void {
+    if info.metadata != null {
+        free(info.metadata as &void);
     }
+    if info.tensors != null {
+        free(info.tensors as &void);
+    }
+    *info = gguf_info_init();
+}
+
+fn set_error(info: &GgufInfo, stage: u32, index: u64, offset: u64, value_type: u32) void {
+    info.error_stage = stage;
+    info.error_index = index;
+    info.error_offset = offset;
+    info.error_value_type = value_type;
 }
 
 fn reader_remaining(r: &Reader) u64 {
@@ -81,6 +298,24 @@ fn reader_skip(r: &Reader, n: u64) bool {
     return true;
 }
 
+fn read_u8(r: &Reader, out: &byte) bool {
+    var buf: [byte: 1] = [];
+    if !reader_read(r, &buf[0], 1) {
+        return false;
+    }
+    *out = buf[0];
+    return true;
+}
+
+fn read_u16(r: &Reader, out: &u16) bool {
+    var buf: [byte: 2] = [];
+    if !reader_read(r, &buf[0], 2) {
+        return false;
+    }
+    *out = le_u16_from_bytes(buf[0], buf[1]);
+    return true;
+}
+
 fn read_u32(r: &Reader, out: &u32) bool {
     var buf: [byte: 4] = [];
     if !reader_read(r, &buf[0], 4) {
@@ -99,8 +334,8 @@ fn read_u64(r: &Reader, out: &u64) bool {
     return true;
 }
 
-fn read_string_sample(r: &Reader, out: &SampleString) bool {
-    sample_clear(out);
+fn read_gguf_string(r: &Reader, out: &GgufString) bool {
+    *out = gguf_string_zero();
 
     var len: u64 = 0;
     if !read_u64(r, &len) {
@@ -134,12 +369,14 @@ fn read_string_sample(r: &Reader, out: &SampleString) bool {
     return true;
 }
 
-fn skip_string(r: &Reader) bool {
-    var len: u64 = 0;
-    if !read_u64(r, &len) {
-        return false;
+fn copy_gguf_string(dst: &GgufString, src: &GgufString) void {
+    dst.len = src.len;
+    dst.shown = src.shown;
+    var i: usize = 0;
+    while i < 256 {
+        dst.data[i] = src.data[i];
+        i = i + 1;
     }
-    return reader_skip(r, len);
 }
 
 fn scalar_value_size(value_type: u32) u64 {
@@ -158,37 +395,9 @@ fn scalar_value_size(value_type: u32) u64 {
     return 0;
 }
 
-fn skip_array(r: &Reader) bool {
-    var elem_type: u32 = 0;
-    var count: u64 = 0;
-    if !read_u32(r, &elem_type) {
-        return false;
-    }
-    if !read_u64(r, &count) {
-        return false;
-    }
-
-    if elem_type == GGUF_TYPE_STRING {
-        var i: u64 = 0;
-        while i < count {
-            if !skip_string(r) {
-                return false;
-            }
-            i = i + 1;
-        }
-        return true;
-    }
-
-    const item_size: u64 = scalar_value_size(elem_type);
-    if item_size == 0 {
-        return false;
-    }
-
-    const remaining: u64 = reader_remaining(r);
-    if count > (remaining / item_size) {
-        return false;
-    }
-    return reader_skip(r, count * item_size);
+fn skip_string(r: &Reader) bool {
+    var ignored: GgufString = gguf_string_zero();
+    return read_gguf_string(r, &ignored);
 }
 
 fn skip_metadata_value(r: &Reader, value_type: u32) bool {
@@ -196,7 +405,15 @@ fn skip_metadata_value(r: &Reader, value_type: u32) bool {
         return skip_string(r);
     }
     if value_type == GGUF_TYPE_ARRAY {
-        return skip_array(r);
+        var elem_type: u32 = 0;
+        var count: u64 = 0;
+        if !read_u32(r, &elem_type) {
+            return false;
+        }
+        if !read_u64(r, &count) {
+            return false;
+        }
+        return skip_array_body(r, elem_type, count);
     }
 
     const size: u64 = scalar_value_size(value_type);
@@ -204,6 +421,235 @@ fn skip_metadata_value(r: &Reader, value_type: u32) bool {
         return false;
     }
     return reader_skip(r, size);
+}
+
+fn skip_array_body(r: &Reader, elem_type: u32, count: u64) bool {
+    const item_size: u64 = scalar_value_size(elem_type);
+    if item_size != 0 {
+        const remaining: u64 = reader_remaining(r);
+        if count > (remaining / item_size) {
+            return false;
+        }
+        return reader_skip(r, count * item_size);
+    }
+
+    var i: u64 = 0;
+    while i < count {
+        if !skip_metadata_value(r, elem_type) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn read_metadata_value(r: &Reader, meta: &GgufMetadataInfo) bool {
+    meta.value_offset = r.pos;
+
+    if meta.value_type == GGUF_TYPE_STRING {
+        return read_gguf_string(r, &meta.string_sample);
+    }
+
+    if meta.value_type == GGUF_TYPE_ARRAY {
+        if !read_u32(r, &meta.array_type) {
+            return false;
+        }
+        if !read_u64(r, &meta.array_len) {
+            return false;
+        }
+        meta.array_data_offset = r.pos;
+        return skip_array_body(r, meta.array_type, meta.array_len);
+    }
+
+    if meta.value_type == GGUF_TYPE_UINT8 || meta.value_type == GGUF_TYPE_INT8 || meta.value_type == GGUF_TYPE_BOOL {
+        var value8: byte = 0;
+        if !read_u8(r, &value8) {
+            return false;
+        }
+        meta.scalar_u64 = value8 as u64;
+        return true;
+    }
+
+    if meta.value_type == GGUF_TYPE_UINT16 || meta.value_type == GGUF_TYPE_INT16 {
+        var value16: u16 = 0;
+        if !read_u16(r, &value16) {
+            return false;
+        }
+        meta.scalar_u64 = value16 as u64;
+        return true;
+    }
+
+    if meta.value_type == GGUF_TYPE_UINT32 || meta.value_type == GGUF_TYPE_INT32 || meta.value_type == GGUF_TYPE_FLOAT32 {
+        var value32: u32 = 0;
+        if !read_u32(r, &value32) {
+            return false;
+        }
+        meta.scalar_u64 = value32 as u64;
+        return true;
+    }
+
+    if meta.value_type == GGUF_TYPE_UINT64 || meta.value_type == GGUF_TYPE_INT64 || meta.value_type == GGUF_TYPE_FLOAT64 {
+        var value64: u64 = 0;
+        if !read_u64(r, &value64) {
+            return false;
+        }
+        meta.scalar_u64 = value64;
+        return true;
+    }
+
+    return false;
+}
+
+fn sample_equals(s: &GgufString, literal: &const byte) bool {
+    const n: usize = strlen(literal as *const byte);
+    if s.len != n as u64 {
+        return false;
+    }
+    if s.shown != n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if s.data[i] != literal[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn sample_has_prefix(s: &GgufString, prefix: &const byte) bool {
+    const n: usize = strlen(prefix as *const byte);
+    if s.len < n as u64 || s.shown < n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if s.data[i] != prefix[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn metadata_as_u64(meta: &GgufMetadataInfo, out: &u64) bool {
+    if meta.value_type == GGUF_TYPE_UINT8 || meta.value_type == GGUF_TYPE_UINT16 ||
+        meta.value_type == GGUF_TYPE_UINT32 || meta.value_type == GGUF_TYPE_UINT64 ||
+        meta.value_type == GGUF_TYPE_INT8 || meta.value_type == GGUF_TYPE_INT16 ||
+        meta.value_type == GGUF_TYPE_INT32 || meta.value_type == GGUF_TYPE_INT64 {
+        *out = meta.scalar_u64;
+        return true;
+    }
+    return false;
+}
+
+fn record_model_metadata(info: &GgufInfo, meta: &GgufMetadataInfo) void {
+    if sample_has_prefix(&meta.key, "tokenizer.\0" as &const byte) {
+        info.tokenizer_metadata_count = info.tokenizer_metadata_count + 1;
+    }
+
+    if sample_equals(&meta.key, "tokenizer.ggml.model\0" as &const byte) && meta.value_type == GGUF_TYPE_STRING {
+        copy_gguf_string(&info.tokenizer_model, &meta.string_sample);
+        return;
+    }
+    if sample_equals(&meta.key, "tokenizer.ggml.pre\0" as &const byte) && meta.value_type == GGUF_TYPE_STRING {
+        copy_gguf_string(&info.tokenizer_pre, &meta.string_sample);
+        return;
+    }
+    if sample_equals(&meta.key, "tokenizer.chat_template\0" as &const byte) && meta.value_type == GGUF_TYPE_STRING {
+        copy_gguf_string(&info.tokenizer_chat_template, &meta.string_sample);
+        return;
+    }
+    if sample_equals(&meta.key, "tokenizer.ggml.tokens\0" as &const byte) &&
+        meta.value_type == GGUF_TYPE_ARRAY && meta.array_type == GGUF_TYPE_STRING {
+        info.has_tokenizer_tokens = true;
+        info.tokenizer_tokens_count = meta.array_len;
+        info.tokenizer_tokens_offset = meta.array_data_offset;
+        return;
+    }
+    if sample_equals(&meta.key, "tokenizer.ggml.token_type\0" as &const byte) &&
+        meta.value_type == GGUF_TYPE_ARRAY {
+        info.has_tokenizer_token_types = true;
+        info.tokenizer_token_types_count = meta.array_len;
+        info.tokenizer_token_types_offset = meta.array_data_offset;
+        return;
+    }
+    if sample_equals(&meta.key, "tokenizer.ggml.merges\0" as &const byte) &&
+        meta.value_type == GGUF_TYPE_ARRAY && meta.array_type == GGUF_TYPE_STRING {
+        info.has_tokenizer_merges = true;
+        info.tokenizer_merges_count = meta.array_len;
+        info.tokenizer_merges_offset = meta.array_data_offset;
+        return;
+    }
+
+    if sample_equals(&meta.key, "general.architecture\0" as &const byte) && meta.value_type == GGUF_TYPE_STRING {
+        copy_gguf_string(&info.general_architecture, &meta.string_sample);
+        return;
+    }
+    if sample_equals(&meta.key, "general.name\0" as &const byte) && meta.value_type == GGUF_TYPE_STRING {
+        copy_gguf_string(&info.general_name, &meta.string_sample);
+        return;
+    }
+
+    var value: u64 = 0;
+    if !metadata_as_u64(meta, &value) {
+        return;
+    }
+
+    if sample_equals(&meta.key, "general.file_type\0" as &const byte) {
+        info.has_file_type = true;
+        info.file_type = value;
+    } else if sample_equals(&meta.key, "tokenizer.ggml.bos_token_id\0" as &const byte) {
+        info.has_bos_token_id = true;
+        info.bos_token_id = value;
+    } else if sample_equals(&meta.key, "tokenizer.ggml.eos_token_id\0" as &const byte) {
+        info.has_eos_token_id = true;
+        info.eos_token_id = value;
+    } else if sample_equals(&meta.key, "tokenizer.ggml.unknown_token_id\0" as &const byte) {
+        info.has_unk_token_id = true;
+        info.unk_token_id = value;
+    } else if sample_equals(&meta.key, "tokenizer.ggml.padding_token_id\0" as &const byte) {
+        info.has_padding_token_id = true;
+        info.padding_token_id = value;
+    } else if sample_equals(&meta.key, "tokenizer.ggml.add_bos_token\0" as &const byte) {
+        info.has_add_bos_token = true;
+        info.add_bos_token = value != 0;
+    } else if sample_equals(&meta.key, "tokenizer.ggml.add_eos_token\0" as &const byte) {
+        info.has_add_eos_token = true;
+        info.add_eos_token = value != 0;
+    } else if sample_equals(&meta.key, "general.alignment\0" as &const byte) {
+        if value != 0 {
+            info.alignment = value;
+        }
+    } else if sample_equals(&meta.key, "deepseek4.block_count\0" as &const byte) {
+        info.has_block_count = true;
+        info.block_count = value;
+    } else if sample_equals(&meta.key, "deepseek4.context_length\0" as &const byte) {
+        info.has_context_length = true;
+        info.context_length = value;
+    } else if sample_equals(&meta.key, "deepseek4.embedding_length\0" as &const byte) {
+        info.has_embedding_length = true;
+        info.embedding_length = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.head_count\0" as &const byte) {
+        info.has_head_count = true;
+        info.head_count = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.head_count_kv\0" as &const byte) {
+        info.has_head_count_kv = true;
+        info.head_count_kv = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.key_length\0" as &const byte) {
+        info.has_key_length = true;
+        info.key_length = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.value_length\0" as &const byte) {
+        info.has_value_length = true;
+        info.value_length = value;
+    } else if sample_equals(&meta.key, "deepseek4.expert_count\0" as &const byte) {
+        info.has_expert_count = true;
+        info.expert_count = value;
+    } else if sample_equals(&meta.key, "deepseek4.expert_used_count\0" as &const byte) {
+        info.has_expert_used_count = true;
+        info.expert_used_count = value;
+    }
 }
 
 fn print_value_type(value_type: u32) void {
@@ -238,6 +684,198 @@ fn print_value_type(value_type: u32) void {
     }
 }
 
+fn tensor_block_elems(ggml_type: u32) u64 {
+    if ggml_type == GGML_TYPE_F32 || ggml_type == GGML_TYPE_F16 ||
+        ggml_type == GGML_TYPE_I8 || ggml_type == GGML_TYPE_I16 ||
+        ggml_type == GGML_TYPE_I32 || ggml_type == GGML_TYPE_I64 ||
+        ggml_type == GGML_TYPE_F64 || ggml_type == GGML_TYPE_BF16 {
+        return 1;
+    }
+    if ggml_type == GGML_TYPE_Q4_0 || ggml_type == GGML_TYPE_Q4_1 ||
+        ggml_type == GGML_TYPE_Q5_0 || ggml_type == GGML_TYPE_Q5_1 ||
+        ggml_type == GGML_TYPE_Q8_0 || ggml_type == GGML_TYPE_Q8_1 {
+        return 32;
+    }
+    if ggml_type >= GGML_TYPE_Q2_K && ggml_type <= GGML_TYPE_IQ1_M {
+        return 256;
+    }
+    return 0;
+}
+
+fn tensor_block_bytes(ggml_type: u32) u64 {
+    if ggml_type == GGML_TYPE_F32 {
+        return 4;
+    }
+    if ggml_type == GGML_TYPE_F16 {
+        return 2;
+    }
+    if ggml_type == GGML_TYPE_Q4_0 {
+        return 18;
+    }
+    if ggml_type == GGML_TYPE_Q4_1 {
+        return 20;
+    }
+    if ggml_type == GGML_TYPE_Q5_0 {
+        return 22;
+    }
+    if ggml_type == GGML_TYPE_Q5_1 {
+        return 24;
+    }
+    if ggml_type == GGML_TYPE_Q8_0 {
+        return 34;
+    }
+    if ggml_type == GGML_TYPE_Q8_1 {
+        return 40;
+    }
+    if ggml_type == GGML_TYPE_Q2_K {
+        return 84;
+    }
+    if ggml_type == GGML_TYPE_Q3_K {
+        return 110;
+    }
+    if ggml_type == GGML_TYPE_Q4_K {
+        return 144;
+    }
+    if ggml_type == GGML_TYPE_Q5_K {
+        return 176;
+    }
+    if ggml_type == GGML_TYPE_Q6_K {
+        return 210;
+    }
+    if ggml_type == GGML_TYPE_Q8_K {
+        return 292;
+    }
+    if ggml_type == GGML_TYPE_IQ2_XXS {
+        return 66;
+    }
+    if ggml_type == GGML_TYPE_IQ2_XS {
+        return 74;
+    }
+    if ggml_type == GGML_TYPE_IQ3_XXS {
+        return 98;
+    }
+    if ggml_type == GGML_TYPE_IQ1_S {
+        return 110;
+    }
+    if ggml_type == GGML_TYPE_IQ4_NL {
+        return 50;
+    }
+    if ggml_type == GGML_TYPE_IQ3_S {
+        return 110;
+    }
+    if ggml_type == GGML_TYPE_IQ2_S {
+        return 82;
+    }
+    if ggml_type == GGML_TYPE_IQ4_XS {
+        return 136;
+    }
+    if ggml_type == GGML_TYPE_I8 {
+        return 1;
+    }
+    if ggml_type == GGML_TYPE_I16 {
+        return 2;
+    }
+    if ggml_type == GGML_TYPE_I32 {
+        return 4;
+    }
+    if ggml_type == GGML_TYPE_I64 {
+        return 8;
+    }
+    if ggml_type == GGML_TYPE_F64 {
+        return 8;
+    }
+    if ggml_type == GGML_TYPE_IQ1_M {
+        return 56;
+    }
+    if ggml_type == GGML_TYPE_BF16 {
+        return 2;
+    }
+    return 0;
+}
+
+export fn gguf_tensor_nbytes(ggml_type: u32, elements: u64, out: &u64) bool {
+    const block_elems: u64 = tensor_block_elems(ggml_type);
+    const block_bytes: u64 = tensor_block_bytes(ggml_type);
+    if block_elems == 0 || block_bytes == 0 {
+        return false;
+    }
+
+    var blocks: u64 = elements / block_elems;
+    if (elements % block_elems) != 0 {
+        blocks = blocks + 1;
+    }
+    if blocks > (U64_MAX / block_bytes) {
+        return false;
+    }
+
+    *out = blocks * block_bytes;
+    return true;
+}
+
+fn print_tensor_type(ggml_type: u32) void {
+    if ggml_type == GGML_TYPE_F32 {
+        _ = printf("f32");
+    } else if ggml_type == GGML_TYPE_F16 {
+        _ = printf("f16");
+    } else if ggml_type == GGML_TYPE_Q4_0 {
+        _ = printf("q4_0");
+    } else if ggml_type == GGML_TYPE_Q4_1 {
+        _ = printf("q4_1");
+    } else if ggml_type == GGML_TYPE_Q5_0 {
+        _ = printf("q5_0");
+    } else if ggml_type == GGML_TYPE_Q5_1 {
+        _ = printf("q5_1");
+    } else if ggml_type == GGML_TYPE_Q8_0 {
+        _ = printf("q8_0");
+    } else if ggml_type == GGML_TYPE_Q8_1 {
+        _ = printf("q8_1");
+    } else if ggml_type == GGML_TYPE_Q2_K {
+        _ = printf("q2_k");
+    } else if ggml_type == GGML_TYPE_Q3_K {
+        _ = printf("q3_k");
+    } else if ggml_type == GGML_TYPE_Q4_K {
+        _ = printf("q4_k");
+    } else if ggml_type == GGML_TYPE_Q5_K {
+        _ = printf("q5_k");
+    } else if ggml_type == GGML_TYPE_Q6_K {
+        _ = printf("q6_k");
+    } else if ggml_type == GGML_TYPE_Q8_K {
+        _ = printf("q8_k");
+    } else if ggml_type == GGML_TYPE_IQ2_XXS {
+        _ = printf("iq2_xxs");
+    } else if ggml_type == GGML_TYPE_IQ2_XS {
+        _ = printf("iq2_xs");
+    } else if ggml_type == GGML_TYPE_IQ3_XXS {
+        _ = printf("iq3_xxs");
+    } else if ggml_type == GGML_TYPE_IQ1_S {
+        _ = printf("iq1_s");
+    } else if ggml_type == GGML_TYPE_IQ4_NL {
+        _ = printf("iq4_nl");
+    } else if ggml_type == GGML_TYPE_IQ3_S {
+        _ = printf("iq3_s");
+    } else if ggml_type == GGML_TYPE_IQ2_S {
+        _ = printf("iq2_s");
+    } else if ggml_type == GGML_TYPE_IQ4_XS {
+        _ = printf("iq4_xs");
+    } else if ggml_type == GGML_TYPE_I8 {
+        _ = printf("i8");
+    } else if ggml_type == GGML_TYPE_I16 {
+        _ = printf("i16");
+    } else if ggml_type == GGML_TYPE_I32 {
+        _ = printf("i32");
+    } else if ggml_type == GGML_TYPE_I64 {
+        _ = printf("i64");
+    } else if ggml_type == GGML_TYPE_F64 {
+        _ = printf("f64");
+    } else if ggml_type == GGML_TYPE_IQ1_M {
+        _ = printf("iq1_m");
+    } else if ggml_type == GGML_TYPE_BF16 {
+        _ = printf("bf16");
+    } else {
+        _ = printf("unknown(%u)", ggml_type);
+    }
+}
+
 fn align_up_u64(value: u64, alignment: u64) u64 {
     if alignment == 0 {
         return value;
@@ -249,164 +887,496 @@ fn align_up_u64(value: u64, alignment: u64) u64 {
     return value + (alignment - rem);
 }
 
-export fn inspect_gguf(path: &const byte) i32 {
+fn allocate_metadata_table(count: u64) &GgufMetadataInfo {
+    if count == 0 {
+        return null;
+    }
+    if count > 10000000 {
+        return null;
+    }
+    const item_size: usize = @size_of(GgufMetadataInfo) as usize;
+    const bytes: usize = (count as usize) * item_size;
+    return malloc(bytes) as &GgufMetadataInfo;
+}
+
+fn allocate_tensor_table(count: u64) &GgufTensorInfo {
+    if count == 0 {
+        return null;
+    }
+    if count > 10000000 {
+        return null;
+    }
+    const item_size: usize = @size_of(GgufTensorInfo) as usize;
+    const bytes: usize = (count as usize) * item_size;
+    return malloc(bytes) as &GgufTensorInfo;
+}
+
+fn parse_metadata(info: &GgufInfo, r: &Reader) bool {
+    info.metadata = allocate_metadata_table(info.metadata_count);
+    if info.metadata_count > 0 && info.metadata == null {
+        set_error(info, GGUF_STAGE_ALLOC, 0, r.pos, 0);
+        return false;
+    }
+
+    var i: u64 = 0;
+    while i < info.metadata_count {
+        const meta: &GgufMetadataInfo = &info.metadata[i as usize];
+        *meta = GgufMetadataInfo{
+            key: gguf_string_zero(),
+            value_type: 0,
+            value_offset: 0,
+            array_type: 0,
+            array_len: 0,
+            array_data_offset: 0,
+            scalar_u64: 0,
+            string_sample: gguf_string_zero(),
+        };
+
+        if !read_gguf_string(r, &meta.key) {
+            set_error(info, GGUF_STAGE_METADATA, i, r.pos, 0);
+            return false;
+        }
+        if !read_u32(r, &meta.value_type) {
+            set_error(info, GGUF_STAGE_METADATA, i, r.pos, 0);
+            return false;
+        }
+        if !read_metadata_value(r, meta) {
+            set_error(info, GGUF_STAGE_METADATA, i, r.pos, meta.value_type);
+            return false;
+        }
+
+        record_model_metadata(info, meta);
+        info.loaded_metadata_count = i + 1;
+        i = i + 1;
+    }
+
+    info.metadata_end = r.pos;
+    return true;
+}
+
+fn parse_tensors(info: &GgufInfo, r: &Reader) bool {
+    info.tensors = allocate_tensor_table(info.tensor_count);
+    if info.tensor_count > 0 && info.tensors == null {
+        set_error(info, GGUF_STAGE_ALLOC, 0, r.pos, 0);
+        return false;
+    }
+
+    var t_index: u64 = 0;
+    while t_index < info.tensor_count {
+        const tensor: &GgufTensorInfo = &info.tensors[t_index as usize];
+        *tensor = GgufTensorInfo{
+            name: gguf_string_zero(),
+            n_dims: 0,
+            shape: [],
+            ggml_type: 0,
+            rel_offset: 0,
+            abs_offset: 0,
+            elements: 1,
+            byte_size: 0,
+            byte_size_known: false,
+        };
+
+        if !read_gguf_string(r, &tensor.name) {
+            set_error(info, GGUF_STAGE_TENSOR_DIRECTORY, t_index, r.pos, 0);
+            return false;
+        }
+        if !read_u32(r, &tensor.n_dims) {
+            set_error(info, GGUF_STAGE_TENSOR_DIRECTORY, t_index, r.pos, 0);
+            return false;
+        }
+        if tensor.n_dims == 0 || tensor.n_dims > 8 {
+            set_error(info, GGUF_STAGE_TENSOR_DIRECTORY, t_index, r.pos, tensor.n_dims);
+            return false;
+        }
+
+        var d: u32 = 0;
+        while d < tensor.n_dims {
+            var dim_value: u64 = 0;
+            if !read_u64(r, &dim_value) {
+                set_error(info, GGUF_STAGE_TENSOR_DIRECTORY, t_index, r.pos, 0);
+                return false;
+            }
+            tensor.shape[d as usize] = dim_value;
+            if dim_value != 0 && tensor.elements > (U64_MAX / dim_value) {
+                set_error(info, GGUF_STAGE_TENSOR_DIRECTORY, t_index, r.pos, 0);
+                return false;
+            }
+            tensor.elements = tensor.elements * dim_value;
+            d = d + 1;
+        }
+
+        if !read_u32(r, &tensor.ggml_type) || !read_u64(r, &tensor.rel_offset) {
+            set_error(info, GGUF_STAGE_TENSOR_DIRECTORY, t_index, r.pos, 0);
+            return false;
+        }
+
+        tensor.byte_size_known = gguf_tensor_nbytes(tensor.ggml_type, tensor.elements, &tensor.byte_size);
+        info.loaded_tensor_count = t_index + 1;
+        t_index = t_index + 1;
+    }
+
+    info.tensor_directory_end = r.pos;
+    info.tensor_data_start = align_up_u64(r.pos, info.alignment);
+
+    if info.tensor_data_start > info.file_size {
+        set_error(info, GGUF_STAGE_TENSOR_DATA, 0, info.tensor_data_start, 0);
+        info.required_end = info.tensor_data_start;
+        return false;
+    }
+
+    var found_data_truncation: bool = false;
+    var i: u64 = 0;
+    while i < info.tensor_count {
+        const tensor: &GgufTensorInfo = &info.tensors[i as usize];
+        if tensor.rel_offset > (U64_MAX - info.tensor_data_start) {
+            set_error(info, GGUF_STAGE_TENSOR_DIRECTORY, i, info.tensor_directory_end, tensor.ggml_type);
+            return false;
+        }
+        tensor.abs_offset = info.tensor_data_start + tensor.rel_offset;
+
+        if tensor.abs_offset > info.file_size {
+            if !found_data_truncation {
+                set_error(info, GGUF_STAGE_TENSOR_DATA, i, tensor.abs_offset, tensor.ggml_type);
+                info.required_end = tensor.abs_offset;
+                found_data_truncation = true;
+            }
+        } else if tensor.byte_size_known {
+            if tensor.byte_size > (info.file_size - tensor.abs_offset) {
+                if !found_data_truncation {
+                    set_error(info, GGUF_STAGE_TENSOR_DATA, i, tensor.abs_offset, tensor.ggml_type);
+                    if tensor.byte_size > (U64_MAX - tensor.abs_offset) {
+                        info.required_end = U64_MAX;
+                    } else {
+                        info.required_end = tensor.abs_offset + tensor.byte_size;
+                    }
+                    found_data_truncation = true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    if found_data_truncation {
+        return false;
+    }
+
+    return true;
+}
+
+export fn load_gguf(path: &const byte, info: &GgufInfo) i32 {
+    gguf_info_deinit(info);
+
     const fp: &FILE = fopen(path, "rb\0" as &const byte);
     if fp == null {
-        _ = printf("ds4-uya: cannot open file: %s\n", path);
         return 2;
     }
 
     if fseek(fp, 0, SEEK_END) < 0 {
-        _ = printf("ds4-uya: cannot seek file\n");
         _ = fclose(fp);
         return 2;
     }
     const size_i64: i64 = ftell(fp);
     if size_i64 < 0 {
-        _ = printf("ds4-uya: cannot determine file size\n");
         _ = fclose(fp);
         return 2;
     }
     if fseek(fp, 0, SEEK_SET) < 0 {
-        _ = printf("ds4-uya: cannot rewind file\n");
         _ = fclose(fp);
         return 2;
     }
 
-    var r: Reader = Reader{ fp: fp, size: size_i64 as u64, pos: 0 };
-    var magic: u32 = 0;
-    var version: u32 = 0;
-    var tensor_count: u64 = 0;
-    var metadata_count: u64 = 0;
+    info.file_size = size_i64 as u64;
+    var r: Reader = Reader{ fp: fp, size: info.file_size, pos: 0 };
 
-    if !read_u32(&r, &magic) || !read_u32(&r, &version) || !read_u64(&r, &tensor_count) || !read_u64(&r, &metadata_count) {
-        _ = printf("ds4-uya: truncated GGUF header, size=%llu bytes\n", r.size);
+    if !read_u32(&r, &info.magic) || !read_u32(&r, &info.version) ||
+        !read_u64(&r, &info.tensor_count) || !read_u64(&r, &info.metadata_count) {
+        set_error(info, GGUF_STAGE_HEADER, 0, r.pos, 0);
         _ = fclose(fp);
         return 3;
     }
 
-    _ = printf("file: %s\n", path);
-    _ = printf("size: %llu bytes\n", r.size);
-
-    if magic != GGUF_MAGIC {
-        _ = printf("format: not GGUF, magic=0x%08x\n", magic);
+    if info.magic != GGUF_MAGIC {
         _ = fclose(fp);
         return 4;
     }
 
-    _ = printf("format: GGUF v%u\n", version);
-    _ = printf("tensors: %llu\n", tensor_count);
-    _ = printf("metadata: %llu\n", metadata_count);
+    if !parse_metadata(info, &r) {
+        _ = fclose(fp);
+        if info.error_stage == GGUF_STAGE_ALLOC {
+            return 2;
+        }
+        return 3;
+    }
 
-    var key: SampleString = SampleString{ len: 0, shown: 0, data: [] };
+    if !parse_tensors(info, &r) {
+        _ = fclose(fp);
+        if info.error_stage == GGUF_STAGE_ALLOC {
+            return 2;
+        }
+        if info.error_stage == GGUF_STAGE_TENSOR_DATA {
+            return 6;
+        }
+        return 3;
+    }
+
+    _ = fclose(fp);
+    return 0;
+}
+
+fn print_model_params(info: &GgufInfo) void {
+    if info.general_name.len > 0 {
+        _ = printf("model: %s\n", &info.general_name.data[0]);
+    }
+    if info.general_architecture.len > 0 {
+        _ = printf("arch: %s\n", &info.general_architecture.data[0]);
+    }
+
+    _ = printf("metadata tokenizer keys: %llu\n", info.tokenizer_metadata_count);
+    _ = printf("model params:");
+    if info.has_block_count {
+        _ = printf(" layers=%llu", info.block_count);
+    }
+    if info.has_context_length {
+        _ = printf(" ctx=%llu", info.context_length);
+    }
+    if info.has_embedding_length {
+        _ = printf(" embd=%llu", info.embedding_length);
+    }
+    if info.has_head_count {
+        _ = printf(" heads=%llu", info.head_count);
+    }
+    if info.has_head_count_kv {
+        _ = printf(" kv_heads=%llu", info.head_count_kv);
+    }
+    if info.has_key_length {
+        _ = printf(" key_len=%llu", info.key_length);
+    }
+    if info.has_value_length {
+        _ = printf(" value_len=%llu", info.value_length);
+    }
+    if info.has_expert_count {
+        _ = printf(" experts=%llu", info.expert_count);
+    }
+    if info.has_expert_used_count {
+        _ = printf(" experts_used=%llu", info.expert_used_count);
+    }
+    if info.has_file_type {
+        _ = printf(" file_type=%llu", info.file_type);
+    }
+    _ = printf("\n");
+
+    if info.tokenizer_model.len > 0 || info.has_tokenizer_tokens || info.has_tokenizer_merges {
+        _ = printf("tokenizer:");
+        if info.tokenizer_model.len > 0 {
+            _ = printf(" model=%s", &info.tokenizer_model.data[0]);
+        }
+        if info.tokenizer_pre.len > 0 {
+            _ = printf(" pre=%s", &info.tokenizer_pre.data[0]);
+        }
+        if info.has_tokenizer_tokens {
+            _ = printf(" tokens=%llu@%llu", info.tokenizer_tokens_count, info.tokenizer_tokens_offset);
+        }
+        if info.has_tokenizer_token_types {
+            _ = printf(" token_types=%llu@%llu", info.tokenizer_token_types_count, info.tokenizer_token_types_offset);
+        }
+        if info.has_tokenizer_merges {
+            _ = printf(" merges=%llu@%llu", info.tokenizer_merges_count, info.tokenizer_merges_offset);
+        }
+        if info.has_bos_token_id {
+            _ = printf(" bos=%llu", info.bos_token_id);
+        }
+        if info.has_eos_token_id {
+            _ = printf(" eos=%llu", info.eos_token_id);
+        }
+        if info.has_unk_token_id {
+            _ = printf(" unk=%llu", info.unk_token_id);
+        }
+        if info.has_padding_token_id {
+            _ = printf(" pad=%llu", info.padding_token_id);
+        }
+        if info.has_add_bos_token {
+            _ = printf(" add_bos=%u", info.add_bos_token as u32);
+        }
+        if info.has_add_eos_token {
+            _ = printf(" add_eos=%u", info.add_eos_token as u32);
+        }
+        if info.tokenizer_chat_template.len > 0 {
+            _ = printf(" chat_template_len=%llu", info.tokenizer_chat_template.len);
+        }
+        _ = printf("\n");
+    }
+}
+
+fn print_metadata_sample(info: &GgufInfo) void {
+    _ = printf("metadata entries:\n");
     var i: u64 = 0;
-    while i < metadata_count {
-        if !read_string_sample(&r, &key) {
-            _ = printf("ds4-uya: truncated while reading metadata key %llu at offset %llu/%llu\n", i, r.pos, r.size);
-            _ = fclose(fp);
-            return 3;
+    while i < info.loaded_metadata_count {
+        const meta: &GgufMetadataInfo = &info.metadata[i as usize];
+        _ = printf("  meta[%llu] %s: ", i, &meta.key.data[0]);
+        print_value_type(meta.value_type);
+        if meta.value_type == GGUF_TYPE_ARRAY {
+            _ = printf(" elem=");
+            print_value_type(meta.array_type);
+            _ = printf(" len=%llu data_offset=%llu", meta.array_len, meta.array_data_offset);
+        } else if meta.value_type == GGUF_TYPE_STRING {
+            _ = printf(" len=%llu", meta.string_sample.len);
+        } else {
+            _ = printf(" raw=%llu", meta.scalar_u64);
         }
-
-        var value_type: u32 = 0;
-        if !read_u32(&r, &value_type) {
-            _ = printf("ds4-uya: truncated while reading metadata type %llu at offset %llu/%llu\n", i, r.pos, r.size);
-            _ = fclose(fp);
-            return 3;
+        if meta.key.len > meta.key.shown as u64 {
+            _ = printf(" (key truncated, len=%llu)", meta.key.len);
         }
-
-        if i < 24 {
-            _ = printf("  meta[%llu] %s: ", i, &key.data[0]);
-            print_value_type(value_type);
-            if key.len > key.shown as u64 {
-                _ = printf(" (key truncated, len=%llu)", key.len);
-            }
-            _ = printf("\n");
-        }
-
-        if !skip_metadata_value(&r, value_type) {
-            _ = printf("ds4-uya: cannot skip metadata value %llu at offset %llu/%llu, type=", i, r.pos, r.size);
-            print_value_type(value_type);
-            _ = printf("\n");
-            _ = fclose(fp);
-            return 3;
-        }
-
+        _ = printf("\n");
         i = i + 1;
     }
+}
 
-    _ = printf("metadata_end: %llu\n", r.pos);
+fn print_shape(tensor: &GgufTensorInfo) void {
+    _ = printf("[");
+    var d: usize = 0;
+    while d < tensor.n_dims as usize {
+        if d > 0 {
+            _ = printf(" x ");
+        }
+        _ = printf("%llu", tensor.shape[d]);
+        d = d + 1;
+    }
+    _ = printf("]");
+}
 
-    var tensor_name: SampleString = SampleString{ len: 0, shown: 0, data: [] };
-    var t: u64 = 0;
-    var max_tensor_offset: u64 = 0;
-    var max_tensor_offset_index: u64 = 0;
-    while t < tensor_count {
-        if !read_string_sample(&r, &tensor_name) {
-            _ = printf("ds4-uya: truncated while reading tensor name %llu at offset %llu/%llu\n", t, r.pos, r.size);
-            _ = fclose(fp);
-            return 3;
-        }
+fn print_tensor_line(index: u64, tensor: &GgufTensorInfo) void {
+    _ = printf("  tensor[%llu] %s dtype=", index, &tensor.name.data[0]);
+    print_tensor_type(tensor.ggml_type);
+    _ = printf(" shape=");
+    print_shape(tensor);
+    _ = printf(" rel_offset=%llu abs_offset=%llu", tensor.rel_offset, tensor.abs_offset);
+    if tensor.byte_size_known {
+        _ = printf(" bytes=%llu", tensor.byte_size);
+    } else {
+        _ = printf(" bytes=unknown");
+    }
+    _ = printf("\n");
+}
 
-        var n_dims: u32 = 0;
-        if !read_u32(&r, &n_dims) {
-            _ = printf("ds4-uya: truncated while reading tensor dims %llu at offset %llu/%llu\n", t, r.pos, r.size);
-            _ = fclose(fp);
-            return 3;
-        }
-        if n_dims > 8 {
-            _ = printf("ds4-uya: invalid tensor dimension count %u for tensor %llu\n", n_dims, t);
-            _ = fclose(fp);
-            return 5;
-        }
+fn print_tensors(info: &GgufInfo) void {
+    _ = printf("tensor table:\n");
+    var i: u64 = 0;
+    while i < info.loaded_tensor_count {
+        print_tensor_line(i, &info.tensors[i as usize]);
+        i = i + 1;
+    }
+}
 
-        var d: u32 = 0;
-        var dim_value: u64 = 0;
-        while d < n_dims {
-            if !read_u64(&r, &dim_value) {
-                _ = printf("ds4-uya: truncated while reading tensor shape %llu at offset %llu/%llu\n", t, r.pos, r.size);
-                _ = fclose(fp);
-                return 3;
-            }
-            d = d + 1;
+fn print_load_error(path: &const byte, rc: i32, info: &GgufInfo) void {
+    if rc == 2 {
+        if info.error_stage == GGUF_STAGE_ALLOC {
+            _ = printf("ds4-uya: out of memory while loading GGUF tables\n");
+        } else {
+            _ = printf("ds4-uya: cannot open or read file: %s\n", path);
         }
+        return;
+    }
+    if rc == 3 {
+        if info.error_stage == GGUF_STAGE_HEADER {
+            _ = printf("ds4-uya: truncated GGUF header at offset %llu/%llu\n", info.error_offset, info.file_size);
+        } else if info.error_stage == GGUF_STAGE_METADATA {
+            _ = printf("ds4-uya: truncated in metadata at entry %llu offset %llu/%llu type=", info.error_index, info.error_offset, info.file_size);
+            print_value_type(info.error_value_type);
+            _ = printf("\n");
+        } else if info.error_stage == GGUF_STAGE_TENSOR_DIRECTORY {
+            _ = printf("ds4-uya: truncated or invalid tensor directory at tensor %llu offset %llu/%llu\n", info.error_index, info.error_offset, info.file_size);
+        } else {
+            _ = printf("ds4-uya: truncated GGUF at offset %llu/%llu\n", info.error_offset, info.file_size);
+        }
+        return;
+    }
+    if rc == 4 {
+        _ = printf("format: not GGUF, magic=0x%08x\n", info.magic);
+        return;
+    }
+    if rc == 6 {
+        if info.error_offset >= info.file_size {
+            _ = printf("inspect: incomplete, tensor data section is truncated at tensor[%llu], need end=%llu file_size=%llu\n", info.error_index, info.required_end, info.file_size);
+        } else {
+            _ = printf("inspect: incomplete, tensor[%llu] data at offset %llu needs end=%llu but file_size=%llu\n", info.error_index, info.error_offset, info.required_end, info.file_size);
+        }
+        return;
+    }
+}
 
-        var ggml_type: u32 = 0;
-        var offset: u64 = 0;
-        if !read_u32(&r, &ggml_type) || !read_u64(&r, &offset) {
-            _ = printf("ds4-uya: truncated while reading tensor info %llu at offset %llu/%llu\n", t, r.pos, r.size);
-            _ = fclose(fp);
-            return 3;
-        }
-        if offset > max_tensor_offset {
-            max_tensor_offset = offset;
-            max_tensor_offset_index = t;
-        }
+export fn inspect_gguf(path: &const byte) i32 {
+    var info: GgufInfo = gguf_info_init();
+    const rc: i32 = load_gguf(path, &info);
 
-        if t < 24 {
-            _ = printf("  tensor[%llu] %s dims=%u ggml_type=%u data_offset=%llu\n", t, &tensor_name.data[0], n_dims, ggml_type, offset);
-        }
-
-        t = t + 1;
+    if rc == 2 {
+        print_load_error(path, rc, &info);
+        gguf_info_deinit(&info);
+        return rc;
     }
 
-    _ = printf("tensor_directory_end: %llu\n", r.pos);
-    const data_start: u64 = align_up_u64(r.pos, 32);
-    _ = printf("data_start_estimate: %llu (alignment=32)\n", data_start);
-    if data_start > r.size {
-        _ = printf("inspect: incomplete, tensor data section is missing\n");
-        _ = fclose(fp);
-        return 6;
+    _ = printf("file: %s\n", path);
+    _ = printf("size: %llu bytes\n", info.file_size);
+
+    if rc == 4 {
+        print_load_error(path, rc, &info);
+        gguf_info_deinit(&info);
+        return rc;
     }
 
-    const available_tensor_data: u64 = r.size - data_start;
-    _ = printf("available_tensor_data: %llu bytes\n", available_tensor_data);
-    if max_tensor_offset > available_tensor_data {
-        _ = printf("inspect: incomplete, tensor[%llu] offset %llu exceeds available tensor data %llu\n", max_tensor_offset_index, max_tensor_offset, available_tensor_data);
-        _ = fclose(fp);
-        return 6;
+    _ = printf("format: GGUF v%u\n", info.version);
+    _ = printf("tensors: %llu\n", info.tensor_count);
+    _ = printf("metadata: %llu\n", info.metadata_count);
+    _ = printf("alignment: %llu\n", info.alignment);
+    print_model_params(&info);
+    print_metadata_sample(&info);
+    _ = printf("metadata_end: %llu\n", info.metadata_end);
+    _ = printf("tensor_directory_end: %llu\n", info.tensor_directory_end);
+    _ = printf("tensor_data_start: %llu\n", info.tensor_data_start);
+    print_tensors(&info);
+
+    if rc != 0 {
+        print_load_error(path, rc, &info);
+        gguf_info_deinit(&info);
+        return rc;
     }
 
     _ = printf("inspect: ok\n");
-    _ = fclose(fp);
+    gguf_info_deinit(&info);
+    return 0;
+}
+
+export fn find_gguf_tensor(info: &GgufInfo, name: &const byte) &GgufTensorInfo {
+    var i: u64 = 0;
+    while i < info.loaded_tensor_count {
+        const tensor: &GgufTensorInfo = &info.tensors[i as usize];
+        if sample_equals(&tensor.name, name) {
+            return tensor;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+export fn print_gguf_tensor(path: &const byte, name: &const byte) i32 {
+    var info: GgufInfo = gguf_info_init();
+    const rc: i32 = load_gguf(path, &info);
+    if rc != 0 && rc != 6 {
+        print_load_error(path, rc, &info);
+        gguf_info_deinit(&info);
+        return rc;
+    }
+
+    const tensor: &GgufTensorInfo = find_gguf_tensor(&info, name);
+    if tensor == null {
+        _ = printf("ds4-uya: tensor not found: %s\n", name);
+        gguf_info_deinit(&info);
+        return 7;
+    }
+
+    print_tensor_line(0, tensor);
+    if rc == 6 {
+        print_load_error(path, rc, &info);
+    }
+    gguf_info_deinit(&info);
     return 0;
 }
