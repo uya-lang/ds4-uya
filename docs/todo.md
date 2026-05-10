@@ -51,12 +51,12 @@
 
 ## Phase 3: CPU tensor runtime
 
-- [ ] 定义 dtype enum。
-- [ ] 定义 tensor view。
-- [ ] 定义 model weight table。
-- [ ] 定义 scratch arena。
-- [ ] 定义 KV cache layout。
-- [ ] 实现 bounds/shape 检查。
+- [x] 定义 dtype enum。
+- [x] 定义 tensor view。
+- [x] 定义 model weight table。
+- [x] 定义 scratch arena。
+- [x] 定义 KV cache layout。
+- [x] 实现 bounds/shape 检查。
 
 验收标准：
 

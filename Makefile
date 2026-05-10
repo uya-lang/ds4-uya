@@ -12,6 +12,7 @@ test:
 	$(UYA) test src/binary_test.uya
 	$(UYA) test src/gguf_test.uya
 	$(UYA) test src/tokenizer_test.uya
+	$(UYA) test src/tensor_test.uya
 
 help: build
 	$(BIN) --help

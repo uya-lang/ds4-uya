@@ -1,0 +1,224 @@
+use ds4.gguf.GGML_TYPE_F16;
+use ds4.gguf.GGML_TYPE_F32;
+use ds4.gguf.GGML_TYPE_Q8_0;
+use ds4.gguf.GgufString;
+use ds4.tensor.TensorDType;
+use ds4.tensor.TensorKvCache;
+use ds4.tensor.TensorScratchArena;
+use ds4.tensor.TensorView;
+use ds4.tensor.TensorWeightTable;
+use ds4.tensor.tensor_kv_cache_deinit;
+use ds4.tensor.tensor_kv_cache_empty;
+use ds4.tensor.tensor_kv_cache_init;
+use ds4.tensor.tensor_kv_cache_key_offset;
+use ds4.tensor.tensor_kv_cache_value_offset;
+use ds4.tensor.tensor_scratch_alloc_view;
+use ds4.tensor.tensor_scratch_arena_deinit;
+use ds4.tensor.tensor_scratch_arena_init;
+use ds4.tensor.tensor_scratch_reset;
+use ds4.tensor.tensor_view_byte_offset;
+use ds4.tensor.tensor_view_data_available;
+use ds4.tensor.tensor_view_expect_shape;
+use ds4.tensor.tensor_view_init_memory;
+use ds4.tensor.tensor_weight_table_deinit;
+use ds4.tensor.tensor_weight_table_find;
+use ds4.tensor.tensor_weight_table_init;
+use ds4.tensor.tensor_weight_table_load_from_gguf;
+use libc.FILE;
+use libc.fclose;
+use libc.fopen;
+use libc.fwrite;
+use libc.remove;
+use libc.strlen;
+use std.testing.assert_eq_i32;
+use std.testing.expect;
+
+fn write_u32_le(fp: &FILE, value: u32) bool {
+    var buf: [byte: 4] = [];
+    buf[0] = value as byte;
+    buf[1] = (value >> 8) as byte;
+    buf[2] = (value >> 16) as byte;
+    buf[3] = (value >> 24) as byte;
+    return fwrite(&buf[0], 1 as usize, 4 as usize, fp) == 4;
+}
+
+fn write_u64_le(fp: &FILE, value: u64) bool {
+    var buf: [byte: 8] = [];
+    buf[0] = value as byte;
+    buf[1] = (value >> 8) as byte;
+    buf[2] = (value >> 16) as byte;
+    buf[3] = (value >> 24) as byte;
+    buf[4] = (value >> 32) as byte;
+    buf[5] = (value >> 40) as byte;
+    buf[6] = (value >> 48) as byte;
+    buf[7] = (value >> 56) as byte;
+    return fwrite(&buf[0], 1 as usize, 8 as usize, fp) == 8;
+}
+
+fn write_cstr_bytes(fp: &FILE, text: &const byte) bool {
+    const len: usize = strlen(text as *const byte);
+    return fwrite(text, 1 as usize, len, fp) == len;
+}
+
+fn write_gguf_string(fp: &FILE, text: &const byte) bool {
+    const len: usize = strlen(text as *const byte);
+    if !write_u64_le(fp, len as u64) {
+        return false;
+    }
+    return write_cstr_bytes(fp, text);
+}
+
+fn write_tensor_entry(fp: &FILE, name: &const byte, n_dims: u32, d0: u64, d1: u64, dtype: u32, rel_offset: u64) bool {
+    if !write_gguf_string(fp, name) { return false; }
+    if !write_u32_le(fp, n_dims) { return false; }
+    if !write_u64_le(fp, d0) { return false; }
+    if n_dims > 1 {
+        if !write_u64_le(fp, d1) { return false; }
+    }
+    if !write_u32_le(fp, dtype) { return false; }
+    return write_u64_le(fp, rel_offset);
+}
+
+fn write_weight_fixture(path: &const byte) bool {
+    const fp: &FILE = fopen(path, "wb\0" as &const byte);
+    if fp == null {
+        return false;
+    }
+
+    var ok: bool = true;
+    ok = ok && write_u32_le(fp, 0x46554747);
+    ok = ok && write_u32_le(fp, 3);
+    ok = ok && write_u64_le(fp, 3);
+    ok = ok && write_u64_le(fp, 0);
+    ok = ok && write_tensor_entry(fp, "token_embd.weight\0" as &const byte, 2, 4, 8, GGML_TYPE_F16, 0);
+    ok = ok && write_tensor_entry(fp, "output_norm.weight\0" as &const byte, 1, 4, 0, GGML_TYPE_F32, 64);
+    ok = ok && write_tensor_entry(fp, "output.weight\0" as &const byte, 2, 32, 8, GGML_TYPE_Q8_0, 80);
+
+    var padding: [byte: 8] = [];
+    ok = ok && fwrite(&padding[0], 1 as usize, 8 as usize, fp) == 8;
+    var zeros: [byte: 352] = [];
+    ok = ok && fwrite(&zeros[0], 1 as usize, 352 as usize, fp) == 352;
+    _ = fclose(fp);
+    return ok;
+}
+
+test "tensor view layout and bounds" {
+    var storage: [byte: 256] = [];
+    var view: TensorView = TensorView{
+        name: GgufString{ len: 0, shown: 0, data: [] },
+        data: null,
+        dtype: TensorDType.UNKNOWN,
+        ggml_type: 0,
+        n_dims: 0,
+        shape: [],
+        stride_bytes: [],
+        elements: 0,
+        byte_size: 0,
+        file_offset: 0,
+        file_size: 0,
+        file_backed: false,
+        writable: false,
+    };
+    try expect(tensor_view_init_memory(&storage[0], TensorDType.F32, 2, 4, 3, 0, 0, true, &view));
+    try assert_eq_i32(view.byte_size as i32, 48);
+    try assert_eq_i32(view.stride_bytes[0] as i32, 4);
+    try assert_eq_i32(view.stride_bytes[1] as i32, 16);
+
+    var off: u64 = 0;
+    try expect(tensor_view_byte_offset(&view, 2, 1, 0, 0, &off));
+    try assert_eq_i32(off as i32, 24);
+    try expect(!tensor_view_byte_offset(&view, 4, 0, 0, 0, &off));
+
+    try expect(tensor_view_init_memory(&storage[0], TensorDType.Q8_0, 2, 32, 3, 0, 0, false, &view));
+    try assert_eq_i32(view.byte_size as i32, 102);
+    try assert_eq_i32(view.stride_bytes[0] as i32, 34);
+    try assert_eq_i32(view.stride_bytes[1] as i32, 34);
+    try expect(tensor_view_byte_offset(&view, 31, 2, 0, 0, &off));
+    try assert_eq_i32(off as i32, 68);
+}
+
+test "tensor weight table loads root views" {
+    const path: &const byte = "/tmp/ds4-uya-tensor-weight-test.gguf\0" as &const byte;
+    _ = remove(path);
+    try expect(write_weight_fixture(path));
+
+    var table: TensorWeightTable = tensor_weight_table_init();
+    try assert_eq_i32(tensor_weight_table_load_from_gguf(path, &table), 0);
+    try assert_eq_i32(table.count as i32, 3);
+    try expect(table.token_embd != null);
+    try expect(table.output_norm != null);
+    try expect(table.output != null);
+    try expect(tensor_view_expect_shape(table.token_embd, TensorDType.F16, 2, 4, 8, 0, 0));
+    try expect(tensor_view_expect_shape(table.output_norm, TensorDType.F32, 1, 4, 0, 0, 0));
+    try expect(tensor_view_expect_shape(table.output, TensorDType.Q8_0, 2, 32, 8, 0, 0));
+    try assert_eq_i32(table.output.byte_size as i32, 272);
+    try expect(tensor_view_data_available(table.output));
+    try expect(tensor_weight_table_find(&table, "missing.weight\0" as &const byte) == null);
+
+    tensor_weight_table_deinit(&table);
+    _ = remove(path);
+}
+
+test "scratch arena reuses memory after reset" {
+    var arena: TensorScratchArena = tensor_scratch_arena_init();
+    var a: TensorView = TensorView{
+        name: GgufString{ len: 0, shown: 0, data: [] },
+        data: null,
+        dtype: TensorDType.UNKNOWN,
+        ggml_type: 0,
+        n_dims: 0,
+        shape: [],
+        stride_bytes: [],
+        elements: 0,
+        byte_size: 0,
+        file_offset: 0,
+        file_size: 0,
+        file_backed: false,
+        writable: false,
+    };
+    var b: TensorView = TensorView{
+        name: GgufString{ len: 0, shown: 0, data: [] },
+        data: null,
+        dtype: TensorDType.UNKNOWN,
+        ggml_type: 0,
+        n_dims: 0,
+        shape: [],
+        stride_bytes: [],
+        elements: 0,
+        byte_size: 0,
+        file_offset: 0,
+        file_size: 0,
+        file_backed: false,
+        writable: false,
+    };
+
+    try expect(tensor_scratch_alloc_view(&arena, TensorDType.F32, 1, 16, 0, 0, 0, &a));
+    const first_addr: usize = @usize_from_ptr(a.data as &void);
+    try assert_eq_i32(a.byte_size as i32, 64);
+    try assert_eq_i32(arena.used as i32, 64);
+
+    tensor_scratch_reset(&arena);
+    try expect(tensor_scratch_alloc_view(&arena, TensorDType.F32, 1, 16, 0, 0, 0, &b));
+    const second_addr: usize = @usize_from_ptr(b.data as &void);
+    try expect(first_addr == second_addr);
+    try expect(arena.high_water >= 64);
+
+    tensor_scratch_arena_deinit(&arena);
+}
+
+test "kv cache layout offsets and bounds" {
+    var cache: TensorKvCache = tensor_kv_cache_empty();
+    try expect(tensor_kv_cache_init(&cache, TensorDType.F32, 2, 4, 3, 5, 7));
+    try assert_eq_i32(cache.key.byte_size as i32, 480);
+    try assert_eq_i32(cache.value_offset as i32, 512);
+    try assert_eq_i32(cache.bytes as i32, 1184);
+
+    var off: u64 = 0;
+    try expect(tensor_kv_cache_key_offset(&cache, 1, 2, 1, 4, &off));
+    try assert_eq_i32(off as i32, 396);
+    try expect(tensor_kv_cache_value_offset(&cache, 1, 3, 2, 6, &off));
+    try assert_eq_i32(off as i32, 1180);
+    try expect(!tensor_kv_cache_key_offset(&cache, 2, 0, 0, 0, &off));
+
+    tensor_kv_cache_deinit(&cache);
+}

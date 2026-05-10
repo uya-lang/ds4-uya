@@ -1,0 +1,775 @@
+use ds4.gguf.GGML_TYPE_BF16;
+use ds4.gguf.GGML_TYPE_F16;
+use ds4.gguf.GGML_TYPE_F32;
+use ds4.gguf.GGML_TYPE_F64;
+use ds4.gguf.GGML_TYPE_I16;
+use ds4.gguf.GGML_TYPE_I32;
+use ds4.gguf.GGML_TYPE_I64;
+use ds4.gguf.GGML_TYPE_I8;
+use ds4.gguf.GGML_TYPE_IQ1_M;
+use ds4.gguf.GGML_TYPE_IQ1_S;
+use ds4.gguf.GGML_TYPE_IQ2_S;
+use ds4.gguf.GGML_TYPE_IQ2_XS;
+use ds4.gguf.GGML_TYPE_IQ2_XXS;
+use ds4.gguf.GGML_TYPE_IQ3_S;
+use ds4.gguf.GGML_TYPE_IQ3_XXS;
+use ds4.gguf.GGML_TYPE_IQ4_NL;
+use ds4.gguf.GGML_TYPE_IQ4_XS;
+use ds4.gguf.GGML_TYPE_Q2_K;
+use ds4.gguf.GGML_TYPE_Q3_K;
+use ds4.gguf.GGML_TYPE_Q4_0;
+use ds4.gguf.GGML_TYPE_Q4_1;
+use ds4.gguf.GGML_TYPE_Q4_K;
+use ds4.gguf.GGML_TYPE_Q5_0;
+use ds4.gguf.GGML_TYPE_Q5_1;
+use ds4.gguf.GGML_TYPE_Q5_K;
+use ds4.gguf.GGML_TYPE_Q6_K;
+use ds4.gguf.GGML_TYPE_Q8_0;
+use ds4.gguf.GGML_TYPE_Q8_1;
+use ds4.gguf.GGML_TYPE_Q8_K;
+use ds4.gguf.GgufInfo;
+use ds4.gguf.GgufString;
+use ds4.gguf.GgufTensorInfo;
+use ds4.gguf.gguf_info_deinit;
+use ds4.gguf.gguf_info_init;
+use ds4.gguf.load_gguf;
+use libc.free;
+use libc.malloc;
+use libc.printf;
+use libc.realloc;
+use libc.strlen;
+
+const TENSOR_U64_MAX: u64 = 0xffffffffffffffff;
+
+export enum TensorDType {
+    UNKNOWN = 255,
+    F32 = 0,
+    F16 = 1,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
+    Q8_0 = 8,
+    Q8_1 = 9,
+    Q2_K = 10,
+    Q3_K = 11,
+    Q4_K = 12,
+    Q5_K = 13,
+    Q6_K = 14,
+    Q8_K = 15,
+    IQ2_XXS = 16,
+    IQ2_XS = 17,
+    IQ3_XXS = 18,
+    IQ1_S = 19,
+    IQ4_NL = 20,
+    IQ3_S = 21,
+    IQ2_S = 22,
+    IQ4_XS = 23,
+    I8 = 24,
+    I16 = 25,
+    I32 = 26,
+    I64 = 27,
+    F64 = 28,
+    IQ1_M = 29,
+    BF16 = 30,
+}
+
+export struct TensorView {
+    name: GgufString,
+    data: &byte,
+    dtype: TensorDType,
+    ggml_type: u32,
+    n_dims: u32,
+    shape: [u64: 4],
+    stride_bytes: [u64: 4],
+    elements: u64,
+    byte_size: u64,
+    file_offset: u64,
+    file_size: u64,
+    file_backed: bool,
+    writable: bool,
+}
+
+export struct TensorWeightTable {
+    views: &TensorView,
+    count: u64,
+    file_size: u64,
+    incomplete: bool,
+    required_end: u64,
+    token_embd: &TensorView,
+    output_norm: &TensorView,
+    output: &TensorView,
+}
+
+export struct TensorScratchArena {
+    data: &byte,
+    cap: u64,
+    used: u64,
+    high_water: u64,
+}
+
+export struct TensorKvCache {
+    data: &byte,
+    bytes: u64,
+    dtype: TensorDType,
+    n_layer: u64,
+    n_ctx: u64,
+    n_head_kv: u64,
+    key_dim: u64,
+    value_dim: u64,
+    value_offset: u64,
+    key: TensorView,
+    value: TensorView,
+}
+
+fn tensor_string_zero() GgufString {
+    return GgufString{ len: 0, shown: 0, data: [] };
+}
+
+fn tensor_string_copy(dst: &GgufString, src: &GgufString) void {
+    dst.len = src.len;
+    dst.shown = src.shown;
+    var i: usize = 0;
+    while i < 256 {
+        dst.data[i] = src.data[i];
+        i = i + 1;
+    }
+}
+
+fn tensor_name_equals(name: &GgufString, literal: &const byte) bool {
+    const n: usize = strlen(literal as *const byte);
+    if name.len != n as u64 || name.shown != n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if name.data[i] != literal[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn tensor_dtype_from_ggml(ggml_type: u32) TensorDType {
+    if ggml_type == GGML_TYPE_F32 { return TensorDType.F32; }
+    if ggml_type == GGML_TYPE_F16 { return TensorDType.F16; }
+    if ggml_type == GGML_TYPE_Q4_0 { return TensorDType.Q4_0; }
+    if ggml_type == GGML_TYPE_Q4_1 { return TensorDType.Q4_1; }
+    if ggml_type == GGML_TYPE_Q5_0 { return TensorDType.Q5_0; }
+    if ggml_type == GGML_TYPE_Q5_1 { return TensorDType.Q5_1; }
+    if ggml_type == GGML_TYPE_Q8_0 { return TensorDType.Q8_0; }
+    if ggml_type == GGML_TYPE_Q8_1 { return TensorDType.Q8_1; }
+    if ggml_type == GGML_TYPE_Q2_K { return TensorDType.Q2_K; }
+    if ggml_type == GGML_TYPE_Q3_K { return TensorDType.Q3_K; }
+    if ggml_type == GGML_TYPE_Q4_K { return TensorDType.Q4_K; }
+    if ggml_type == GGML_TYPE_Q5_K { return TensorDType.Q5_K; }
+    if ggml_type == GGML_TYPE_Q6_K { return TensorDType.Q6_K; }
+    if ggml_type == GGML_TYPE_Q8_K { return TensorDType.Q8_K; }
+    if ggml_type == GGML_TYPE_IQ2_XXS { return TensorDType.IQ2_XXS; }
+    if ggml_type == GGML_TYPE_IQ2_XS { return TensorDType.IQ2_XS; }
+    if ggml_type == GGML_TYPE_IQ3_XXS { return TensorDType.IQ3_XXS; }
+    if ggml_type == GGML_TYPE_IQ1_S { return TensorDType.IQ1_S; }
+    if ggml_type == GGML_TYPE_IQ4_NL { return TensorDType.IQ4_NL; }
+    if ggml_type == GGML_TYPE_IQ3_S { return TensorDType.IQ3_S; }
+    if ggml_type == GGML_TYPE_IQ2_S { return TensorDType.IQ2_S; }
+    if ggml_type == GGML_TYPE_IQ4_XS { return TensorDType.IQ4_XS; }
+    if ggml_type == GGML_TYPE_I8 { return TensorDType.I8; }
+    if ggml_type == GGML_TYPE_I16 { return TensorDType.I16; }
+    if ggml_type == GGML_TYPE_I32 { return TensorDType.I32; }
+    if ggml_type == GGML_TYPE_I64 { return TensorDType.I64; }
+    if ggml_type == GGML_TYPE_F64 { return TensorDType.F64; }
+    if ggml_type == GGML_TYPE_IQ1_M { return TensorDType.IQ1_M; }
+    if ggml_type == GGML_TYPE_BF16 { return TensorDType.BF16; }
+    return TensorDType.UNKNOWN;
+}
+
+export fn tensor_dtype_block_elems(dtype: TensorDType) u64 {
+    if dtype == TensorDType.UNKNOWN {
+        return 0;
+    }
+    if dtype == TensorDType.F32 || dtype == TensorDType.F16 ||
+        dtype == TensorDType.I8 || dtype == TensorDType.I16 ||
+        dtype == TensorDType.I32 || dtype == TensorDType.I64 ||
+        dtype == TensorDType.F64 || dtype == TensorDType.BF16 {
+        return 1;
+    }
+    if dtype == TensorDType.Q4_0 || dtype == TensorDType.Q4_1 ||
+        dtype == TensorDType.Q5_0 || dtype == TensorDType.Q5_1 ||
+        dtype == TensorDType.Q8_0 || dtype == TensorDType.Q8_1 {
+        return 32;
+    }
+    return 256;
+}
+
+export fn tensor_dtype_block_bytes(dtype: TensorDType) u64 {
+    if dtype == TensorDType.F32 { return 4; }
+    if dtype == TensorDType.F16 { return 2; }
+    if dtype == TensorDType.Q4_0 { return 18; }
+    if dtype == TensorDType.Q4_1 { return 20; }
+    if dtype == TensorDType.Q5_0 { return 22; }
+    if dtype == TensorDType.Q5_1 { return 24; }
+    if dtype == TensorDType.Q8_0 { return 34; }
+    if dtype == TensorDType.Q8_1 { return 40; }
+    if dtype == TensorDType.Q2_K { return 84; }
+    if dtype == TensorDType.Q3_K { return 110; }
+    if dtype == TensorDType.Q4_K { return 144; }
+    if dtype == TensorDType.Q5_K { return 176; }
+    if dtype == TensorDType.Q6_K { return 210; }
+    if dtype == TensorDType.Q8_K { return 292; }
+    if dtype == TensorDType.IQ2_XXS { return 66; }
+    if dtype == TensorDType.IQ2_XS { return 74; }
+    if dtype == TensorDType.IQ3_XXS { return 98; }
+    if dtype == TensorDType.IQ1_S { return 110; }
+    if dtype == TensorDType.IQ4_NL { return 50; }
+    if dtype == TensorDType.IQ3_S { return 110; }
+    if dtype == TensorDType.IQ2_S { return 82; }
+    if dtype == TensorDType.IQ4_XS { return 136; }
+    if dtype == TensorDType.I8 { return 1; }
+    if dtype == TensorDType.I16 { return 2; }
+    if dtype == TensorDType.I32 { return 4; }
+    if dtype == TensorDType.I64 { return 8; }
+    if dtype == TensorDType.F64 { return 8; }
+    if dtype == TensorDType.IQ1_M { return 56; }
+    if dtype == TensorDType.BF16 { return 2; }
+    return 0;
+}
+
+export fn tensor_dtype_is_scalar(dtype: TensorDType) bool {
+    return tensor_dtype_block_elems(dtype) == 1 && tensor_dtype_block_bytes(dtype) != 0;
+}
+
+fn tensor_align_up(value: u64, alignment: u64) u64 {
+    if alignment == 0 {
+        return value;
+    }
+    const rem: u64 = value % alignment;
+    if rem == 0 {
+        return value;
+    }
+    return value + (alignment - rem);
+}
+
+fn tensor_mul_checked(a: u64, b: u64, out: &u64) bool {
+    if a != 0 && b > (TENSOR_U64_MAX / a) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+fn tensor_shape_get(n_dims: u32, d0: u64, d1: u64, d2: u64, d3: u64, idx: u32) u64 {
+    if idx == 0 { return d0; }
+    if idx == 1 { return d1; }
+    if idx == 2 { return d2; }
+    if idx == 3 { return d3; }
+    return 0;
+}
+
+fn tensor_view_zero() TensorView {
+    return TensorView{
+        name: tensor_string_zero(),
+        data: null,
+        dtype: TensorDType.UNKNOWN,
+        ggml_type: 0,
+        n_dims: 0,
+        shape: [],
+        stride_bytes: [],
+        elements: 0,
+        byte_size: 0,
+        file_offset: 0,
+        file_size: 0,
+        file_backed: false,
+        writable: false,
+    };
+}
+
+fn tensor_view_compute_layout(view: &TensorView) bool {
+    const block_elems: u64 = tensor_dtype_block_elems(view.dtype);
+    const block_bytes: u64 = tensor_dtype_block_bytes(view.dtype);
+    if view.n_dims == 0 || view.n_dims > 4 || block_elems == 0 || block_bytes == 0 {
+        return false;
+    }
+
+    view.elements = 1;
+    var d: u32 = 0;
+    while d < view.n_dims {
+        const dim: u64 = view.shape[d as usize];
+        if dim == 0 {
+            return false;
+        }
+        if !tensor_mul_checked(view.elements, dim, &view.elements) {
+            return false;
+        }
+        d = d + 1;
+    }
+
+    var row_blocks: u64 = view.shape[0] / block_elems;
+    if (view.shape[0] % block_elems) != 0 {
+        row_blocks = row_blocks + 1;
+    }
+    if !tensor_mul_checked(row_blocks, block_bytes, &view.stride_bytes[1]) {
+        return false;
+    }
+    view.stride_bytes[0] = block_bytes;
+
+    if view.n_dims == 1 {
+        view.byte_size = view.stride_bytes[1];
+        return true;
+    }
+
+    d = 2;
+    while d < view.n_dims {
+        const prev: u64 = view.stride_bytes[(d - 1) as usize];
+        const prev_dim: u64 = view.shape[(d - 1) as usize];
+        if !tensor_mul_checked(prev, prev_dim, &view.stride_bytes[d as usize]) {
+            return false;
+        }
+        d = d + 1;
+    }
+
+    var last_stride: u64 = view.stride_bytes[1];
+    var last_dim: u64 = view.shape[1];
+    if view.n_dims == 3 {
+        last_stride = view.stride_bytes[2];
+        last_dim = view.shape[2];
+    } else if view.n_dims == 4 {
+        last_stride = view.stride_bytes[3];
+        last_dim = view.shape[3];
+    }
+    return tensor_mul_checked(last_stride, last_dim, &view.byte_size);
+}
+
+export fn tensor_view_init_memory(
+    data: &byte,
+    dtype: TensorDType,
+    n_dims: u32,
+    d0: u64,
+    d1: u64,
+    d2: u64,
+    d3: u64,
+    writable: bool,
+    out: &TensorView,
+) bool {
+    *out = tensor_view_zero();
+    out.data = data;
+    out.dtype = dtype;
+    out.n_dims = n_dims;
+    out.shape[0] = d0;
+    out.shape[1] = d1;
+    out.shape[2] = d2;
+    out.shape[3] = d3;
+    out.file_backed = false;
+    out.writable = writable;
+    return tensor_view_compute_layout(out);
+}
+
+export fn tensor_view_from_gguf_tensor(info: &GgufInfo, tensor: &GgufTensorInfo, out: &TensorView) bool {
+    *out = tensor_view_zero();
+    if tensor.n_dims == 0 || tensor.n_dims > 4 || !tensor.byte_size_known {
+        return false;
+    }
+    const dtype: TensorDType = tensor_dtype_from_ggml(tensor.ggml_type);
+    if dtype == TensorDType.UNKNOWN {
+        return false;
+    }
+
+    tensor_string_copy(&out.name, &tensor.name);
+    out.dtype = dtype;
+    out.ggml_type = tensor.ggml_type;
+    out.n_dims = tensor.n_dims;
+    out.file_offset = tensor.abs_offset;
+    out.file_size = info.file_size;
+    out.file_backed = true;
+    out.writable = false;
+
+    var d: u32 = 0;
+    while d < tensor.n_dims {
+        out.shape[d as usize] = tensor.shape[d as usize];
+        d = d + 1;
+    }
+    if !tensor_view_compute_layout(out) {
+        return false;
+    }
+    return out.byte_size == tensor.byte_size;
+}
+
+export fn tensor_view_data_available(view: &TensorView) bool {
+    if !view.file_backed {
+        return view.data != null;
+    }
+    if view.file_offset > view.file_size {
+        return false;
+    }
+    return view.byte_size <= (view.file_size - view.file_offset);
+}
+
+export fn tensor_view_expect_shape(
+    view: &TensorView,
+    dtype: TensorDType,
+    n_dims: u32,
+    d0: u64,
+    d1: u64,
+    d2: u64,
+    d3: u64,
+) bool {
+    if view.dtype != dtype || view.n_dims != n_dims {
+        return false;
+    }
+    var d: u32 = 0;
+    while d < n_dims {
+        if view.shape[d as usize] != tensor_shape_get(n_dims, d0, d1, d2, d3, d) {
+            return false;
+        }
+        d = d + 1;
+    }
+    return true;
+}
+
+export fn tensor_view_byte_offset(
+    view: &TensorView,
+    i0: u64,
+    i1: u64,
+    i2: u64,
+    i3: u64,
+    out: &u64,
+) bool {
+    if view.n_dims == 0 || view.n_dims > 4 {
+        return false;
+    }
+    const idx: [u64: 4] = [i0, i1, i2, i3];
+    var d: u32 = 0;
+    while d < view.n_dims {
+        if idx[d as usize] >= view.shape[d as usize] {
+            return false;
+        }
+        d = d + 1;
+    }
+
+    const block_elems: u64 = tensor_dtype_block_elems(view.dtype);
+    if block_elems == 0 {
+        return false;
+    }
+
+    var offset: u64 = (i0 / block_elems) * view.stride_bytes[0];
+    if view.n_dims > 1 {
+        offset = offset + i1 * view.stride_bytes[1];
+    }
+    if view.n_dims > 2 {
+        offset = offset + i2 * view.stride_bytes[2];
+    }
+    if view.n_dims > 3 {
+        offset = offset + i3 * view.stride_bytes[3];
+    }
+    if offset >= view.byte_size {
+        return false;
+    }
+    *out = offset;
+    return true;
+}
+
+export fn tensor_view_byte_range(view: &TensorView, byte_offset: u64, len: u64) bool {
+    if byte_offset > view.byte_size {
+        return false;
+    }
+    return len <= (view.byte_size - byte_offset);
+}
+
+export fn tensor_weight_table_init() TensorWeightTable {
+    return TensorWeightTable{
+        views: null,
+        count: 0,
+        file_size: 0,
+        incomplete: false,
+        required_end: 0,
+        token_embd: null,
+        output_norm: null,
+        output: null,
+    };
+}
+
+export fn tensor_weight_table_deinit(table: &TensorWeightTable) void {
+    if table.views != null {
+        free(table.views as &void);
+    }
+    *table = tensor_weight_table_init();
+}
+
+export fn tensor_weight_table_find(table: &TensorWeightTable, name: &const byte) &TensorView {
+    var i: u64 = 0;
+    while i < table.count {
+        const view: &TensorView = &table.views[i as usize];
+        if tensor_name_equals(&view.name, name) {
+            return view;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn tensor_weight_table_bind_roots(table: &TensorWeightTable) bool {
+    table.token_embd = tensor_weight_table_find(table, "token_embd.weight\0" as &const byte);
+    table.output_norm = tensor_weight_table_find(table, "output_norm.weight\0" as &const byte);
+    table.output = tensor_weight_table_find(table, "output.weight\0" as &const byte);
+    return table.token_embd != null && table.output_norm != null && table.output != null;
+}
+
+export fn tensor_weight_table_load_from_gguf(path: &const byte, table: &TensorWeightTable) i32 {
+    tensor_weight_table_deinit(table);
+
+    var info: GgufInfo = gguf_info_init();
+    const rc: i32 = load_gguf(path, &info);
+    if rc != 0 && rc != 6 {
+        gguf_info_deinit(&info);
+        return rc;
+    }
+
+    table.count = info.loaded_tensor_count;
+    table.file_size = info.file_size;
+    table.incomplete = rc == 6;
+    table.required_end = info.required_end;
+
+    if table.count > 0 {
+        const bytes: usize = (table.count as usize) * (@size_of(TensorView) as usize);
+        table.views = malloc(bytes) as &TensorView;
+        if table.views == null {
+            gguf_info_deinit(&info);
+            tensor_weight_table_deinit(table);
+            return 2;
+        }
+
+        var i: u64 = 0;
+        while i < table.count {
+            if !tensor_view_from_gguf_tensor(&info, &info.tensors[i as usize], &table.views[i as usize]) {
+                gguf_info_deinit(&info);
+                tensor_weight_table_deinit(table);
+                return 3;
+            }
+            i = i + 1;
+        }
+    }
+
+    if !tensor_weight_table_bind_roots(table) {
+        gguf_info_deinit(&info);
+        tensor_weight_table_deinit(table);
+        return 7;
+    }
+
+    gguf_info_deinit(&info);
+    return 0;
+}
+
+export fn tensor_scratch_arena_init() TensorScratchArena {
+    return TensorScratchArena{ data: null, cap: 0, used: 0, high_water: 0 };
+}
+
+export fn tensor_scratch_arena_deinit(arena: &TensorScratchArena) void {
+    if arena.data != null {
+        free(arena.data as &void);
+    }
+    *arena = tensor_scratch_arena_init();
+}
+
+export fn tensor_scratch_reset(arena: &TensorScratchArena) void {
+    arena.used = 0;
+}
+
+fn tensor_scratch_reserve(arena: &TensorScratchArena, needed: u64) bool {
+    if arena.cap >= needed {
+        return true;
+    }
+    var new_cap: u64 = arena.cap;
+    if new_cap == 0 {
+        new_cap = 4096;
+    }
+    while new_cap < needed {
+        if new_cap > (TENSOR_U64_MAX / 2) {
+            return false;
+        }
+        new_cap = new_cap * 2;
+    }
+
+    var p: &void = null;
+    if arena.data == null {
+        p = malloc(new_cap as usize);
+    } else {
+        p = realloc(arena.data as &void, new_cap as usize);
+    }
+    if p == null {
+        return false;
+    }
+    arena.data = p as &byte;
+    arena.cap = new_cap;
+    return true;
+}
+
+export fn tensor_scratch_alloc_bytes(arena: &TensorScratchArena, bytes: u64, alignment: u64) &byte {
+    const start: u64 = tensor_align_up(arena.used, alignment);
+    if bytes > (TENSOR_U64_MAX - start) {
+        return null;
+    }
+    const end: u64 = start + bytes;
+    if !tensor_scratch_reserve(arena, end) {
+        return null;
+    }
+    arena.used = end;
+    if arena.used > arena.high_water {
+        arena.high_water = arena.used;
+    }
+    const base: usize = @usize_from_ptr(arena.data as &void);
+    return @ptr_from_usize(base + (start as usize)) as &byte;
+}
+
+export fn tensor_scratch_alloc_view(
+    arena: &TensorScratchArena,
+    dtype: TensorDType,
+    n_dims: u32,
+    d0: u64,
+    d1: u64,
+    d2: u64,
+    d3: u64,
+    out: &TensorView,
+) bool {
+    var tmp: TensorView = tensor_view_zero();
+    if !tensor_view_init_memory(null, dtype, n_dims, d0, d1, d2, d3, true, &tmp) {
+        return false;
+    }
+    const ptr: &byte = tensor_scratch_alloc_bytes(arena, tmp.byte_size, 64);
+    if ptr == null {
+        return false;
+    }
+    return tensor_view_init_memory(ptr, dtype, n_dims, d0, d1, d2, d3, true, out);
+}
+
+export fn tensor_kv_cache_init(
+    cache: &TensorKvCache,
+    dtype: TensorDType,
+    n_layer: u64,
+    n_ctx: u64,
+    n_head_kv: u64,
+    key_dim: u64,
+    value_dim: u64,
+) bool {
+    tensor_kv_cache_deinit(cache);
+    if !tensor_dtype_is_scalar(dtype) || n_layer == 0 || n_ctx == 0 || n_head_kv == 0 || key_dim == 0 || value_dim == 0 {
+        return false;
+    }
+
+    var key_view: TensorView = tensor_view_zero();
+    if !tensor_view_init_memory(null, dtype, 4, key_dim, n_head_kv, n_ctx, n_layer, true, &key_view) {
+        return false;
+    }
+    var value_view: TensorView = tensor_view_zero();
+    if !tensor_view_init_memory(null, dtype, 4, value_dim, n_head_kv, n_ctx, n_layer, true, &value_view) {
+        return false;
+    }
+
+    const value_offset: u64 = tensor_align_up(key_view.byte_size, 64);
+    if value_view.byte_size > (TENSOR_U64_MAX - value_offset) {
+        return false;
+    }
+    const total: u64 = value_offset + value_view.byte_size;
+    const data: &byte = malloc(total as usize) as &byte;
+    if data == null {
+        return false;
+    }
+
+    cache.data = data;
+    cache.bytes = total;
+    cache.dtype = dtype;
+    cache.n_layer = n_layer;
+    cache.n_ctx = n_ctx;
+    cache.n_head_kv = n_head_kv;
+    cache.key_dim = key_dim;
+    cache.value_dim = value_dim;
+    cache.value_offset = value_offset;
+    _ = tensor_view_init_memory(data, dtype, 4, key_dim, n_head_kv, n_ctx, n_layer, true, &cache.key);
+    const base: usize = @usize_from_ptr(data as &void);
+    const value_ptr: &byte = @ptr_from_usize(base + (value_offset as usize)) as &byte;
+    _ = tensor_view_init_memory(value_ptr, dtype, 4, value_dim, n_head_kv, n_ctx, n_layer, true, &cache.value);
+    return true;
+}
+
+export fn tensor_kv_cache_empty() TensorKvCache {
+    return TensorKvCache{
+        data: null,
+        bytes: 0,
+        dtype: TensorDType.UNKNOWN,
+        n_layer: 0,
+        n_ctx: 0,
+        n_head_kv: 0,
+        key_dim: 0,
+        value_dim: 0,
+        value_offset: 0,
+        key: tensor_view_zero(),
+        value: tensor_view_zero(),
+    };
+}
+
+export fn tensor_kv_cache_deinit(cache: &TensorKvCache) void {
+    if cache.data != null {
+        free(cache.data as &void);
+    }
+    *cache = tensor_kv_cache_empty();
+}
+
+export fn tensor_kv_cache_key_offset(cache: &TensorKvCache, layer: u64, pos: u64, head: u64, dim: u64, out: &u64) bool {
+    return tensor_view_byte_offset(&cache.key, dim, head, pos, layer, out);
+}
+
+export fn tensor_kv_cache_value_offset(cache: &TensorKvCache, layer: u64, pos: u64, head: u64, dim: u64, out: &u64) bool {
+    var rel: u64 = 0;
+    if !tensor_view_byte_offset(&cache.value, dim, head, pos, layer, &rel) {
+        return false;
+    }
+    *out = cache.value_offset + rel;
+    return true;
+}
+
+fn tensor_print_dtype(dtype: TensorDType) void {
+    if dtype == TensorDType.F32 { _ = printf("f32"); }
+    else if dtype == TensorDType.F16 { _ = printf("f16"); }
+    else if dtype == TensorDType.Q8_0 { _ = printf("q8_0"); }
+    else if dtype == TensorDType.Q4_K { _ = printf("q4_k"); }
+    else if dtype == TensorDType.I32 { _ = printf("i32"); }
+    else { _ = printf("dtype(%d)", dtype as i32); }
+}
+
+export fn print_tensor_weight_view(path: &const byte, name: &const byte) i32 {
+    var table: TensorWeightTable = tensor_weight_table_init();
+    const rc: i32 = tensor_weight_table_load_from_gguf(path, &table);
+    if rc != 0 {
+        _ = printf("ds4-uya: cannot load tensor weight table, rc=%d\n", rc);
+        tensor_weight_table_deinit(&table);
+        return rc;
+    }
+    const view: &TensorView = tensor_weight_table_find(&table, name);
+    if view == null {
+        _ = printf("ds4-uya: tensor view not found: %s\n", name);
+        tensor_weight_table_deinit(&table);
+        return 7;
+    }
+    _ = printf("view %s dtype=", &view.name.data[0]);
+    tensor_print_dtype(view.dtype);
+    _ = printf(" shape=[");
+    var d: u32 = 0;
+    while d < view.n_dims {
+        if d > 0 {
+            _ = printf(" x ");
+        }
+        _ = printf("%llu", view.shape[d as usize]);
+        d = d + 1;
+    }
+    _ = printf("] stride=[");
+    d = 0;
+    while d < view.n_dims {
+        if d > 0 {
+            _ = printf(", ");
+        }
+        _ = printf("%llu", view.stride_bytes[d as usize]);
+        d = d + 1;
+    }
+    _ = printf("] bytes=%llu offset=%llu available=%u\n", view.byte_size, view.file_offset, tensor_view_data_available(view) as u32);
+    tensor_weight_table_deinit(&table);
+    return 0;
+}
