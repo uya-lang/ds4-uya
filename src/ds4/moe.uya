@@ -1,0 +1,137 @@
+use libc.free;
+use libc.malloc;
+
+const MOE_U64_MAX: u64 = 0xffffffffffffffff;
+
+export struct MoeDispatchPlan {
+    n_tokens: u64,
+    top_k: u64,
+    n_expert: u64,
+    n_items: u64,
+    counts: &u64,
+    offsets: &u64,
+    next: &u64,
+    token_ids: &u64,
+    ranks: &u64,
+}
+
+export fn moe_dispatch_plan_init() MoeDispatchPlan {
+    return MoeDispatchPlan{
+        n_tokens: 0,
+        top_k: 0,
+        n_expert: 0,
+        n_items: 0,
+        counts: null,
+        offsets: null,
+        next: null,
+        token_ids: null,
+        ranks: null,
+    };
+}
+
+export fn moe_dispatch_plan_deinit(plan: &MoeDispatchPlan) void {
+    if plan.counts != null { free(plan.counts as &void); }
+    if plan.offsets != null { free(plan.offsets as &void); }
+    if plan.next != null { free(plan.next as &void); }
+    if plan.token_ids != null { free(plan.token_ids as &void); }
+    if plan.ranks != null { free(plan.ranks as &void); }
+    *plan = moe_dispatch_plan_init();
+}
+
+fn moe_alloc_u64(n: u64) &u64 {
+    if n == 0 {
+        return null;
+    }
+    return malloc((n as usize) * (8 as usize)) as &u64;
+}
+
+fn moe_zero_u64(values: &u64, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        values[i as usize] = 0;
+        i = i + 1;
+    }
+}
+
+export fn moe_dispatch_plan_build(expert_ids: &const i32, n_tokens: u64, top_k: u64, n_expert: u64, plan: &MoeDispatchPlan) bool {
+    moe_dispatch_plan_deinit(plan);
+    if expert_ids == null || n_tokens == 0 || top_k == 0 || n_expert == 0 {
+        return false;
+    }
+    if n_tokens > MOE_U64_MAX / top_k || n_expert == MOE_U64_MAX {
+        return false;
+    }
+    const n_items: u64 = n_tokens * top_k;
+
+    plan.counts = moe_alloc_u64(n_expert);
+    plan.offsets = moe_alloc_u64(n_expert + 1);
+    plan.next = moe_alloc_u64(n_expert);
+    plan.token_ids = moe_alloc_u64(n_items);
+    plan.ranks = moe_alloc_u64(n_items);
+    if plan.counts == null || plan.offsets == null || plan.next == null || plan.token_ids == null || plan.ranks == null {
+        moe_dispatch_plan_deinit(plan);
+        return false;
+    }
+    moe_zero_u64(plan.counts, n_expert);
+    moe_zero_u64(plan.offsets, n_expert + 1);
+    moe_zero_u64(plan.next, n_expert);
+
+    var t: u64 = 0;
+    while t < n_tokens {
+        var r: u64 = 0;
+        while r < top_k {
+            const expert: i32 = expert_ids[(t * top_k + r) as usize];
+            if expert < 0 || (expert as u64) >= n_expert {
+                moe_dispatch_plan_deinit(plan);
+                return false;
+            }
+            plan.counts[expert as usize] = plan.counts[expert as usize] + 1;
+            r = r + 1;
+        }
+        t = t + 1;
+    }
+
+    var sum: u64 = 0;
+    var e: u64 = 0;
+    while e < n_expert {
+        plan.offsets[e as usize] = sum;
+        plan.next[e as usize] = sum;
+        sum = sum + plan.counts[e as usize];
+        e = e + 1;
+    }
+    plan.offsets[n_expert as usize] = sum;
+
+    t = 0;
+    while t < n_tokens {
+        var r2: u64 = 0;
+        while r2 < top_k {
+            const expert2: u64 = expert_ids[(t * top_k + r2) as usize] as u64;
+            const slot: u64 = plan.next[expert2 as usize];
+            plan.token_ids[slot as usize] = t;
+            plan.ranks[slot as usize] = r2;
+            plan.next[expert2 as usize] = slot + 1;
+            r2 = r2 + 1;
+        }
+        t = t + 1;
+    }
+
+    plan.n_tokens = n_tokens;
+    plan.top_k = top_k;
+    plan.n_expert = n_expert;
+    plan.n_items = n_items;
+    return true;
+}
+
+export fn moe_dispatch_expert_start(plan: &MoeDispatchPlan, expert: u64) u64 {
+    if expert >= plan.n_expert || plan.offsets == null {
+        return 0;
+    }
+    return plan.offsets[expert as usize];
+}
+
+export fn moe_dispatch_expert_end(plan: &MoeDispatchPlan, expert: u64) u64 {
+    if expert >= plan.n_expert || plan.offsets == null {
+        return 0;
+    }
+    return plan.offsets[(expert + 1) as usize];
+}

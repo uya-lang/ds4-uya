@@ -1,0 +1,164 @@
+use ds4.bench.BenchResult;
+use ds4.bench.bench_run_synthetic;
+use ds4.kernels.kernels_f32_dot_reference;
+use ds4.kernels.kernels_f32_dot_simd;
+use ds4.kernels.kernels_q4_k_dot_f32_fast;
+use ds4.kernels.kernels_q4_k_dot_f32_reference;
+use ds4.kernels.kernels_q8_0_dot_f32_fast;
+use ds4.kernels.kernels_q8_0_dot_f32_reference;
+use ds4.moe.MoeDispatchPlan;
+use ds4.moe.moe_dispatch_expert_end;
+use ds4.moe.moe_dispatch_expert_start;
+use ds4.moe.moe_dispatch_plan_build;
+use ds4.moe.moe_dispatch_plan_deinit;
+use ds4.moe.moe_dispatch_plan_init;
+use ds4.tensor.TensorDType;
+use ds4.tensor.TensorKvCache;
+use ds4.tensor.tensor_kv_cache_deinit;
+use ds4.tensor.tensor_kv_cache_empty;
+use ds4.tensor.tensor_kv_cache_init;
+use ds4.tensor.tensor_kv_cache_key_offset;
+use ds4.tensor.tensor_kv_cache_key_row;
+use ds4.tensor.tensor_kv_cache_value_row;
+use libc.fabsf;
+use std.testing.assert_eq_i32;
+use std.testing.expect;
+
+fn assert_close(actual: f32, expected: f32, tol: f32) !void {
+    try expect(fabsf(actual - expected) <= tol);
+}
+
+test "simd dot matches scalar reference" {
+    var a: [f32: 17] = [];
+    var b: [f32: 17] = [];
+    var i: u64 = 0;
+    while i < 17 {
+        a[i as usize] = ((i as f32) - 5.0f32) * 0.25f32;
+        b[i as usize] = (((i * 3) % 11) as f32) * 0.125f32 - 0.5f32;
+        i = i + 1;
+    }
+
+    const ref: f32 = kernels_f32_dot_reference(&a[0], &b[0], 17);
+    const fast: f32 = kernels_f32_dot_simd(&a[0], &b[0], 17);
+    try assert_close(fast, ref, 0.00001f32);
+}
+
+test "q8 fast fused dot matches reference" {
+    var blocks: [byte: 68] = [];
+    var x: [f32: 40] = [];
+    var b: u64 = 0;
+    while b < 2 {
+        const base: u64 = b * 34;
+        blocks[base as usize] = 0;
+        blocks[(base + 1) as usize] = 0x3c;
+        var j: u64 = 0;
+        while j < 32 {
+            blocks[(base + 2 + j) as usize] = ((j + b * 3) % (251 as u64)) as byte;
+            j = j + 1;
+        }
+        b = b + 1;
+    }
+    var i: u64 = 0;
+    while i < 40 {
+        x[i as usize] = ((i % 9) as f32) * 0.2f32 - 0.7f32;
+        i = i + 1;
+    }
+
+    const ref: f32 = kernels_q8_0_dot_f32_reference(&blocks[0], &x[0], 40);
+    const fast: f32 = kernels_q8_0_dot_f32_fast(&blocks[0], &x[0], 40);
+    try assert_close(fast, ref, 0.00002f32);
+}
+
+test "q4_k fast fused dot matches reference" {
+    var block: [byte: 144] = [];
+    var x: [f32: 64] = [];
+    block[0] = 0;
+    block[1] = 0x3c;
+    block[2] = 0;
+    block[3] = 0;
+    block[4] = 1;
+    block[5] = 2;
+    var j: u64 = 0;
+    while j < 32 {
+        block[(16 + j) as usize] = (((j % (13 as u64)) & (15 as u64)) | (((j + 3) % (13 as u64)) << 4)) as byte;
+        j = j + 1;
+    }
+    var i: u64 = 0;
+    while i < 64 {
+        x[i as usize] = ((i % 7) as f32) * 0.125f32 + 0.25f32;
+        i = i + 1;
+    }
+
+    const ref: f32 = kernels_q4_k_dot_f32_reference(&block[0], &x[0], 64);
+    const fast: f32 = kernels_q4_k_dot_f32_fast(&block[0], &x[0], 64);
+    try assert_close(fast, ref, 0.00002f32);
+}
+
+test "kv cache row pointers expose contiguous head rows" {
+    var cache: TensorKvCache = tensor_kv_cache_empty();
+    try expect(tensor_kv_cache_init(&cache, TensorDType.F32, 1, 2, 2, 4, 4));
+
+    const key_bytes: &byte = tensor_kv_cache_key_row(&cache, 0, 1, 1);
+    const value_bytes: &byte = tensor_kv_cache_value_row(&cache, 0, 1, 1);
+    try expect(key_bytes != null);
+    try expect(value_bytes != null);
+    const key_row: &f32 = key_bytes as &f32;
+    const value_row: &f32 = value_bytes as &f32;
+    key_row[0] = 1.0f32;
+    key_row[3] = 4.0f32;
+    value_row[2] = 9.0f32;
+
+    var off: u64 = 0;
+    try expect(tensor_kv_cache_key_offset(&cache, 0, 1, 1, 3, &off));
+    const base: usize = @usize_from_ptr(cache.data as &void);
+    const p: &f32 = @ptr_from_usize(base + (off as usize)) as &f32;
+    try assert_close(*p, 4.0f32, 0.00001f32);
+    try assert_close(value_row[2], 9.0f32, 0.00001f32);
+
+    tensor_kv_cache_deinit(&cache);
+}
+
+test "moe dispatch groups token routes by expert" {
+    var ids: [i32: 6] = [];
+    ids[0] = 1;
+    ids[1] = 0;
+    ids[2] = 1;
+    ids[3] = 2;
+    ids[4] = 0;
+    ids[5] = 1;
+
+    var plan: MoeDispatchPlan = moe_dispatch_plan_init();
+    try expect(moe_dispatch_plan_build(&ids[0], 3, 2, 3, &plan));
+    try assert_eq_i32(plan.counts[0], 2);
+    try assert_eq_i32(plan.counts[1], 3);
+    try assert_eq_i32(plan.counts[2], 1);
+    try assert_eq_i32(moe_dispatch_expert_start(&plan, 0) as i32, 0);
+    try assert_eq_i32(moe_dispatch_expert_end(&plan, 0) as i32, 2);
+    try assert_eq_i32(moe_dispatch_expert_start(&plan, 1) as i32, 2);
+    try assert_eq_i32(moe_dispatch_expert_end(&plan, 1) as i32, 5);
+    try assert_eq_i32(plan.token_ids[0] as i32, 0);
+    try assert_eq_i32(plan.token_ids[1] as i32, 2);
+    try assert_eq_i32(plan.token_ids[2] as i32, 0);
+    try assert_eq_i32(plan.token_ids[3] as i32, 1);
+    try assert_eq_i32(plan.token_ids[4] as i32, 2);
+    try assert_eq_i32(plan.token_ids[5] as i32, 1);
+
+    moe_dispatch_plan_deinit(&plan);
+}
+
+test "synthetic benchmark reports token rates" {
+    var result: BenchResult = BenchResult{
+        prompt_tokens: 0,
+        decode_tokens: 0,
+        prompt_seconds: 0.0f32,
+        decode_seconds: 0.0f32,
+        prompt_tokens_per_sec: 0.0f32,
+        decode_tokens_per_sec: 0.0f32,
+        checksum: 0.0f32,
+    };
+    try expect(bench_run_synthetic(2, 2, &result));
+    try assert_eq_i32(result.prompt_tokens as i32, 2);
+    try assert_eq_i32(result.decode_tokens as i32, 2);
+    try expect(result.prompt_tokens_per_sec > 0.0f32);
+    try expect(result.decode_tokens_per_sec > 0.0f32);
+}

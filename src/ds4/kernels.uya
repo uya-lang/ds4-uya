@@ -4,6 +4,8 @@ use libc.powf;
 use libc.sinf;
 use libc.sqrtf;
 
+type Vec8f32 = @vector(f32, 8);
+
 const Q8_0_BLOCK_ELEMS: u64 = 32;
 const Q8_0_BLOCK_BYTES: u64 = 34;
 const QK_K: u64 = 256;
@@ -82,7 +84,7 @@ export fn kernels_f32_mul(dst: &f32, a: &const f32, b: &const f32, n: u64) void 
     }
 }
 
-export fn kernels_f32_dot(a: &const f32, b: &const f32, n: u64) f32 {
+export fn kernels_f32_dot_reference(a: &const f32, b: &const f32, n: u64) f32 {
     var acc: f32 = 0.0f32;
     var i: u64 = 0;
     while i < n {
@@ -90,6 +92,28 @@ export fn kernels_f32_dot(a: &const f32, b: &const f32, n: u64) f32 {
         i = i + 1;
     }
     return acc;
+}
+
+export fn kernels_f32_dot_simd(a: &const f32, b: &const f32, n: u64) f32 {
+    var acc8: Vec8f32 = @vector.splat(0.0f32);
+    var i: u64 = 0;
+    while i + 8 <= n {
+        const av: Vec8f32 = @vector.load(&a[i as usize]);
+        const bv: Vec8f32 = @vector.load(&b[i as usize]);
+        acc8 = acc8 + av * bv;
+        i = i + 8;
+    }
+
+    var acc: f32 = @vector.reduce_add(acc8);
+    while i < n {
+        acc = acc + a[i as usize] * b[i as usize];
+        i = i + 1;
+    }
+    return acc;
+}
+
+export fn kernels_f32_dot(a: &const f32, b: &const f32, n: u64) f32 {
+    return kernels_f32_dot_simd(a, b, n);
 }
 
 export fn kernels_f16_to_f32(bits: u16) f32 {
@@ -238,7 +262,7 @@ export fn kernels_softmax(out: &f32, x: &const f32, n: u64) void {
     }
 }
 
-export fn kernels_dense_matvec_f32(out: &f32, matrix: &const f32, x: &const f32, out_dim: u64, in_dim: u64) void {
+export fn kernels_dense_matvec_f32_reference(out: &f32, matrix: &const f32, x: &const f32, out_dim: u64, in_dim: u64) void {
     var row: u64 = 0;
     while row < out_dim {
         var acc: f32 = 0.0f32;
@@ -252,7 +276,15 @@ export fn kernels_dense_matvec_f32(out: &f32, matrix: &const f32, x: &const f32,
     }
 }
 
-export fn kernels_q8_0_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+export fn kernels_dense_matvec_f32(out: &f32, matrix: &const f32, x: &const f32, out_dim: u64, in_dim: u64) void {
+    var row: u64 = 0;
+    while row < out_dim {
+        out[row as usize] = kernels_f32_dot(&matrix[(row * in_dim) as usize], x, in_dim);
+        row = row + 1;
+    }
+}
+
+export fn kernels_q8_0_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {
     var acc: f32 = 0.0f32;
     var b: u64 = 0;
     while b * Q8_0_BLOCK_ELEMS < n {
@@ -269,7 +301,45 @@ export fn kernels_q8_0_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
     return acc;
 }
 
-export fn kernels_q4_k_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+export fn kernels_q8_0_dot_f32_fast(blocks: &const byte, x: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var b: u64 = 0;
+    while b * Q8_0_BLOCK_ELEMS < n {
+        const elem_base: u64 = b * Q8_0_BLOCK_ELEMS;
+        const block_base: u64 = b * Q8_0_BLOCK_BYTES;
+        const scale: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base));
+        var limit: u64 = Q8_0_BLOCK_ELEMS;
+        if n - elem_base < limit {
+            limit = n - elem_base;
+        }
+
+        var sum0: f32 = 0.0f32;
+        var sum1: f32 = 0.0f32;
+        var sum2: f32 = 0.0f32;
+        var sum3: f32 = 0.0f32;
+        var j: u64 = 0;
+        while j + 4 <= limit {
+            sum0 = sum0 + (signed_byte_value(blocks[(block_base + 2 + j) as usize]) as f32) * x[(elem_base + j) as usize];
+            sum1 = sum1 + (signed_byte_value(blocks[(block_base + 3 + j) as usize]) as f32) * x[(elem_base + j + 1) as usize];
+            sum2 = sum2 + (signed_byte_value(blocks[(block_base + 4 + j) as usize]) as f32) * x[(elem_base + j + 2) as usize];
+            sum3 = sum3 + (signed_byte_value(blocks[(block_base + 5 + j) as usize]) as f32) * x[(elem_base + j + 3) as usize];
+            j = j + 4;
+        }
+        while j < limit {
+            sum0 = sum0 + (signed_byte_value(blocks[(block_base + 2 + j) as usize]) as f32) * x[(elem_base + j) as usize];
+            j = j + 1;
+        }
+        acc = acc + scale * (sum0 + sum1 + sum2 + sum3);
+        b = b + 1;
+    }
+    return acc;
+}
+
+export fn kernels_q8_0_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+    return kernels_q8_0_dot_f32_fast(blocks, x, n);
+}
+
+export fn kernels_q4_k_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {
     var acc: f32 = 0.0f32;
     var block_index: u64 = 0;
     while block_index * QK_K < n {
@@ -315,6 +385,65 @@ export fn kernels_q4_k_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
         block_index = block_index + 1;
     }
     return acc;
+}
+
+export fn kernels_q4_k_dot_f32_fast(blocks: &const byte, x: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var block_index: u64 = 0;
+    while block_index * QK_K < n {
+        const block_base: u64 = block_index * Q4_K_BLOCK_BYTES;
+        const d: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base));
+        const dmin: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base + 2));
+        const scales: &const byte = &blocks[(block_base + 4) as usize];
+        const qs_base: u64 = block_base + 16;
+
+        var group_pair: u64 = 0;
+        while group_pair < 4 {
+            const qoff: u64 = qs_base + group_pair * 32;
+            const g0: u64 = group_pair * 2;
+            const g1: u64 = g0 + 1;
+            var sc0: u32 = 0;
+            var min0: u32 = 0;
+            var sc1: u32 = 0;
+            var min1: u32 = 0;
+            q4_k_scale_min(scales, g0, &sc0, &min0);
+            q4_k_scale_min(scales, g1, &sc1, &min1);
+
+            var qsum0: f32 = 0.0f32;
+            var xsum0: f32 = 0.0f32;
+            var qsum1: f32 = 0.0f32;
+            var xsum1: f32 = 0.0f32;
+            var j: u64 = 0;
+            while j < 32 {
+                const qbyte: byte = blocks[(qoff + j) as usize];
+                const elem0: u64 = block_index * QK_K + group_pair * 64 + j;
+                if elem0 < n {
+                    const x0: f32 = x[elem0 as usize];
+                    qsum0 = qsum0 + ((qbyte & 15) as f32) * x0;
+                    xsum0 = xsum0 + x0;
+                }
+
+                const elem1: u64 = elem0 + 32;
+                if elem1 < n {
+                    const x1: f32 = x[elem1 as usize];
+                    qsum1 = qsum1 + ((qbyte >> 4) as f32) * x1;
+                    xsum1 = xsum1 + x1;
+                }
+                j = j + 1;
+            }
+
+            acc = acc + d * (sc0 as f32) * qsum0 - dmin * (min0 as f32) * xsum0;
+            acc = acc + d * (sc1 as f32) * qsum1 - dmin * (min1 as f32) * xsum1;
+            group_pair = group_pair + 1;
+        }
+
+        block_index = block_index + 1;
+    }
+    return acc;
+}
+
+export fn kernels_q4_k_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+    return kernels_q4_k_dot_f32_fast(blocks, x, n);
 }
 
 export fn kernels_silu(value: f32) f32 {

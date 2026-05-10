@@ -110,11 +110,11 @@
 
 ## Phase 7: CPU 优化
 
-- [ ] 为 Q8/Q4 dot 合并 dequant + dot。
-- [ ] 为 AVX2/F16C 机器增加 Uya SIMD 快路径。
-- [ ] 优化 KV cache 访问局部性。
-- [ ] 优化 MoE expert dispatch。
-- [ ] 增加 tokens/s benchmark。
+- [x] 为 Q8/Q4 dot 合并 dequant + dot。
+- [x] 为 AVX2/F16C 机器增加 Uya SIMD 快路径。
+- [x] 优化 KV cache 访问局部性。
+- [x] 优化 MoE expert dispatch。
+- [x] 增加 tokens/s benchmark。
 
 验收标准：
 

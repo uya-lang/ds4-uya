@@ -726,6 +726,24 @@ export fn tensor_kv_cache_value_offset(cache: &TensorKvCache, layer: u64, pos: u
     return true;
 }
 
+export fn tensor_kv_cache_key_row(cache: &TensorKvCache, layer: u64, pos: u64, head: u64) &byte {
+    var off: u64 = 0;
+    if !tensor_kv_cache_key_offset(cache, layer, pos, head, 0, &off) {
+        return null;
+    }
+    const base: usize = @usize_from_ptr(cache.data as &void);
+    return @ptr_from_usize(base + (off as usize)) as &byte;
+}
+
+export fn tensor_kv_cache_value_row(cache: &TensorKvCache, layer: u64, pos: u64, head: u64) &byte {
+    var off: u64 = 0;
+    if !tensor_kv_cache_value_offset(cache, layer, pos, head, 0, &off) {
+        return null;
+    }
+    const base: usize = @usize_from_ptr(cache.data as &void);
+    return @ptr_from_usize(base + (off as usize)) as &byte;
+}
+
 fn tensor_print_dtype(dtype: TensorDType) void {
     if dtype == TensorDType.F32 { _ = printf("f32"); }
     else if dtype == TensorDType.F16 { _ = printf("f16"); }

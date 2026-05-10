@@ -1,6 +1,8 @@
 use ds4.kernels.kernels_dense_matvec_f32;
 use ds4.kernels.kernels_f16_load;
+use ds4.kernels.kernels_f32_dot;
 use ds4.kernels.kernels_q8_0_dot_f32;
+use ds4.kernels.kernels_q4_k_dot_f32;
 use ds4.kernels.kernels_rms_norm;
 use ds4.kernels.kernels_rope_f32;
 use ds4.kernels.kernels_softmax;
@@ -14,7 +16,9 @@ use ds4.tensor.tensor_kv_cache_deinit;
 use ds4.tensor.tensor_kv_cache_empty;
 use ds4.tensor.tensor_kv_cache_init;
 use ds4.tensor.tensor_kv_cache_key_offset;
+use ds4.tensor.tensor_kv_cache_key_row;
 use ds4.tensor.tensor_kv_cache_value_offset;
+use ds4.tensor.tensor_kv_cache_value_row;
 use ds4.tensor.tensor_scratch_alloc_bytes;
 use ds4.tensor.tensor_scratch_arena_deinit;
 use ds4.tensor.tensor_scratch_arena_init;
@@ -179,7 +183,7 @@ fn model_view_is_output(view: &TensorView, config: &ModelConfig) bool {
     if view == null || view.n_dims != 2 || view.shape[0] != config.n_embd || view.shape[1] != config.n_vocab {
         return false;
     }
-    return view.dtype == TensorDType.F32 || view.dtype == TensorDType.Q8_0;
+    return view.dtype == TensorDType.F32 || view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q4_K;
 }
 
 fn model_layer_weights_validate(layer: &ModelLayerWeights, config: &ModelConfig) bool {
@@ -360,6 +364,15 @@ fn model_matvec(out: &f32, view: &TensorView, x: &const f32, out_dim: u64, in_di
         }
         return true;
     }
+    if view.dtype == TensorDType.Q4_K {
+        var row2: u64 = 0;
+        while row2 < out_dim {
+            const row_data: &const byte = model_byte_ptr_add(view.data, row2 * view.stride_bytes[1]);
+            out[row2 as usize] = kernels_q4_k_dot_f32(row_data, x, in_dim);
+            row2 = row2 + 1;
+        }
+        return true;
+    }
     return false;
 }
 
@@ -452,15 +465,16 @@ fn model_apply_rope(config: &ModelConfig, q: &f32, k: &f32, pos: u64) void {
 fn model_store_kv(config: &ModelConfig, state: &ModelState, layer_index: u64, pos: u64, k: &const f32, v: &const f32) bool {
     var h: u64 = 0;
     while h < config.n_head {
+        const key_row: &f32 = tensor_kv_cache_key_row(&state.kv, layer_index, pos, h) as &f32;
+        const value_row: &f32 = tensor_kv_cache_value_row(&state.kv, layer_index, pos, h) as &f32;
+        if key_row == null || value_row == null {
+            return false;
+        }
         var d: u64 = 0;
         while d < config.head_dim {
             const idx: u64 = h * config.head_dim + d;
-            if !model_cache_store_key(state, layer_index, pos, h, d, k[idx as usize]) {
-                return false;
-            }
-            if !model_cache_store_value(state, layer_index, pos, h, d, v[idx as usize]) {
-                return false;
-            }
+            key_row[d as usize] = k[idx as usize];
+            value_row[d as usize] = v[idx as usize];
             d = d + 1;
         }
         h = h + 1;
@@ -475,13 +489,11 @@ fn model_attention(config: &ModelConfig, state: &ModelState, layer_index: u64, p
     while h < config.n_head {
         var t: u64 = 0;
         while t <= pos {
-            var dot: f32 = 0.0f32;
-            var d: u64 = 0;
-            while d < config.head_dim {
-                const idx: u64 = h * config.head_dim + d;
-                dot = dot + q[idx as usize] * model_cache_load_key(state, layer_index, t, h, d);
-                d = d + 1;
+            const key_row: &const f32 = tensor_kv_cache_key_row(&state.kv, layer_index, t, h) as &const f32;
+            if key_row == null {
+                return false;
             }
+            const dot: f32 = kernels_f32_dot(&q[(h * config.head_dim) as usize], key_row, config.head_dim);
             scores[t as usize] = dot * inv_sqrt_dim;
             t = t + 1;
         }
@@ -492,7 +504,11 @@ fn model_attention(config: &ModelConfig, state: &ModelState, layer_index: u64, p
             var acc: f32 = 0.0f32;
             t = 0;
             while t <= pos {
-                acc = acc + probs[t as usize] * model_cache_load_value(state, layer_index, t, h, d2);
+                const value_row: &const f32 = tensor_kv_cache_value_row(&state.kv, layer_index, t, h) as &const f32;
+                if value_row == null {
+                    return false;
+                }
+                acc = acc + probs[t as usize] * value_row[d2 as usize];
                 t = t + 1;
             }
             context[(h * config.head_dim + d2) as usize] = acc;

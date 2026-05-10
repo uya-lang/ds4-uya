@@ -4,8 +4,9 @@
 
 The current milestone is intentionally small and runnable on this Linux x86_64
 machine: it provides project docs, GGUF loading, tokenizer support, CPU tensor
-views, scalar reference kernels, a reference transformer forward path, a sampler,
-an in-memory greedy generation loop, and generation/chat CLI entrypoints.
+views, scalar and optimized kernels, a reference transformer forward path, a
+sampler, an in-memory greedy generation loop, and generation/chat CLI
+entrypoints.
 
 ## Build
 
@@ -37,6 +38,7 @@ build/ds4-uya encode /path/to/model.gguf "hello"
 build/ds4-uya decode /path/to/model.gguf 33310
 build/ds4-uya generate /path/to/model.gguf "hello"
 build/ds4-uya chat /path/to/model.gguf
+build/ds4-uya bench
 ```
 
 For the partial model currently present in the sibling `ds4` project:
@@ -53,10 +55,12 @@ build/ds4-uya inspect /home/winger/uya/ds4/gguf/DeepSeek-V4-Flash-Q4KExperts-F16
   tensor lookup, tensor offsets, tokenizer metadata loading, token lookup,
   GPT-2 byte-level BPE encode/decode, BOS/EOS/UNK/control token handling, CPU
   tensor views, root weight binding, scratch arena, KV cache layout, truncation
-  diagnostics, and scalar reference kernels for F32/F16 math, RMSNorm, RoPE,
-  Softmax, dense matvec, Q8_0/Q4_K dot, SiLU/SwiGLU, and a dense F32
-  transformer forward fixture path with logits output, plus deterministic
-  greedy/temperature/top-k/top-p/repeat-penalty sampling, an in-memory greedy
-  generation loop, and `generate`/`chat` command entrypoints.
+  diagnostics, scalar reference kernels for F32/F16 math, RMSNorm, RoPE,
+  Softmax, dense matvec, Q8_0/Q4_K dot, SiLU/SwiGLU, Uya `@vector` F32 dot,
+  fused Q8_0/Q4_K dequant-dot fast paths, KV row access, MoE dispatch planning,
+  a dense F32 transformer forward fixture path with logits output,
+  deterministic greedy/temperature/top-k/top-p/repeat-penalty sampling, an
+  in-memory greedy generation loop, `generate`/`chat` command entrypoints, and
+  a synthetic prompt/decode tokens/s benchmark.
 - Not implemented yet: end-to-end GGUF-backed token generation from mapped
   model weights.

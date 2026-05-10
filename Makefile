@@ -16,6 +16,7 @@ test:
 	$(UYA) test src/kernels_test.uya
 	$(UYA) test src/model_test.uya
 	$(UYA) test src/sampler_test.uya
+	$(UYA) test src/optimization_test.uya
 
 help: build
 	$(BIN) --help
