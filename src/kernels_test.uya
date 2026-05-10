@@ -7,6 +7,7 @@ use ds4.kernels.kernels_f32_dot;
 use ds4.kernels.kernels_f32_fill;
 use ds4.kernels.kernels_f32_mul;
 use ds4.kernels.kernels_f32_to_f16;
+use ds4.kernels.kernels_q2_k_dot_f32;
 use ds4.kernels.kernels_q4_k_dot_f32;
 use ds4.kernels.kernels_q8_0_dot_f32;
 use ds4.kernels.kernels_rms_norm;
@@ -140,6 +141,23 @@ test "q8_0 dot f32" {
     x[3] = 4.0f32;
 
     try assert_close(kernels_q8_0_dot_f32(&block[0], &x[0], 4), 12.0f32, 0.00001f32);
+}
+
+test "q2_k reference dot f32" {
+    var block: [byte: 84] = [];
+    var x: [f32: 4] = [];
+    block[0] = 1;
+    block[16] = 57;
+    block[80] = 0;
+    block[81] = 0x3c;
+    block[82] = 0;
+    block[83] = 0;
+    x[0] = 1.0f32;
+    x[1] = 1.0f32;
+    x[2] = 1.0f32;
+    x[3] = 1.0f32;
+
+    try assert_close(kernels_q2_k_dot_f32(&block[0], &x[0], 4), 6.0f32, 0.00001f32);
 }
 
 test "q4_k reference dot f32" {

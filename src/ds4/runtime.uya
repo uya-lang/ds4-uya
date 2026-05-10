@@ -2,6 +2,17 @@ use ds4.generation.GenerationConfig;
 use ds4.generation.generation_config_greedy;
 use ds4.generation.generation_generate;
 use ds4.gguf.GgufInfo;
+use ds4.gguf.GgufString;
+use ds4.gguf.GgufTensorInfo;
+use ds4.gguf.GGML_TYPE_F16;
+use ds4.gguf.GGML_TYPE_F32;
+use ds4.gguf.GGML_TYPE_I32;
+use ds4.gguf.GGML_TYPE_IQ2_S;
+use ds4.gguf.GGML_TYPE_IQ2_XS;
+use ds4.gguf.GGML_TYPE_IQ2_XXS;
+use ds4.gguf.GGML_TYPE_Q2_K;
+use ds4.gguf.GGML_TYPE_Q4_K;
+use ds4.gguf.GGML_TYPE_Q8_0;
 use ds4.gguf.gguf_info_deinit;
 use ds4.gguf.gguf_info_init;
 use ds4.gguf.load_gguf;
@@ -59,6 +70,8 @@ const RUNTIME_SEEK_SET: i32 = 0;
 const RUNTIME_DEFAULT_MAX_NEW: u64 = 64;
 const RUNTIME_CHAT_MAX_NEW: u64 = 96;
 
+extern "libc" fn memcpy(dest: &void, src: &const void, n: usize) &void;
+
 export struct RuntimeSession {
     info: GgufInfo,
     table: TensorWeightTable,
@@ -75,6 +88,13 @@ export struct RuntimeSession {
 fn runtime_empty_model() Model {
     var config: ModelConfig = model_config_init(0, 0, 0, 0, 0, 0);
     return Model{ config: config, weights: null };
+}
+
+fn runtime_f32_from_bits(bits: u64) f32 {
+    var raw: u32 = bits as u32;
+    var value: f32 = 0.0f32;
+    _ = memcpy(&value as &void, &raw as &const void, 4 as usize);
+    return value;
 }
 
 export fn runtime_session_init() RuntimeSession {
@@ -237,7 +257,7 @@ fn runtime_build_config(session: &RuntimeSession) bool {
     if session.info.has_head_count_kv {
         n_head_kv = session.info.head_count_kv;
     }
-    if n_head == 0 || n_head_kv == 0 || n_head != n_head_kv {
+    if n_head == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 {
         return false;
     }
     if (n_embd % n_head) != 0 {
@@ -247,19 +267,29 @@ fn runtime_build_config(session: &RuntimeSession) bool {
     var config: ModelConfig = model_config_init(n_vocab, n_embd, n_layer, n_ctx, n_head, n_ff);
     config.n_head_kv = n_head_kv;
     config.head_dim = n_embd / n_head;
-    if session.info.has_key_length && session.info.key_length != config.head_dim {
-        return false;
+    config.key_dim = config.head_dim;
+    if session.info.has_key_length {
+        config.key_dim = session.info.key_length;
     }
-    if session.info.has_value_length && session.info.value_length != config.head_dim {
-        return false;
+    config.value_dim = config.head_dim;
+    if session.info.has_value_length {
+        config.value_dim = session.info.value_length;
     }
     if session.info.has_embedding_length && session.info.embedding_length != n_embd {
         return false;
     }
-    if (config.head_dim % (2 as u64)) == 0 {
+    if session.info.has_rope_dimension_count {
+        config.rope_dim = session.info.rope_dimension_count;
+    } else if (config.head_dim % (2 as u64)) == 0 {
         config.rope_dim = config.head_dim;
     } else {
         config.rope_dim = 0;
+    }
+    if session.info.has_rope_freq_base {
+        config.rope_theta = runtime_f32_from_bits(session.info.rope_freq_base_bits);
+    }
+    if session.info.has_rms_eps {
+        config.rms_eps = runtime_f32_from_bits(session.info.rms_eps_bits);
     }
 
     if !model_config_validate(&config) {
@@ -274,16 +304,221 @@ fn runtime_print_load_error(path: &const byte, rc: i32) void {
         _ = printf("ds4-uya: cannot open model or allocate runtime memory: %s\n", path);
     } else if rc == 3 {
         _ = printf("ds4-uya: GGUF tensor data is truncated or unreadable: %s\n", path);
+    } else if rc == 6 {
+        _ = printf("ds4-uya: GGUF tensor data is truncated; run `ds4-uya audit %s` for schema-only diagnostics\n", path);
     } else if rc == 7 {
         _ = printf("ds4-uya: GGUF is missing required root tensors token_embd/output_norm/output\n");
     } else if rc == 8 {
         _ = printf("ds4-uya: GGUF is missing tokenizer.ggml.tokens or tokenizer.ggml.merges metadata\n");
     } else if rc == 9 {
         _ = printf("ds4-uya: unsupported model layout for current CPU forward path\n");
-        _ = printf("ds4-uya: supported now: dense decoder tensors named blk.N.*, n_head == n_head_kv, F32/F16/Q8_0/Q4_K matrices\n");
+        _ = printf("ds4-uya: supported now: dense decoder tensors named blk.N.*, dense GQA/MQA with key/value dims equal to head_dim, F32/F16/Q8_0/Q2_K/Q4_K matrices\n");
+        _ = printf("ds4-uya: run `ds4-uya audit <model.gguf>` for DS4 Flash/MoE/compressor/indexer diagnostics\n");
     } else {
         _ = printf("ds4-uya: failed to load GGUF-backed runtime, rc=%d\n", rc);
     }
+}
+
+fn runtime_sample_equals(s: &GgufString, literal: &const byte) bool {
+    const n: usize = strlen(literal as *const byte);
+    if s.len != n as u64 || s.shown != n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if s.data[i] != literal[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn runtime_sample_contains(s: &GgufString, needle: &const byte) bool {
+    const n: usize = strlen(needle as *const byte);
+    if n == 0 {
+        return true;
+    }
+    if s.shown < n {
+        return false;
+    }
+    var i: usize = 0;
+    while i + n <= s.shown {
+        var j: usize = 0;
+        var ok: bool = true;
+        while j < n {
+            if s.data[i + j] != needle[j] {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+export fn print_runtime_audit(path: &const byte) i32 {
+    var info: GgufInfo = gguf_info_init();
+    const rc: i32 = load_gguf(path, &info);
+    if rc != 0 && rc != 6 {
+        runtime_print_load_error(path, rc);
+        gguf_info_deinit(&info);
+        return rc;
+    }
+
+    _ = printf("ds4-uya audit: %s\n", path);
+    if rc == 6 {
+        _ = printf("warning: tensor data is truncated; schema/directory audit only. file_size=%llu required_end=%llu\n", info.file_size, info.required_end);
+    }
+    if info.general_name.len > 0 {
+        _ = printf("model: %s\n", &info.general_name.data[0]);
+    }
+    if info.general_architecture.len > 0 {
+        _ = printf("arch: %s\n", &info.general_architecture.data[0]);
+    }
+    _ = printf("counts: metadata=%llu/%llu tensors=%llu/%llu alignment=%llu tensor_data_start=%llu\n",
+        info.loaded_metadata_count, info.metadata_count, info.loaded_tensor_count, info.tensor_count, info.alignment, info.tensor_data_start);
+    _ = printf("params:");
+    if info.has_block_count { _ = printf(" layers=%llu", info.block_count); }
+    if info.has_context_length { _ = printf(" ctx=%llu", info.context_length); }
+    if info.has_embedding_length { _ = printf(" embd=%llu", info.embedding_length); }
+    if info.has_head_count { _ = printf(" heads=%llu", info.head_count); }
+    if info.has_head_count_kv { _ = printf(" kv_heads=%llu", info.head_count_kv); }
+    if info.has_key_length { _ = printf(" key_len=%llu", info.key_length); }
+    if info.has_value_length { _ = printf(" value_len=%llu", info.value_length); }
+    if info.has_expert_count { _ = printf(" experts=%llu", info.expert_count); }
+    if info.has_expert_used_count { _ = printf(" experts_used=%llu", info.expert_used_count); }
+    if info.has_expert_feed_forward_length { _ = printf(" expert_ff=%llu", info.expert_feed_forward_length); }
+    if info.has_expert_shared_count { _ = printf(" shared_experts=%llu", info.expert_shared_count); }
+    if info.has_file_type { _ = printf(" file_type=%llu", info.file_type); }
+    _ = printf("\n");
+
+    _ = printf("flash-metadata:");
+    if info.has_rope_dimension_count { _ = printf(" rope_dim=%llu", info.rope_dimension_count); }
+    if info.has_rope_freq_base { _ = printf(" rope_freq_base_bits=%llu", info.rope_freq_base_bits); }
+    if info.has_rope_scaling_factor { _ = printf(" rope_scale_bits=%llu", info.rope_scaling_factor_bits); }
+    if info.has_rms_eps { _ = printf(" rms_eps_bits=%llu", info.rms_eps_bits); }
+    if info.has_q_lora_rank { _ = printf(" q_lora=%llu", info.q_lora_rank); }
+    if info.has_output_lora_rank { _ = printf(" out_lora=%llu", info.output_lora_rank); }
+    if info.has_output_group_count { _ = printf(" out_groups=%llu", info.output_group_count); }
+    if info.has_expert_gating_func { _ = printf(" expert_gate_func=%llu", info.expert_gating_func); }
+    if info.has_attention_sliding_window { _ = printf(" sliding_window=%llu", info.attention_sliding_window); }
+    if info.has_indexer_head_count { _ = printf(" indexer_heads=%llu", info.indexer_head_count); }
+    if info.has_indexer_key_length { _ = printf(" indexer_key_len=%llu", info.indexer_key_length); }
+    if info.has_indexer_top_k { _ = printf(" indexer_top_k=%llu", info.indexer_top_k); }
+    if info.has_hyper_connection_count { _ = printf(" hc_count=%llu", info.hyper_connection_count); }
+    _ = printf("\n");
+
+    var dense_roots: u64 = 0;
+    var dense_attn: u64 = 0;
+    var moe_experts: u64 = 0;
+    var shared_experts: u64 = 0;
+    var router_tensors: u64 = 0;
+    var compressor_tensors: u64 = 0;
+    var indexer_tensors: u64 = 0;
+    var hc_tensors: u64 = 0;
+    var lora_split_tensors: u64 = 0;
+    var q2_k_tensors: u64 = 0;
+    var iq2_tensors: u64 = 0;
+    var q4_k_tensors: u64 = 0;
+    var q8_0_tensors: u64 = 0;
+    var f16_tensors: u64 = 0;
+    var f32_tensors: u64 = 0;
+    var i32_tensors: u64 = 0;
+
+    var i: u64 = 0;
+    while i < info.loaded_tensor_count {
+        const tensor: &GgufTensorInfo = &info.tensors[i as usize];
+        if runtime_sample_equals(&tensor.name, "token_embd.weight\0" as &const byte) ||
+            runtime_sample_equals(&tensor.name, "output_norm.weight\0" as &const byte) ||
+            runtime_sample_equals(&tensor.name, "output.weight\0" as &const byte) {
+            dense_roots = dense_roots + 1;
+        }
+        if runtime_sample_contains(&tensor.name, ".attn_q.weight\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, ".attn_k.weight\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, ".attn_v.weight\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, ".attn_output.weight\0" as &const byte) {
+            dense_attn = dense_attn + 1;
+        }
+        if runtime_sample_contains(&tensor.name, "_exps.weight\0" as &const byte) {
+            moe_experts = moe_experts + 1;
+        }
+        if runtime_sample_contains(&tensor.name, "_shexp.weight\0" as &const byte) {
+            shared_experts = shared_experts + 1;
+        }
+        if runtime_sample_contains(&tensor.name, "ffn_gate_\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, "exp_probs\0" as &const byte) {
+            router_tensors = router_tensors + 1;
+        }
+        if runtime_sample_contains(&tensor.name, "compressor\0" as &const byte) {
+            compressor_tensors = compressor_tensors + 1;
+        }
+        if runtime_sample_contains(&tensor.name, "indexer\0" as &const byte) {
+            indexer_tensors = indexer_tensors + 1;
+        }
+        if runtime_sample_contains(&tensor.name, "_hc_\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, ".hc_\0" as &const byte) {
+            hc_tensors = hc_tensors + 1;
+        }
+        if runtime_sample_contains(&tensor.name, "attn_q_a.weight\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, "attn_q_b.weight\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, "attn_kv_a_norm.weight\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, "attn_kv.weight\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, "attn_output_a.weight\0" as &const byte) ||
+            runtime_sample_contains(&tensor.name, "attn_output_b.weight\0" as &const byte) {
+            lora_split_tensors = lora_split_tensors + 1;
+        }
+
+        if tensor.ggml_type == GGML_TYPE_Q2_K {
+            q2_k_tensors = q2_k_tensors + 1;
+        } else if tensor.ggml_type == GGML_TYPE_IQ2_XXS || tensor.ggml_type == GGML_TYPE_IQ2_XS ||
+            tensor.ggml_type == GGML_TYPE_IQ2_S {
+            iq2_tensors = iq2_tensors + 1;
+        } else if tensor.ggml_type == GGML_TYPE_Q4_K {
+            q4_k_tensors = q4_k_tensors + 1;
+        } else if tensor.ggml_type == GGML_TYPE_Q8_0 {
+            q8_0_tensors = q8_0_tensors + 1;
+        } else if tensor.ggml_type == GGML_TYPE_F16 {
+            f16_tensors = f16_tensors + 1;
+        } else if tensor.ggml_type == GGML_TYPE_F32 {
+            f32_tensors = f32_tensors + 1;
+        } else if tensor.ggml_type == GGML_TYPE_I32 {
+            i32_tensors = i32_tensors + 1;
+        }
+        i = i + 1;
+    }
+
+    _ = printf("layout: dense_roots=%llu dense_attn=%llu moe_experts=%llu shared_experts=%llu router=%llu compressor=%llu indexer=%llu hc=%llu split_lora=%llu\n",
+        dense_roots, dense_attn, moe_experts, shared_experts, router_tensors, compressor_tensors, indexer_tensors, hc_tensors, lora_split_tensors);
+    _ = printf("dtypes: f32=%llu f16=%llu i32=%llu q8_0=%llu q4_k=%llu q2_k=%llu iq2=%llu\n",
+        f32_tensors, f16_tensors, i32_tensors, q8_0_tensors, q4_k_tensors, q2_k_tensors, iq2_tensors);
+
+    if info.has_head_count && info.has_head_count_kv && info.head_count != info.head_count_kv {
+        _ = printf("diagnostic: GQA/MQA metadata detected; dense GQA is supported when key_len/value_len equal head_dim\n");
+    }
+    if info.has_key_length && info.has_head_count && info.has_embedding_length && info.head_count != 0 {
+        const head_dim: u64 = info.embedding_length / info.head_count;
+        if info.key_length != head_dim || (info.has_value_length && info.value_length != head_dim) {
+            _ = printf("diagnostic: Flash key/value dims require compressor/LORA branch (head_dim=%llu key_len=%llu value_len=%llu)\n",
+                head_dim, info.key_length, info.value_length);
+        }
+    }
+    if moe_experts != 0 || router_tensors != 0 || shared_experts != 0 {
+        _ = printf("diagnostic: Flash MoE tensors detected; router/shared/expert forward is not wired into generation yet\n");
+    }
+    if compressor_tensors != 0 || indexer_tensors != 0 || hc_tensors != 0 || lora_split_tensors != 0 {
+        _ = printf("diagnostic: Flash compressor/indexer/HC/split-LORA tensors detected; current forward reports unsupported instead of fake generation\n");
+    }
+    if iq2_tensors != 0 {
+        _ = printf("diagnostic: IQ2 tensors detected; Q2_K has a reference kernel, IQ2_* kernels still need format-specific implementation\n");
+    }
+
+    gguf_info_deinit(&info);
+    return 0;
 }
 
 export fn runtime_session_load_gguf(path: &const byte, session: &RuntimeSession) i32 {
@@ -294,27 +529,27 @@ export fn runtime_session_load_gguf(path: &const byte, session: &RuntimeSession)
         return load_rc;
     }
 
-    const vocab_rc: i32 = tokenizer_vocab_load_from_gguf(path, &session.vocab);
-    if vocab_rc != 0 {
-        runtime_session_deinit(session);
-        return vocab_rc;
-    }
-
     const table_rc: i32 = tensor_weight_table_load_from_gguf(path, &session.table);
     if table_rc != 0 {
         runtime_session_deinit(session);
         return table_rc;
     }
 
+    if !runtime_build_config(session) {
+        runtime_session_deinit(session);
+        return 9;
+    }
+
+    const vocab_rc: i32 = tokenizer_vocab_load_from_gguf(path, &session.vocab);
+    if vocab_rc != 0 {
+        runtime_session_deinit(session);
+        return vocab_rc;
+    }
+
     const data_rc: i32 = runtime_load_tensor_data(path, session);
     if data_rc != 0 {
         runtime_session_deinit(session);
         return data_rc;
-    }
-
-    if !runtime_build_config(session) {
-        runtime_session_deinit(session);
-        return 9;
     }
 
     if !model_weights_bind_from_table(&session.config, &session.table, &session.weights) {

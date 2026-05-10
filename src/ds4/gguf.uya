@@ -141,6 +141,38 @@ export struct GgufInfo {
     expert_count: u64,
     has_expert_used_count: bool,
     expert_used_count: u64,
+    has_feed_forward_length: bool,
+    feed_forward_length: u64,
+    has_rope_dimension_count: bool,
+    rope_dimension_count: u64,
+    has_rope_freq_base: bool,
+    rope_freq_base_bits: u64,
+    has_rope_scaling_factor: bool,
+    rope_scaling_factor_bits: u64,
+    has_rms_eps: bool,
+    rms_eps_bits: u64,
+    has_q_lora_rank: bool,
+    q_lora_rank: u64,
+    has_output_lora_rank: bool,
+    output_lora_rank: u64,
+    has_output_group_count: bool,
+    output_group_count: u64,
+    has_expert_feed_forward_length: bool,
+    expert_feed_forward_length: u64,
+    has_expert_shared_count: bool,
+    expert_shared_count: u64,
+    has_expert_gating_func: bool,
+    expert_gating_func: u64,
+    has_attention_sliding_window: bool,
+    attention_sliding_window: u64,
+    has_indexer_head_count: bool,
+    indexer_head_count: u64,
+    has_indexer_key_length: bool,
+    indexer_key_length: u64,
+    has_indexer_top_k: bool,
+    indexer_top_k: u64,
+    has_hyper_connection_count: bool,
+    hyper_connection_count: u64,
 
     tokenizer_model: GgufString,
     tokenizer_pre: GgufString,
@@ -216,6 +248,38 @@ export fn gguf_info_init() GgufInfo {
         expert_count: 0,
         has_expert_used_count: false,
         expert_used_count: 0,
+        has_feed_forward_length: false,
+        feed_forward_length: 0,
+        has_rope_dimension_count: false,
+        rope_dimension_count: 0,
+        has_rope_freq_base: false,
+        rope_freq_base_bits: 0,
+        has_rope_scaling_factor: false,
+        rope_scaling_factor_bits: 0,
+        has_rms_eps: false,
+        rms_eps_bits: 0,
+        has_q_lora_rank: false,
+        q_lora_rank: 0,
+        has_output_lora_rank: false,
+        output_lora_rank: 0,
+        has_output_group_count: false,
+        output_group_count: 0,
+        has_expert_feed_forward_length: false,
+        expert_feed_forward_length: 0,
+        has_expert_shared_count: false,
+        expert_shared_count: 0,
+        has_expert_gating_func: false,
+        expert_gating_func: 0,
+        has_attention_sliding_window: false,
+        attention_sliding_window: 0,
+        has_indexer_head_count: false,
+        indexer_head_count: 0,
+        has_indexer_key_length: false,
+        indexer_key_length: 0,
+        has_indexer_top_k: false,
+        indexer_top_k: 0,
+        has_hyper_connection_count: false,
+        hyper_connection_count: 0,
         tokenizer_model: gguf_string_zero(),
         tokenizer_pre: gguf_string_zero(),
         tokenizer_chat_template: gguf_string_zero(),
@@ -592,6 +656,20 @@ fn record_model_metadata(info: &GgufInfo, meta: &GgufMetadataInfo) void {
         return;
     }
 
+    if meta.value_type == GGUF_TYPE_FLOAT32 {
+        if sample_equals(&meta.key, "deepseek4.rope.freq_base\0" as &const byte) {
+            info.has_rope_freq_base = true;
+            info.rope_freq_base_bits = meta.scalar_u64;
+        } else if sample_equals(&meta.key, "deepseek4.rope.scaling.factor\0" as &const byte) {
+            info.has_rope_scaling_factor = true;
+            info.rope_scaling_factor_bits = meta.scalar_u64;
+        } else if sample_equals(&meta.key, "deepseek4.attention.layer_norm_rms_epsilon\0" as &const byte) {
+            info.has_rms_eps = true;
+            info.rms_eps_bits = meta.scalar_u64;
+        }
+        return;
+    }
+
     var value: u64 = 0;
     if !metadata_as_u64(meta, &value) {
         return;
@@ -649,6 +727,45 @@ fn record_model_metadata(info: &GgufInfo, meta: &GgufMetadataInfo) void {
     } else if sample_equals(&meta.key, "deepseek4.expert_used_count\0" as &const byte) {
         info.has_expert_used_count = true;
         info.expert_used_count = value;
+    } else if sample_equals(&meta.key, "deepseek4.feed_forward_length\0" as &const byte) {
+        info.has_feed_forward_length = true;
+        info.feed_forward_length = value;
+    } else if sample_equals(&meta.key, "deepseek4.rope.dimension_count\0" as &const byte) {
+        info.has_rope_dimension_count = true;
+        info.rope_dimension_count = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.q_lora_rank\0" as &const byte) {
+        info.has_q_lora_rank = true;
+        info.q_lora_rank = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.output_lora_rank\0" as &const byte) {
+        info.has_output_lora_rank = true;
+        info.output_lora_rank = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.output_group_count\0" as &const byte) {
+        info.has_output_group_count = true;
+        info.output_group_count = value;
+    } else if sample_equals(&meta.key, "deepseek4.expert_feed_forward_length\0" as &const byte) {
+        info.has_expert_feed_forward_length = true;
+        info.expert_feed_forward_length = value;
+    } else if sample_equals(&meta.key, "deepseek4.expert_shared_count\0" as &const byte) {
+        info.has_expert_shared_count = true;
+        info.expert_shared_count = value;
+    } else if sample_equals(&meta.key, "deepseek4.expert_gating_func\0" as &const byte) {
+        info.has_expert_gating_func = true;
+        info.expert_gating_func = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.sliding_window\0" as &const byte) {
+        info.has_attention_sliding_window = true;
+        info.attention_sliding_window = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.indexer.head_count\0" as &const byte) {
+        info.has_indexer_head_count = true;
+        info.indexer_head_count = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.indexer.key_length\0" as &const byte) {
+        info.has_indexer_key_length = true;
+        info.indexer_key_length = value;
+    } else if sample_equals(&meta.key, "deepseek4.attention.indexer.top_k\0" as &const byte) {
+        info.has_indexer_top_k = true;
+        info.indexer_top_k = value;
+    } else if sample_equals(&meta.key, "deepseek4.hyper_connection.count\0" as &const byte) {
+        info.has_hyper_connection_count = true;
+        info.hyper_connection_count = value;
     }
 }
 
@@ -1160,10 +1277,71 @@ fn print_model_params(info: &GgufInfo) void {
     if info.has_expert_used_count {
         _ = printf(" experts_used=%llu", info.expert_used_count);
     }
+    if info.has_feed_forward_length {
+        _ = printf(" ff=%llu", info.feed_forward_length);
+    }
+    if info.has_expert_feed_forward_length {
+        _ = printf(" expert_ff=%llu", info.expert_feed_forward_length);
+    }
+    if info.has_expert_shared_count {
+        _ = printf(" shared_experts=%llu", info.expert_shared_count);
+    }
     if info.has_file_type {
         _ = printf(" file_type=%llu", info.file_type);
     }
     _ = printf("\n");
+
+    if info.has_rope_dimension_count || info.has_rope_freq_base || info.has_rope_scaling_factor ||
+        info.has_rms_eps || info.has_q_lora_rank || info.has_output_lora_rank ||
+        info.has_output_group_count || info.has_attention_sliding_window {
+        _ = printf("ds4 flash params:");
+        if info.has_rope_dimension_count {
+            _ = printf(" rope_dim=%llu", info.rope_dimension_count);
+        }
+        if info.has_rope_freq_base {
+            _ = printf(" rope_freq_base_bits=%llu", info.rope_freq_base_bits);
+        }
+        if info.has_rope_scaling_factor {
+            _ = printf(" rope_scale_bits=%llu", info.rope_scaling_factor_bits);
+        }
+        if info.has_rms_eps {
+            _ = printf(" rms_eps_bits=%llu", info.rms_eps_bits);
+        }
+        if info.has_q_lora_rank {
+            _ = printf(" q_lora=%llu", info.q_lora_rank);
+        }
+        if info.has_output_lora_rank {
+            _ = printf(" out_lora=%llu", info.output_lora_rank);
+        }
+        if info.has_output_group_count {
+            _ = printf(" out_groups=%llu", info.output_group_count);
+        }
+        if info.has_expert_gating_func {
+            _ = printf(" expert_gate_func=%llu", info.expert_gating_func);
+        }
+        if info.has_attention_sliding_window {
+            _ = printf(" sliding_window=%llu", info.attention_sliding_window);
+        }
+        _ = printf("\n");
+    }
+
+    if info.has_indexer_head_count || info.has_indexer_key_length || info.has_indexer_top_k ||
+        info.has_hyper_connection_count {
+        _ = printf("ds4 flash aux:");
+        if info.has_indexer_head_count {
+            _ = printf(" indexer_heads=%llu", info.indexer_head_count);
+        }
+        if info.has_indexer_key_length {
+            _ = printf(" indexer_key_len=%llu", info.indexer_key_length);
+        }
+        if info.has_indexer_top_k {
+            _ = printf(" indexer_top_k=%llu", info.indexer_top_k);
+        }
+        if info.has_hyper_connection_count {
+            _ = printf(" hc_count=%llu", info.hyper_connection_count);
+        }
+        _ = printf("\n");
+    }
 
     if info.tokenizer_model.len > 0 || info.has_tokenizer_tokens || info.has_tokenizer_merges {
         _ = printf("tokenizer:");

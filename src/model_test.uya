@@ -123,6 +123,47 @@ fn fixture_config() ModelConfig {
     return config;
 }
 
+fn init_gqa_views(views: &TensorView, token_embd: &f32, norm: &f32, mat8: &f32, mat16: &f32) bool {
+    var i: usize = 0;
+    if !init_f32_view(&views[i], "token_embd.weight\0" as &const byte, token_embd, 2, 4, 2) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "output_norm.weight\0" as &const byte, norm, 1, 4, 0) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "output.weight\0" as &const byte, mat8, 2, 4, 2) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_norm.weight\0" as &const byte, norm, 1, 4, 0) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_q.weight\0" as &const byte, mat16, 2, 4, 4) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_k.weight\0" as &const byte, mat8, 2, 4, 2) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_v.weight\0" as &const byte, mat8, 2, 4, 2) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_output.weight\0" as &const byte, mat16, 2, 4, 4) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.ffn_norm.weight\0" as &const byte, norm, 1, 4, 0) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.ffn_gate.weight\0" as &const byte, mat16, 2, 4, 4) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.ffn_up.weight\0" as &const byte, mat16, 2, 4, 4) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.ffn_down.weight\0" as &const byte, mat16, 2, 4, 4) { return false; }
+    return true;
+}
+
+fn gqa_table(views: &TensorView) TensorWeightTable {
+    return TensorWeightTable{
+        views: views,
+        count: 12,
+        file_size: 0,
+        incomplete: false,
+        required_end: 0,
+        token_embd: null,
+        output_norm: null,
+        output: null,
+    };
+}
+
 test "model binds config and layer tensors" {
     var token_embd: [f32: 2] = [];
     var one: [f32: 1] = [];
@@ -186,6 +227,51 @@ test "single token forward writes logits and kv cache" {
     try assert_close(kv, 1.0f32, 0.00001f32);
     try expect(model_state_value_at(&state, 1, 0, 0, 0, &kv));
     try assert_close(kv, 1.0f32, 0.00001f32);
+
+    model_state_deinit(&state);
+    model_weights_deinit(&weights);
+}
+
+test "dense GQA binds one kv head for two query heads" {
+    var token_embd: [f32: 8] = [];
+    var norm: [f32: 4] = [];
+    var mat8: [f32: 8] = [];
+    var mat16: [f32: 16] = [];
+    token_embd[0] = 1.0f32;
+    token_embd[1] = 2.0f32;
+    token_embd[2] = 3.0f32;
+    token_embd[3] = 4.0f32;
+    token_embd[4] = 2.0f32;
+    token_embd[5] = 3.0f32;
+    token_embd[6] = 4.0f32;
+    token_embd[7] = 5.0f32;
+    norm[0] = 1.0f32;
+    norm[1] = 1.0f32;
+    norm[2] = 1.0f32;
+    norm[3] = 1.0f32;
+
+    var views: [TensorView: 12] = [];
+    try expect(init_gqa_views(&views[0], &token_embd[0], &norm[0], &mat8[0], &mat16[0]));
+    var table: TensorWeightTable = gqa_table(&views[0]);
+    var config: ModelConfig = model_config_init(2, 4, 1, 4, 2, 4);
+    config.n_head_kv = 1;
+    config.key_dim = 2;
+    config.value_dim = 2;
+    config.rope_dim = 0;
+    try expect(model_config_validate(&config));
+
+    var weights: ModelWeights = model_weights_init();
+    try expect(model_weights_bind_from_table(&config, &table, &weights));
+    var model: Model = model_init(&config, &weights);
+    var state: ModelState = model_state_empty();
+    try expect(model_state_init(&state, &config));
+    try assert_eq_i32(state.kv.n_head_kv as i32, 1);
+
+    var logits: [f32: 2] = [];
+    try expect(model_forward_token(&model, &state, 0, 0, &logits[0]));
+    var kv: f32 = 0.0f32;
+    try expect(model_state_key_at(&state, 0, 0, 0, 0, &kv));
+    try expect(!model_state_key_at(&state, 0, 0, 1, 0, &kv));
 
     model_state_deinit(&state);
     model_weights_deinit(&weights);

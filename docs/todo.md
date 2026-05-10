@@ -142,18 +142,35 @@
 当前 Phase 8 已经能跑 GGUF-backed dense decoder 子集，但还不是 DS4 Flash Q2
 生产模型的完整支持。完整支持还需要补齐以下内容：
 
-- [ ] 用完整 DS4 Flash Q2 GGUF 跑一次 schema audit，记录所有 metadata key、tensor name、shape、dtype、分片/对齐规则。
-- [ ] 解析 DS4 Flash Q2 必需超参：`feed_forward_length`、RoPE theta/scale、RMS eps、GQA key/value 维度、expert/router 相关参数。
-- [ ] 支持 GQA/MQA：允许 `n_head != n_head_kv`，KV cache、attention 读写和 head 映射按 kv heads 工作。
+- [x] 增加 `audit <model.gguf>`，不用加载 tensor data 即可做 schema audit；本机 `.gguf.part` 已跑通并记录 metadata/tensor/dtype/Flash 分支诊断。
+- [x] 解析 DS4 Flash Q2 必需超参：RoPE theta/scale、RMS eps、GQA key/value 维度、expert/router、q/output LoRA、indexer、HC 等关键参数。
+- [x] 支持 dense GQA/MQA：允许 `n_head != n_head_kv`，KV cache、attention 读写和 head 映射按 kv heads 工作；当前 dense forward 要求 key/value per-head dim 等于 query head_dim。
 - [ ] 支持 DS4 Flash 的 MoE forward：router logits、top-k expert 选择、shared expert、expert 权重绑定和 expert-major dispatch 真正接入模型层。
-- [ ] 支持 DS4 Flash 特有 compressor/indexer/HC tensor 命名和 forward 分支，缺失或未知 tensor 要给出具体诊断。
-- [ ] 实现 Q2 系列 matvec kernel：至少覆盖实际文件中出现的 `Q2_K`、`IQ2_XXS`、`IQ2_XS`、`IQ2_S` 等 dtype，并与 reference dot 对照。
-- [ ] 扩展现有 Q4/Q8/F16 路径，覆盖 experts、attention、shared/output 等不同 tensor 位置的混合 dtype。
-- [ ] 改造权重加载策略：大模型不能默认 `malloc` 读入所有 tensor，需要 mmap/按需加载/分块加载，并保持 tensor lifetime 清晰。
+- [x] 支持 DS4 Flash 特有 compressor/indexer/HC tensor 命名的 schema 识别和具体诊断；forward 分支仍未接入。
+- [x] 实现 `Q2_K` matvec reference kernel，并接入 dense matvec；`IQ2_XXS`、`IQ2_XS`、`IQ2_S` 仍需要按 ggml 具体格式实现。
+- [x] 扩展现有 F16/Q8_0/Q4_K/Q2_K dense matvec dtype 覆盖；Flash experts/shared/output 的 3D expert 权重路径仍待接入 MoE forward。
+- [ ] 改造权重加载策略：大模型不能默认 `malloc` 读入所有 tensor，需要 mmap/按需加载/分块加载，并保持 tensor lifetime 清晰；`audit` 已避免读取 tensor data。
 - [ ] 支持真实 tokenizer chat template，把 `chat` 从裸 prompt REPL 升级为模型格式化对话输入。
-- [ ] 增加真实模型 smoke：`inspect`、`encode`、`generate`、`chat` 在 DS4 Flash Q2 GGUF 上不崩溃，并能产出非空文本。
+- [x] 增加真实模型 audit target：`make flash-q2-audit DS4_FLASH_Q2_GGUF=/path/to/model.gguf`。
+- [ ] 增加真实模型 smoke：`inspect`、`encode`、`generate`、`chat` 在 DS4 Flash Q2 GGUF 上不崩溃，并能产出非空文本；`make flash-q2-smoke` 已建目标，但生成仍会因 Flash forward 未接入而报 unsupported。
 - [ ] 增加 golden 对照：同 prompt 与原 DS4 或可信参考实现对齐 logits top-k / token 序列，误差和可接受差异写入测试说明。
 - [ ] 增加性能验收：报告真实 DS4 Flash Q2 的 prompt/decode tokens/s、峰值内存、加载时间。
+
+本机当前只有：
+
+```text
+/home/winger/uya/ds4/gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf.part
+```
+
+它是截断的 Q4KExperts/F16HC/F16Compressor/F16Indexer/Q8Attn 文件，不是完整 DS4 Flash Q2。
+`build/ds4-uya audit` 已在该文件上通过，结果显示：
+
+- metadata `58/58`，tensor directory `1328/1328`，alignment `32`。
+- `layers=43 ctx=1048576 embd=4096 heads=64 kv_heads=1 key_len=512 value_len=512 experts=256 experts_used=6 expert_ff=2048 shared_experts=1 file_type=19`。
+- Flash metadata 包含 `rope_dim=64`、RoPE scaling/freq bits、RMS eps bits、`q_lora=1024`、`out_lora=1024`、`out_groups=8`、`sliding_window=128`、`indexer_heads=64`、`indexer_key_len=128`、`indexer_top_k=512`、`hc_count=4`。
+- layout 识别到 `moe_experts=129 shared_experts=129 router=172 compressor=248 indexer=126 hc=261 split_lora=279`。
+- dtype 分布为 `f32=492 f16=359 i32=3 q8_0=345 q4_k=129 q2_k=0 iq2=0`。
+- 诊断明确指出当前生成路径还缺 Flash compressor/LORA、MoE、indexer、HC forward。
 
 验收标准：
 

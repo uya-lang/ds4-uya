@@ -1,5 +1,6 @@
 use ds4.gguf.GGML_TYPE_F32;
 use ds4.runtime.RuntimeSession;
+use ds4.runtime.print_runtime_audit;
 use ds4.runtime.runtime_session_deinit;
 use ds4.runtime.runtime_session_generate_to_buffer;
 use ds4.runtime.runtime_session_init;
@@ -160,6 +161,50 @@ fn write_runtime_fixture(path: &const byte) bool {
     return ok;
 }
 
+fn write_flash_audit_fixture(path: &const byte) bool {
+    const fp: &FILE = fopen(path, "wb\0" as &const byte);
+    if fp == null {
+        return false;
+    }
+
+    var ok: bool = true;
+    ok = ok && write_u32_le(fp, TEST_GGUF_MAGIC);
+    ok = ok && write_u32_le(fp, 3);
+    ok = ok && write_u64_le(fp, 6);
+    ok = ok && write_u64_le(fp, 20);
+
+    ok = ok && write_meta_string(fp, "general.architecture\0" as &const byte, "deepseek4\0" as &const byte);
+    ok = ok && write_meta_string(fp, "general.name\0" as &const byte, "tiny-flash-audit\0" as &const byte);
+    ok = ok && write_meta_u32(fp, "deepseek4.block_count\0" as &const byte, 1);
+    ok = ok && write_meta_u32(fp, "deepseek4.context_length\0" as &const byte, 16);
+    ok = ok && write_meta_u32(fp, "deepseek4.embedding_length\0" as &const byte, 4);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.head_count\0" as &const byte, 2);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.head_count_kv\0" as &const byte, 1);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.key_length\0" as &const byte, 4);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.value_length\0" as &const byte, 4);
+    ok = ok && write_meta_u32(fp, "deepseek4.expert_count\0" as &const byte, 8);
+    ok = ok && write_meta_u32(fp, "deepseek4.expert_used_count\0" as &const byte, 2);
+    ok = ok && write_meta_u32(fp, "deepseek4.expert_feed_forward_length\0" as &const byte, 4);
+    ok = ok && write_meta_u32(fp, "deepseek4.expert_shared_count\0" as &const byte, 1);
+    ok = ok && write_meta_u32(fp, "deepseek4.rope.dimension_count\0" as &const byte, 2);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.q_lora_rank\0" as &const byte, 2);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.output_lora_rank\0" as &const byte, 2);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.indexer.head_count\0" as &const byte, 2);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.indexer.key_length\0" as &const byte, 2);
+    ok = ok && write_meta_u32(fp, "deepseek4.attention.indexer.top_k\0" as &const byte, 4);
+    ok = ok && write_meta_u32(fp, "deepseek4.hyper_connection.count\0" as &const byte, 1);
+
+    ok = ok && write_tensor_entry(fp, "token_embd.weight\0" as &const byte, 2, 4, 2, 0);
+    ok = ok && write_tensor_entry(fp, "blk.0.ffn_gate_exps.weight\0" as &const byte, 2, 4, 4, 0);
+    ok = ok && write_tensor_entry(fp, "blk.0.attn_compressor_kv.weight\0" as &const byte, 2, 4, 4, 0);
+    ok = ok && write_tensor_entry(fp, "blk.0.indexer.proj.weight\0" as &const byte, 2, 4, 2, 0);
+    ok = ok && write_tensor_entry(fp, "blk.0.hc_attn_base.weight\0" as &const byte, 1, 4, 0, 0);
+    ok = ok && write_tensor_entry(fp, "blk.0.attn_q_a.weight\0" as &const byte, 2, 4, 2, 0);
+
+    _ = fclose(fp);
+    return ok;
+}
+
 test "runtime maps GGUF tensors into forward and generates decoded text" {
     const path: &const byte = "/tmp/ds4-uya-runtime-test.gguf\0" as &const byte;
     _ = remove(path);
@@ -181,5 +226,13 @@ test "runtime maps GGUF tensors into forward and generates decoded text" {
 
     tokenizer_byte_buffer_deinit(&out);
     runtime_session_deinit(&session);
+    _ = remove(path);
+}
+
+test "audit accepts truncated flash schema fixture" {
+    const path: &const byte = "/tmp/ds4-uya-flash-audit-test.gguf\0" as &const byte;
+    _ = remove(path);
+    try expect(write_flash_audit_fixture(path));
+    try assert_eq_i32(print_runtime_audit(path), 0);
     _ = remove(path);
 }

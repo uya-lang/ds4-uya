@@ -9,6 +9,7 @@ type Vec8f32 = @vector(f32, 8);
 const Q8_0_BLOCK_ELEMS: u64 = 32;
 const Q8_0_BLOCK_BYTES: u64 = 34;
 const QK_K: u64 = 256;
+const Q2_K_BLOCK_BYTES: u64 = 84;
 const Q4_K_BLOCK_BYTES: u64 = 144;
 
 extern "libc" fn memcpy(dest: &void, src: &const void, n: usize) &void;
@@ -337,6 +338,42 @@ export fn kernels_q8_0_dot_f32_fast(blocks: &const byte, x: &const f32, n: u64) 
 
 export fn kernels_q8_0_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
     return kernels_q8_0_dot_f32_fast(blocks, x, n);
+}
+
+export fn kernels_q2_k_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var block_index: u64 = 0;
+    while block_index * QK_K < n {
+        const block_base: u64 = block_index * Q2_K_BLOCK_BYTES;
+        const scales: &const byte = &blocks[block_base as usize];
+        const qs_base: u64 = block_base + 16;
+        const d: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base + 80));
+        const dmin: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base + 82));
+
+        var j: u64 = 0;
+        while j < QK_K && block_index * QK_K + j < n {
+            const group: u64 = j / 16;
+            const scale_min: byte = scales[group as usize];
+            const scale: f32 = ((scale_min & (15 as byte)) as f32) * d;
+            const minv: f32 = ((scale_min >> 4) as f32) * dmin;
+            const qbyte: byte = blocks[(qs_base + (j / 4)) as usize];
+            const shift: i32 = ((j % (4 as u64)) * (2 as u64)) as i32;
+            const q: f32 = (((qbyte >> shift) & (3 as byte)) as f32);
+            acc = acc + (scale * q - minv) * x[(block_index * QK_K + j) as usize];
+            j = j + 1;
+        }
+
+        block_index = block_index + 1;
+    }
+    return acc;
+}
+
+export fn kernels_q2_k_dot_f32_fast(blocks: &const byte, x: &const f32, n: u64) f32 {
+    return kernels_q2_k_dot_f32_reference(blocks, x, n);
+}
+
+export fn kernels_q2_k_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+    return kernels_q2_k_dot_f32_fast(blocks, x, n);
 }
 
 export fn kernels_q4_k_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {

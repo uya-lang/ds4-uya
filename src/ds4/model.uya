@@ -1,6 +1,7 @@
 use ds4.kernels.kernels_dense_matvec_f32;
 use ds4.kernels.kernels_f16_load;
 use ds4.kernels.kernels_f32_dot;
+use ds4.kernels.kernels_q2_k_dot_f32;
 use ds4.kernels.kernels_q8_0_dot_f32;
 use ds4.kernels.kernels_q4_k_dot_f32;
 use ds4.kernels.kernels_rms_norm;
@@ -39,6 +40,8 @@ export struct ModelConfig {
     n_head: u64,
     n_head_kv: u64,
     head_dim: u64,
+    key_dim: u64,
+    value_dim: u64,
     n_ff: u64,
     rope_dim: u64,
     rope_theta: f32,
@@ -90,6 +93,8 @@ export fn model_config_init(n_vocab: u64, n_embd: u64, n_layer: u64, n_ctx: u64,
         n_head: n_head,
         n_head_kv: n_head,
         head_dim: head_dim,
+        key_dim: head_dim,
+        value_dim: head_dim,
         n_ff: n_ff,
         rope_dim: 0,
         rope_theta: 10000.0f32,
@@ -101,16 +106,23 @@ export fn model_config_validate(config: &ModelConfig) bool {
     if config.n_vocab == 0 || config.n_embd == 0 || config.n_layer == 0 || config.n_ctx == 0 {
         return false;
     }
-    if config.n_head == 0 || config.n_head_kv == 0 || config.head_dim == 0 || config.n_ff == 0 {
+    if config.n_head == 0 || config.n_head_kv == 0 || config.head_dim == 0 ||
+        config.key_dim == 0 || config.value_dim == 0 || config.n_ff == 0 {
         return false;
     }
-    if config.n_head != config.n_head_kv {
+    if (config.n_head % config.n_head_kv) != 0 {
         return false;
     }
     if config.n_head * config.head_dim != config.n_embd {
         return false;
     }
+    if config.key_dim != config.head_dim || config.value_dim != config.head_dim {
+        return false;
+    }
     if config.rope_dim > config.head_dim {
+        return false;
+    }
+    if config.rope_dim > config.key_dim {
         return false;
     }
     if (config.rope_dim % (2 as u64)) != 0 {
@@ -173,7 +185,8 @@ fn model_view_is_dense_supported(view: &TensorView, in_dim: u64, out_dim: u64) b
         return false;
     }
     return view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 ||
-        view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q4_K;
+        view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q2_K ||
+        view.dtype == TensorDType.Q4_K;
 }
 
 fn model_view_is_vector_norm(view: &TensorView, n: u64) bool {
@@ -195,14 +208,17 @@ fn model_view_is_output(view: &TensorView, config: &ModelConfig) bool {
         return false;
     }
     return view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 ||
-        view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q4_K;
+        view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q2_K ||
+        view.dtype == TensorDType.Q4_K;
 }
 
 fn model_layer_weights_validate(layer: &ModelLayerWeights, config: &ModelConfig) bool {
+    const key_total: u64 = config.n_head_kv * config.key_dim;
+    const value_total: u64 = config.n_head_kv * config.value_dim;
     return model_view_is_vector_norm(layer.attn_norm, config.n_embd) &&
         model_view_is_dense_supported(layer.attn_q, config.n_embd, config.n_embd) &&
-        model_view_is_dense_supported(layer.attn_k, config.n_embd, config.n_embd) &&
-        model_view_is_dense_supported(layer.attn_v, config.n_embd, config.n_embd) &&
+        model_view_is_dense_supported(layer.attn_k, config.n_embd, key_total) &&
+        model_view_is_dense_supported(layer.attn_v, config.n_embd, value_total) &&
         model_view_is_dense_supported(layer.attn_output, config.n_embd, config.n_embd) &&
         model_view_is_vector_norm(layer.ffn_norm, config.n_embd) &&
         model_view_is_dense_supported(layer.ffn_gate, config.n_embd, config.n_ff) &&
@@ -299,7 +315,7 @@ export fn model_state_init(state: &ModelState, config: &ModelConfig) bool {
     }
     state.scratch = tensor_scratch_arena_init();
     state.next_pos = 0;
-    return tensor_kv_cache_init(&state.kv, TensorDType.F32, config.n_layer, config.n_ctx, config.n_head_kv, config.head_dim, config.head_dim);
+    return tensor_kv_cache_init(&state.kv, TensorDType.F32, config.n_layer, config.n_ctx, config.n_head_kv, config.key_dim, config.value_dim);
 }
 
 export fn model_state_reset(state: &ModelState) void {
@@ -416,6 +432,15 @@ fn model_matvec(out: &f32, view: &TensorView, x: &const f32, out_dim: u64, in_di
         }
         return true;
     }
+    if view.dtype == TensorDType.Q2_K {
+        var row_q2: u64 = 0;
+        while row_q2 < out_dim {
+            const row_data: &const byte = model_byte_ptr_add(view.data, row_q2 * view.stride_bytes[1]);
+            out[row_q2 as usize] = kernels_q2_k_dot_f32(row_data, x, in_dim);
+            row_q2 = row_q2 + 1;
+        }
+        return true;
+    }
     if view.dtype == TensorDType.Q4_K {
         var row2: u64 = 0;
         while row2 < out_dim {
@@ -509,6 +534,11 @@ fn model_apply_rope(config: &ModelConfig, q: &f32, k: &f32, pos: u64) void {
     while h < config.n_head {
         const base: u64 = h * config.head_dim;
         kernels_rope_f32(&q[base as usize], &q[base as usize], config.rope_dim, pos, config.rope_theta, false);
+        h = h + 1;
+    }
+    h = 0;
+    while h < config.n_head_kv {
+        const base: u64 = h * config.key_dim;
         kernels_rope_f32(&k[base as usize], &k[base as usize], config.rope_dim, pos, config.rope_theta, false);
         h = h + 1;
     }
@@ -516,16 +546,21 @@ fn model_apply_rope(config: &ModelConfig, q: &f32, k: &f32, pos: u64) void {
 
 fn model_store_kv(config: &ModelConfig, state: &ModelState, layer_index: u64, pos: u64, k: &const f32, v: &const f32) bool {
     var h: u64 = 0;
-    while h < config.n_head {
+    while h < config.n_head_kv {
         const key_row: &f32 = tensor_kv_cache_key_row(&state.kv, layer_index, pos, h) as &f32;
         const value_row: &f32 = tensor_kv_cache_value_row(&state.kv, layer_index, pos, h) as &f32;
         if key_row == null || value_row == null {
             return false;
         }
         var d: u64 = 0;
-        while d < config.head_dim {
-            const idx: u64 = h * config.head_dim + d;
+        while d < config.key_dim {
+            const idx: u64 = h * config.key_dim + d;
             key_row[d as usize] = k[idx as usize];
+            d = d + 1;
+        }
+        d = 0;
+        while d < config.value_dim {
+            const idx: u64 = h * config.value_dim + d;
             value_row[d as usize] = v[idx as usize];
             d = d + 1;
         }
@@ -539,13 +574,14 @@ fn model_attention(config: &ModelConfig, state: &ModelState, layer_index: u64, p
     const inv_sqrt_dim: f32 = 1.0f32 / sqrtf(config.head_dim as f32);
     var h: u64 = 0;
     while h < config.n_head {
+        const kv_head: u64 = h / (config.n_head / config.n_head_kv);
         var t: u64 = 0;
         while t <= pos {
-            const key_row: &const f32 = tensor_kv_cache_key_row(&state.kv, layer_index, t, h) as &const f32;
+            const key_row: &const f32 = tensor_kv_cache_key_row(&state.kv, layer_index, t, kv_head) as &const f32;
             if key_row == null {
                 return false;
             }
-            const dot: f32 = kernels_f32_dot(&q[(h * config.head_dim) as usize], key_row, config.head_dim);
+            const dot: f32 = kernels_f32_dot(&q[(h * config.head_dim) as usize], key_row, config.key_dim);
             scores[t as usize] = dot * inv_sqrt_dim;
             t = t + 1;
         }
@@ -556,7 +592,7 @@ fn model_attention(config: &ModelConfig, state: &ModelState, layer_index: u64, p
             var acc: f32 = 0.0f32;
             t = 0;
             while t <= pos {
-                const value_row: &const f32 = tensor_kv_cache_value_row(&state.kv, layer_index, t, h) as &const f32;
+                const value_row: &const f32 = tensor_kv_cache_value_row(&state.kv, layer_index, t, kv_head) as &const f32;
                 if value_row == null {
                     return false;
                 }
@@ -592,13 +628,15 @@ fn model_forward_layer(
 ) bool {
     const config: &ModelConfig = &model.config;
     const layer: &ModelLayerWeights = &model.weights.layers[layer_index as usize];
+    const key_total: u64 = config.n_head_kv * config.key_dim;
+    const value_total: u64 = config.n_head_kv * config.value_dim;
 
     if !model_rms_norm(norm, x, layer.attn_norm, config.n_embd, config.rms_eps) {
         return false;
     }
     if !model_matvec(q, layer.attn_q, norm, config.n_embd, config.n_embd) ||
-        !model_matvec(k, layer.attn_k, norm, config.n_embd, config.n_embd) ||
-        !model_matvec(v, layer.attn_v, norm, config.n_embd, config.n_embd) {
+        !model_matvec(k, layer.attn_k, norm, key_total, config.n_embd) ||
+        !model_matvec(v, layer.attn_v, norm, value_total, config.n_embd) {
         return false;
     }
 
@@ -635,11 +673,13 @@ export fn model_forward_token(model: &Model, state: &ModelState, token_id: u64, 
     }
 
     tensor_scratch_reset(&state.scratch);
+    const key_total: u64 = model.config.n_head_kv * model.config.key_dim;
+    const value_total: u64 = model.config.n_head_kv * model.config.value_dim;
     const x: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
     const norm: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
     const q: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
-    const k: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
-    const v: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const k: &f32 = model_scratch_f32(&state.scratch, key_total);
+    const v: &f32 = model_scratch_f32(&state.scratch, value_total);
     const context: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
     const attn_out: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
     const ffn_gate: &f32 = model_scratch_f32(&state.scratch, model.config.n_ff);
