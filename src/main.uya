@@ -1,5 +1,7 @@
 use ds4.gguf.inspect_gguf;
 use ds4.gguf.print_gguf_tensor;
+use ds4.tokenizer.print_tokenizer_piece;
+use libc.atoi;
 use libc.printf;
 use libc.strcmp;
 
@@ -10,9 +12,10 @@ fn print_help() void {
     _ = printf("  ds4-uya --help\n");
     _ = printf("  ds4-uya inspect <model.gguf>\n");
     _ = printf("  ds4-uya tensor <model.gguf> <tensor-name>\n");
+    _ = printf("  ds4-uya piece <model.gguf> <token-id>\n");
     _ = printf("\n");
     _ = printf("status:\n");
-    _ = printf("  implemented: GGUF loader and inspection\n");
+    _ = printf("  implemented: GGUF loader, inspection, token lookup\n");
     _ = printf("  planned: tokenizer, CPU tensors, quant kernels, generation\n");
 }
 
@@ -46,6 +49,19 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
             return 1;
         }
         return print_gguf_tensor(argv[2] as &const byte, argv[3] as &const byte);
+    }
+
+    if strcmp(cmd as *const byte, "piece\0" as *const byte) == 0 {
+        if argc < 4 {
+            _ = printf("ds4-uya: piece requires a GGUF file path and token id\n");
+            return 1;
+        }
+        const token_id_i32: i32 = atoi(argv[3] as &const byte);
+        if token_id_i32 < 0 {
+            _ = printf("ds4-uya: token id must be non-negative\n");
+            return 1;
+        }
+        return print_tokenizer_piece(argv[2] as &const byte, token_id_i32 as u64);
     }
 
     _ = printf("ds4-uya: unknown command: %s\n", cmd);

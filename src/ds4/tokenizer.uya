@@ -1,0 +1,194 @@
+use ds4.binary.le_u64_from_bytes;
+use ds4.gguf.GgufInfo;
+use ds4.gguf.GgufString;
+use ds4.gguf.gguf_info_deinit;
+use ds4.gguf.gguf_info_init;
+use ds4.gguf.load_gguf;
+use libc.FILE;
+use libc.fclose;
+use libc.fopen;
+use libc.fread;
+use libc.fseek;
+use libc.printf;
+
+const TOKENIZER_SEEK_SET: i32 = 0;
+
+struct TokenReader {
+    fp: &FILE,
+    size: u64,
+    pos: u64,
+}
+
+fn tokenizer_string_clear(out: &GgufString) void {
+    out.len = 0;
+    out.shown = 0;
+    var i: usize = 0;
+    while i < 256 {
+        out.data[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn tokenizer_reader_remaining(r: &TokenReader) u64 {
+    if r.pos > r.size {
+        return 0;
+    }
+    return r.size - r.pos;
+}
+
+fn tokenizer_reader_read(r: &TokenReader, buf: &byte, n: usize) bool {
+    const want: u64 = n as u64;
+    if want > tokenizer_reader_remaining(r) {
+        return false;
+    }
+    const got: usize = fread(buf, 1, n, r.fp);
+    if got != n {
+        return false;
+    }
+    r.pos = r.pos + want;
+    return true;
+}
+
+fn tokenizer_reader_skip(r: &TokenReader, n: u64) bool {
+    if n > tokenizer_reader_remaining(r) {
+        return false;
+    }
+    const next: u64 = r.pos + n;
+    const seek_result: i32 = fseek(r.fp, next as i64, TOKENIZER_SEEK_SET);
+    if seek_result < 0 {
+        return false;
+    }
+    r.pos = next;
+    return true;
+}
+
+fn tokenizer_read_u64(r: &TokenReader, out: &u64) bool {
+    var buf: [byte: 8] = [];
+    if !tokenizer_reader_read(r, &buf[0], 8) {
+        return false;
+    }
+    *out = le_u64_from_bytes(buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]);
+    return true;
+}
+
+fn read_piece_sample(r: &TokenReader, out: &GgufString) bool {
+    tokenizer_string_clear(out);
+
+    var len: u64 = 0;
+    if !tokenizer_read_u64(r, &len) {
+        return false;
+    }
+    out.len = len;
+
+    var take: usize = 0;
+    if len > 255 {
+        take = 255;
+    } else {
+        take = len as usize;
+    }
+
+    if take > 0 {
+        if !tokenizer_reader_read(r, &out.data[0], take) {
+            return false;
+        }
+    }
+    out.shown = take;
+    if take < 256 {
+        out.data[take] = 0;
+    }
+
+    const rest: u64 = len - (take as u64);
+    if rest > 0 {
+        return tokenizer_reader_skip(r, rest);
+    }
+    return true;
+}
+
+export fn tokenizer_piece_from_tokens_offset(
+    path: &const byte,
+    file_size: u64,
+    tokens_offset: u64,
+    token_count: u64,
+    token_id: u64,
+    out: &GgufString,
+) i32 {
+    tokenizer_string_clear(out);
+
+    if token_id >= token_count {
+        return 7;
+    }
+    if tokens_offset > file_size {
+        return 3;
+    }
+
+    const fp: &FILE = fopen(path, "rb\0" as &const byte);
+    if fp == null {
+        return 2;
+    }
+    if fseek(fp, tokens_offset as i64, TOKENIZER_SEEK_SET) < 0 {
+        _ = fclose(fp);
+        return 2;
+    }
+
+    var r: TokenReader = TokenReader{ fp: fp, size: file_size, pos: tokens_offset };
+    var i: u64 = 0;
+    while i <= token_id {
+        if !read_piece_sample(&r, out) {
+            _ = fclose(fp);
+            return 3;
+        }
+        i = i + 1;
+    }
+
+    _ = fclose(fp);
+    return 0;
+}
+
+export fn tokenizer_piece_for_id(path: &const byte, token_id: u64, out: &GgufString) i32 {
+    tokenizer_string_clear(out);
+
+    var info: GgufInfo = gguf_info_init();
+    const load_rc: i32 = load_gguf(path, &info);
+    if load_rc != 0 && load_rc != 6 {
+        gguf_info_deinit(&info);
+        return load_rc;
+    }
+
+    if !info.has_tokenizer_tokens {
+        gguf_info_deinit(&info);
+        return 8;
+    }
+
+    const rc: i32 = tokenizer_piece_from_tokens_offset(
+        path,
+        info.file_size,
+        info.tokenizer_tokens_offset,
+        info.tokenizer_tokens_count,
+        token_id,
+        out,
+    );
+    gguf_info_deinit(&info);
+    return rc;
+}
+
+export fn print_tokenizer_piece(path: &const byte, token_id: u64) i32 {
+    var piece: GgufString = GgufString{ len: 0, shown: 0, data: [] };
+    const rc: i32 = tokenizer_piece_for_id(path, token_id, &piece);
+    if rc == 0 {
+        _ = printf("token[%llu] len=%llu piece=%s\n", token_id, piece.len, &piece.data[0]);
+        if piece.len > piece.shown as u64 {
+            _ = printf("ds4-uya: token piece truncated in display, shown=%zu\n", piece.shown);
+        }
+        return 0;
+    }
+    if rc == 7 {
+        _ = printf("ds4-uya: token id out of range: %llu\n", token_id);
+    } else if rc == 8 {
+        _ = printf("ds4-uya: GGUF has no tokenizer.ggml.tokens metadata\n");
+    } else if rc == 3 {
+        _ = printf("ds4-uya: truncated while reading tokenizer token %llu\n", token_id);
+    } else {
+        _ = printf("ds4-uya: cannot load tokenizer metadata, rc=%d\n", rc);
+    }
+    return rc;
+}

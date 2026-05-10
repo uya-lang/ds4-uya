@@ -1,0 +1,62 @@
+use ds4.gguf.GgufString;
+use ds4.tokenizer.tokenizer_piece_from_tokens_offset;
+use libc.FILE;
+use libc.fclose;
+use libc.fopen;
+use libc.fwrite;
+use libc.remove;
+use std.testing.assert_eq_i32;
+
+fn write_u64_le(buf: &byte, offset: usize, value: u64) void {
+    buf[offset + 0] = value as byte;
+    buf[offset + 1] = (value >> 8) as byte;
+    buf[offset + 2] = (value >> 16) as byte;
+    buf[offset + 3] = (value >> 24) as byte;
+    buf[offset + 4] = (value >> 32) as byte;
+    buf[offset + 5] = (value >> 40) as byte;
+    buf[offset + 6] = (value >> 48) as byte;
+    buf[offset + 7] = (value >> 56) as byte;
+}
+
+fn write_token_fixture(path: &const byte) bool {
+    var data: [byte: 32] = [];
+
+    write_u64_le(&data[0], 0, 1);
+    data[8] = 97;
+
+    write_u64_le(&data[0], 9, 2);
+    data[17] = 98;
+    data[18] = 99;
+
+    write_u64_le(&data[0], 19, 5);
+    data[27] = 104;
+    data[28] = 101;
+    data[29] = 108;
+    data[30] = 108;
+    data[31] = 111;
+
+    const fp: &FILE = fopen(path, "wb\0" as &const byte);
+    if fp == null {
+        return false;
+    }
+    const wrote: usize = fwrite(&data[0], 1 as usize, 32 as usize, fp);
+    _ = fclose(fp);
+    return wrote == 32;
+}
+
+test "tokenizer_piece_from_tokens_offset" {
+    const path: &const byte = "/tmp/ds4-uya-tokenizer-piece-test.bin\0" as &const byte;
+    _ = remove(path);
+    try assert_eq_i32(write_token_fixture(path) as i32, 1);
+
+    var piece: GgufString = GgufString{ len: 0, shown: 0, data: [] };
+    const rc: i32 = tokenizer_piece_from_tokens_offset(path, 32, 0, 3, 1, &piece);
+    try assert_eq_i32(rc, 0);
+    try assert_eq_i32(piece.len as i32, 2);
+    try assert_eq_i32(piece.data[0] as i32, 98);
+    try assert_eq_i32(piece.data[1] as i32, 99);
+
+    const out_of_range: i32 = tokenizer_piece_from_tokens_offset(path, 32, 0, 3, 3, &piece);
+    try assert_eq_i32(out_of_range, 7);
+    _ = remove(path);
+}
