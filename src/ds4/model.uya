@@ -1,0 +1,635 @@
+use ds4.kernels.kernels_dense_matvec_f32;
+use ds4.kernels.kernels_f16_load;
+use ds4.kernels.kernels_q8_0_dot_f32;
+use ds4.kernels.kernels_rms_norm;
+use ds4.kernels.kernels_rope_f32;
+use ds4.kernels.kernels_softmax;
+use ds4.kernels.kernels_swiglu;
+use ds4.tensor.TensorDType;
+use ds4.tensor.TensorKvCache;
+use ds4.tensor.TensorScratchArena;
+use ds4.tensor.TensorView;
+use ds4.tensor.TensorWeightTable;
+use ds4.tensor.tensor_kv_cache_deinit;
+use ds4.tensor.tensor_kv_cache_empty;
+use ds4.tensor.tensor_kv_cache_init;
+use ds4.tensor.tensor_kv_cache_key_offset;
+use ds4.tensor.tensor_kv_cache_value_offset;
+use ds4.tensor.tensor_scratch_alloc_bytes;
+use ds4.tensor.tensor_scratch_arena_deinit;
+use ds4.tensor.tensor_scratch_arena_init;
+use ds4.tensor.tensor_scratch_reset;
+use ds4.tensor.tensor_view_expect_shape;
+use ds4.tensor.tensor_weight_table_find;
+use libc.free;
+use libc.malloc;
+use libc.printf;
+use libc.snprintf;
+use libc.sqrtf;
+
+export struct ModelConfig {
+    n_vocab: u64,
+    n_embd: u64,
+    n_layer: u64,
+    n_ctx: u64,
+    n_head: u64,
+    n_head_kv: u64,
+    head_dim: u64,
+    n_ff: u64,
+    rope_dim: u64,
+    rope_theta: f32,
+    rms_eps: f32,
+}
+
+export struct ModelLayerWeights {
+    attn_norm: &TensorView,
+    attn_q: &TensorView,
+    attn_k: &TensorView,
+    attn_v: &TensorView,
+    attn_output: &TensorView,
+    ffn_norm: &TensorView,
+    ffn_gate: &TensorView,
+    ffn_up: &TensorView,
+    ffn_down: &TensorView,
+}
+
+export struct ModelWeights {
+    token_embd: &TensorView,
+    output_norm: &TensorView,
+    output: &TensorView,
+    layers: &ModelLayerWeights,
+    n_layer: u64,
+    owns_layers: bool,
+}
+
+export struct Model {
+    config: ModelConfig,
+    weights: &ModelWeights,
+}
+
+export struct ModelState {
+    kv: TensorKvCache,
+    scratch: TensorScratchArena,
+    next_pos: u64,
+}
+
+export fn model_config_init(n_vocab: u64, n_embd: u64, n_layer: u64, n_ctx: u64, n_head: u64, n_ff: u64) ModelConfig {
+    var head_dim: u64 = 0;
+    if n_head != 0 {
+        head_dim = n_embd / n_head;
+    }
+    return ModelConfig{
+        n_vocab: n_vocab,
+        n_embd: n_embd,
+        n_layer: n_layer,
+        n_ctx: n_ctx,
+        n_head: n_head,
+        n_head_kv: n_head,
+        head_dim: head_dim,
+        n_ff: n_ff,
+        rope_dim: 0,
+        rope_theta: 10000.0f32,
+        rms_eps: 0.00001f32,
+    };
+}
+
+export fn model_config_validate(config: &ModelConfig) bool {
+    if config.n_vocab == 0 || config.n_embd == 0 || config.n_layer == 0 || config.n_ctx == 0 {
+        return false;
+    }
+    if config.n_head == 0 || config.n_head_kv == 0 || config.head_dim == 0 || config.n_ff == 0 {
+        return false;
+    }
+    if config.n_head != config.n_head_kv {
+        return false;
+    }
+    if config.n_head * config.head_dim != config.n_embd {
+        return false;
+    }
+    if config.rope_dim > config.head_dim {
+        return false;
+    }
+    if (config.rope_dim % (2 as u64)) != 0 {
+        return false;
+    }
+    return true;
+}
+
+export fn model_weights_init() ModelWeights {
+    return ModelWeights{
+        token_embd: null,
+        output_norm: null,
+        output: null,
+        layers: null,
+        n_layer: 0,
+        owns_layers: false,
+    };
+}
+
+export fn model_weights_deinit(weights: &ModelWeights) void {
+    if weights.owns_layers && weights.layers != null {
+        free(weights.layers as &void);
+    }
+    *weights = model_weights_init();
+}
+
+fn model_layer_weights_zero() ModelLayerWeights {
+    return ModelLayerWeights{
+        attn_norm: null,
+        attn_q: null,
+        attn_k: null,
+        attn_v: null,
+        attn_output: null,
+        ffn_norm: null,
+        ffn_gate: null,
+        ffn_up: null,
+        ffn_down: null,
+    };
+}
+
+fn model_make_layer_name(out: &byte, cap: usize, layer: u64, suffix: &const byte) bool {
+    const rc: i32 = snprintf(out, cap, "blk.%llu.%s\0" as &const byte, layer, suffix);
+    return rc > 0 && (rc as usize) < cap;
+}
+
+fn model_find_layer_tensor(table: &TensorWeightTable, layer: u64, suffix: &const byte) &TensorView {
+    var name: [byte: 128] = [];
+    if !model_make_layer_name(&name[0], 128, layer, suffix) {
+        return null;
+    }
+    return tensor_weight_table_find(table, &name[0] as &const byte);
+}
+
+fn model_view_is_dense_f32(view: &TensorView, in_dim: u64, out_dim: u64) bool {
+    return view != null && tensor_view_expect_shape(view, TensorDType.F32, 2, in_dim, out_dim, 0, 0);
+}
+
+fn model_view_is_vector_f32(view: &TensorView, n: u64) bool {
+    return view != null && tensor_view_expect_shape(view, TensorDType.F32, 1, n, 0, 0, 0);
+}
+
+fn model_view_is_embedding(view: &TensorView, config: &ModelConfig) bool {
+    if view == null || view.n_dims != 2 || view.shape[0] != config.n_embd || view.shape[1] != config.n_vocab {
+        return false;
+    }
+    return view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16;
+}
+
+fn model_view_is_output(view: &TensorView, config: &ModelConfig) bool {
+    if view == null || view.n_dims != 2 || view.shape[0] != config.n_embd || view.shape[1] != config.n_vocab {
+        return false;
+    }
+    return view.dtype == TensorDType.F32 || view.dtype == TensorDType.Q8_0;
+}
+
+fn model_layer_weights_validate(layer: &ModelLayerWeights, config: &ModelConfig) bool {
+    return model_view_is_vector_f32(layer.attn_norm, config.n_embd) &&
+        model_view_is_dense_f32(layer.attn_q, config.n_embd, config.n_embd) &&
+        model_view_is_dense_f32(layer.attn_k, config.n_embd, config.n_embd) &&
+        model_view_is_dense_f32(layer.attn_v, config.n_embd, config.n_embd) &&
+        model_view_is_dense_f32(layer.attn_output, config.n_embd, config.n_embd) &&
+        model_view_is_vector_f32(layer.ffn_norm, config.n_embd) &&
+        model_view_is_dense_f32(layer.ffn_gate, config.n_embd, config.n_ff) &&
+        model_view_is_dense_f32(layer.ffn_up, config.n_embd, config.n_ff) &&
+        model_view_is_dense_f32(layer.ffn_down, config.n_ff, config.n_embd);
+}
+
+fn model_bind_one_layer(table: &TensorWeightTable, layer_index: u64, out: &ModelLayerWeights) bool {
+    *out = model_layer_weights_zero();
+    out.attn_norm = model_find_layer_tensor(table, layer_index, "attn_norm.weight\0" as &const byte);
+    out.attn_q = model_find_layer_tensor(table, layer_index, "attn_q.weight\0" as &const byte);
+    out.attn_k = model_find_layer_tensor(table, layer_index, "attn_k.weight\0" as &const byte);
+    out.attn_v = model_find_layer_tensor(table, layer_index, "attn_v.weight\0" as &const byte);
+    out.attn_output = model_find_layer_tensor(table, layer_index, "attn_output.weight\0" as &const byte);
+    out.ffn_norm = model_find_layer_tensor(table, layer_index, "ffn_norm.weight\0" as &const byte);
+    out.ffn_gate = model_find_layer_tensor(table, layer_index, "ffn_gate.weight\0" as &const byte);
+    out.ffn_up = model_find_layer_tensor(table, layer_index, "ffn_up.weight\0" as &const byte);
+    out.ffn_down = model_find_layer_tensor(table, layer_index, "ffn_down.weight\0" as &const byte);
+    return out.attn_norm != null && out.attn_q != null && out.attn_k != null && out.attn_v != null &&
+        out.attn_output != null && out.ffn_norm != null && out.ffn_gate != null && out.ffn_up != null && out.ffn_down != null;
+}
+
+export fn model_weights_bind_from_table(config: &ModelConfig, table: &TensorWeightTable, weights: &ModelWeights) bool {
+    model_weights_deinit(weights);
+    if !model_config_validate(config) {
+        return false;
+    }
+
+    const token_embd: &TensorView = tensor_weight_table_find(table, "token_embd.weight\0" as &const byte);
+    const output_norm: &TensorView = tensor_weight_table_find(table, "output_norm.weight\0" as &const byte);
+    const output: &TensorView = tensor_weight_table_find(table, "output.weight\0" as &const byte);
+    if !model_view_is_embedding(token_embd, config) || !model_view_is_vector_f32(output_norm, config.n_embd) || !model_view_is_output(output, config) {
+        return false;
+    }
+
+    const bytes: usize = (config.n_layer as usize) * (@size_of(ModelLayerWeights) as usize);
+    const layers: &ModelLayerWeights = malloc(bytes) as &ModelLayerWeights;
+    if layers == null {
+        return false;
+    }
+
+    var i: u64 = 0;
+    while i < config.n_layer {
+        if !model_bind_one_layer(table, i, &layers[i as usize]) || !model_layer_weights_validate(&layers[i as usize], config) {
+            free(layers as &void);
+            return false;
+        }
+        i = i + 1;
+    }
+
+    weights.token_embd = token_embd;
+    weights.output_norm = output_norm;
+    weights.output = output;
+    weights.layers = layers;
+    weights.n_layer = config.n_layer;
+    weights.owns_layers = true;
+    return true;
+}
+
+export fn model_init(config: &ModelConfig, weights: &ModelWeights) Model {
+    return Model{ config: *config, weights: weights };
+}
+
+export fn model_validate(model: &Model) bool {
+    if model.weights == null || !model_config_validate(&model.config) {
+        return false;
+    }
+    if model.weights.n_layer != model.config.n_layer || model.weights.layers == null {
+        return false;
+    }
+    if !model_view_is_embedding(model.weights.token_embd, &model.config) ||
+        !model_view_is_vector_f32(model.weights.output_norm, model.config.n_embd) ||
+        !model_view_is_output(model.weights.output, &model.config) {
+        return false;
+    }
+    var i: u64 = 0;
+    while i < model.config.n_layer {
+        if !model_layer_weights_validate(&model.weights.layers[i as usize], &model.config) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn model_state_empty() ModelState {
+    return ModelState{ kv: tensor_kv_cache_empty(), scratch: tensor_scratch_arena_init(), next_pos: 0 };
+}
+
+export fn model_state_init(state: &ModelState, config: &ModelConfig) bool {
+    model_state_deinit(state);
+    if !model_config_validate(config) {
+        return false;
+    }
+    state.scratch = tensor_scratch_arena_init();
+    state.next_pos = 0;
+    return tensor_kv_cache_init(&state.kv, TensorDType.F32, config.n_layer, config.n_ctx, config.n_head_kv, config.head_dim, config.head_dim);
+}
+
+export fn model_state_reset(state: &ModelState) void {
+    state.next_pos = 0;
+    tensor_scratch_reset(&state.scratch);
+}
+
+export fn model_state_deinit(state: &ModelState) void {
+    tensor_kv_cache_deinit(&state.kv);
+    tensor_scratch_arena_deinit(&state.scratch);
+    *state = model_state_empty();
+}
+
+fn model_scratch_f32(arena: &TensorScratchArena, n: u64) &f32 {
+    const ptr: &byte = tensor_scratch_alloc_bytes(arena, n * 4, 64);
+    if ptr == null {
+        return null;
+    }
+    return ptr as &f32;
+}
+
+fn model_require_data(view: &TensorView) bool {
+    return view != null && view.data != null;
+}
+
+fn model_read_vector_f32(view: &TensorView, index: u64) f32 {
+    const data: &const f32 = view.data as &const f32;
+    return data[index as usize];
+}
+
+fn model_copy_embedding(out: &f32, view: &TensorView, token_id: u64, n_embd: u64) bool {
+    if !model_require_data(view) || token_id >= view.shape[1] {
+        return false;
+    }
+    const base: u64 = token_id * n_embd;
+    var i: u64 = 0;
+    if view.dtype == TensorDType.F32 {
+        const data: &const f32 = view.data as &const f32;
+        while i < n_embd {
+            out[i as usize] = data[(base + i) as usize];
+            i = i + 1;
+        }
+        return true;
+    }
+    if view.dtype == TensorDType.F16 {
+        while i < n_embd {
+            out[i as usize] = kernels_f16_load(view.data as &const byte, base + i);
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn model_byte_ptr_add(data: &byte, off: u64) &const byte {
+    const base: usize = @usize_from_ptr(data as &void);
+    return @ptr_from_usize(base + (off as usize)) as &const byte;
+}
+
+fn model_matvec(out: &f32, view: &TensorView, x: &const f32, out_dim: u64, in_dim: u64) bool {
+    if !model_require_data(view) || view.n_dims != 2 || view.shape[0] != in_dim || view.shape[1] != out_dim {
+        return false;
+    }
+    if view.dtype == TensorDType.F32 {
+        kernels_dense_matvec_f32(out, view.data as &const f32, x, out_dim, in_dim);
+        return true;
+    }
+    if view.dtype == TensorDType.Q8_0 {
+        var row: u64 = 0;
+        while row < out_dim {
+            const row_data: &const byte = model_byte_ptr_add(view.data, row * view.stride_bytes[1]);
+            out[row as usize] = kernels_q8_0_dot_f32(row_data, x, in_dim);
+            row = row + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn model_cache_ptr(cache: &TensorKvCache, byte_offset: u64) &f32 {
+    const base: usize = @usize_from_ptr(cache.data as &void);
+    return @ptr_from_usize(base + (byte_offset as usize)) as &f32;
+}
+
+fn model_cache_store_key(state: &ModelState, layer: u64, pos: u64, head: u64, dim: u64, value: f32) bool {
+    var off: u64 = 0;
+    if !tensor_kv_cache_key_offset(&state.kv, layer, pos, head, dim, &off) {
+        return false;
+    }
+    const p: &f32 = model_cache_ptr(&state.kv, off);
+    *p = value;
+    return true;
+}
+
+fn model_cache_store_value(state: &ModelState, layer: u64, pos: u64, head: u64, dim: u64, value: f32) bool {
+    var off: u64 = 0;
+    if !tensor_kv_cache_value_offset(&state.kv, layer, pos, head, dim, &off) {
+        return false;
+    }
+    const p: &f32 = model_cache_ptr(&state.kv, off);
+    *p = value;
+    return true;
+}
+
+export fn model_state_key_at(state: &ModelState, layer: u64, pos: u64, head: u64, dim: u64, out: &f32) bool {
+    var off: u64 = 0;
+    if !tensor_kv_cache_key_offset(&state.kv, layer, pos, head, dim, &off) {
+        return false;
+    }
+    const p: &f32 = model_cache_ptr(&state.kv, off);
+    *out = *p;
+    return true;
+}
+
+export fn model_state_value_at(state: &ModelState, layer: u64, pos: u64, head: u64, dim: u64, out: &f32) bool {
+    var off: u64 = 0;
+    if !tensor_kv_cache_value_offset(&state.kv, layer, pos, head, dim, &off) {
+        return false;
+    }
+    const p: &f32 = model_cache_ptr(&state.kv, off);
+    *out = *p;
+    return true;
+}
+
+fn model_cache_load_key(state: &ModelState, layer: u64, pos: u64, head: u64, dim: u64) f32 {
+    var out: f32 = 0.0f32;
+    _ = model_state_key_at(state, layer, pos, head, dim, &out);
+    return out;
+}
+
+fn model_cache_load_value(state: &ModelState, layer: u64, pos: u64, head: u64, dim: u64) f32 {
+    var out: f32 = 0.0f32;
+    _ = model_state_value_at(state, layer, pos, head, dim, &out);
+    return out;
+}
+
+fn model_zero_f32(x: &f32, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        x[i as usize] = 0.0f32;
+        i = i + 1;
+    }
+}
+
+fn model_add_inplace(x: &f32, delta: &const f32, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        x[i as usize] = x[i as usize] + delta[i as usize];
+        i = i + 1;
+    }
+}
+
+fn model_apply_rope(config: &ModelConfig, q: &f32, k: &f32, pos: u64) void {
+    if config.rope_dim == 0 {
+        return;
+    }
+    var h: u64 = 0;
+    while h < config.n_head {
+        const base: u64 = h * config.head_dim;
+        kernels_rope_f32(&q[base as usize], &q[base as usize], config.rope_dim, pos, config.rope_theta, false);
+        kernels_rope_f32(&k[base as usize], &k[base as usize], config.rope_dim, pos, config.rope_theta, false);
+        h = h + 1;
+    }
+}
+
+fn model_store_kv(config: &ModelConfig, state: &ModelState, layer_index: u64, pos: u64, k: &const f32, v: &const f32) bool {
+    var h: u64 = 0;
+    while h < config.n_head {
+        var d: u64 = 0;
+        while d < config.head_dim {
+            const idx: u64 = h * config.head_dim + d;
+            if !model_cache_store_key(state, layer_index, pos, h, d, k[idx as usize]) {
+                return false;
+            }
+            if !model_cache_store_value(state, layer_index, pos, h, d, v[idx as usize]) {
+                return false;
+            }
+            d = d + 1;
+        }
+        h = h + 1;
+    }
+    return true;
+}
+
+fn model_attention(config: &ModelConfig, state: &ModelState, layer_index: u64, pos: u64, q: &const f32, context: &f32, scores: &f32, probs: &f32) bool {
+    model_zero_f32(context, config.n_embd);
+    const inv_sqrt_dim: f32 = 1.0f32 / sqrtf(config.head_dim as f32);
+    var h: u64 = 0;
+    while h < config.n_head {
+        var t: u64 = 0;
+        while t <= pos {
+            var dot: f32 = 0.0f32;
+            var d: u64 = 0;
+            while d < config.head_dim {
+                const idx: u64 = h * config.head_dim + d;
+                dot = dot + q[idx as usize] * model_cache_load_key(state, layer_index, t, h, d);
+                d = d + 1;
+            }
+            scores[t as usize] = dot * inv_sqrt_dim;
+            t = t + 1;
+        }
+        kernels_softmax(probs, scores, pos + 1);
+
+        var d2: u64 = 0;
+        while d2 < config.head_dim {
+            var acc: f32 = 0.0f32;
+            t = 0;
+            while t <= pos {
+                acc = acc + probs[t as usize] * model_cache_load_value(state, layer_index, t, h, d2);
+                t = t + 1;
+            }
+            context[(h * config.head_dim + d2) as usize] = acc;
+            d2 = d2 + 1;
+        }
+        h = h + 1;
+    }
+    return true;
+}
+
+fn model_forward_layer(
+    model: &Model,
+    state: &ModelState,
+    layer_index: u64,
+    pos: u64,
+    x: &f32,
+    norm: &f32,
+    q: &f32,
+    k: &f32,
+    v: &f32,
+    context: &f32,
+    attn_out: &f32,
+    ffn_gate: &f32,
+    ffn_up: &f32,
+    ffn_mid: &f32,
+    ffn_out: &f32,
+    scores: &f32,
+    probs: &f32,
+) bool {
+    const config: &ModelConfig = &model.config;
+    const layer: &ModelLayerWeights = &model.weights.layers[layer_index as usize];
+
+    if !model_require_data(layer.attn_norm) || !model_require_data(layer.ffn_norm) {
+        return false;
+    }
+    kernels_rms_norm(norm, x, layer.attn_norm.data as &const f32, config.n_embd, config.rms_eps);
+    if !model_matvec(q, layer.attn_q, norm, config.n_embd, config.n_embd) ||
+        !model_matvec(k, layer.attn_k, norm, config.n_embd, config.n_embd) ||
+        !model_matvec(v, layer.attn_v, norm, config.n_embd, config.n_embd) {
+        return false;
+    }
+
+    model_apply_rope(config, q, k, pos);
+    if !model_store_kv(config, state, layer_index, pos, k, v) {
+        return false;
+    }
+    if !model_attention(config, state, layer_index, pos, q, context, scores, probs) {
+        return false;
+    }
+    if !model_matvec(attn_out, layer.attn_output, context, config.n_embd, config.n_embd) {
+        return false;
+    }
+    model_add_inplace(x, attn_out, config.n_embd);
+
+    kernels_rms_norm(norm, x, layer.ffn_norm.data as &const f32, config.n_embd, config.rms_eps);
+    if !model_matvec(ffn_gate, layer.ffn_gate, norm, config.n_ff, config.n_embd) ||
+        !model_matvec(ffn_up, layer.ffn_up, norm, config.n_ff, config.n_embd) {
+        return false;
+    }
+    kernels_swiglu(ffn_mid, ffn_gate, ffn_up, config.n_ff);
+    if !model_matvec(ffn_out, layer.ffn_down, ffn_mid, config.n_embd, config.n_ff) {
+        return false;
+    }
+    model_add_inplace(x, ffn_out, config.n_embd);
+    return true;
+}
+
+export fn model_forward_token(model: &Model, state: &ModelState, token_id: u64, pos: u64, logits: &f32) bool {
+    if !model_validate(model) || state.kv.data == null || pos >= model.config.n_ctx || token_id >= model.config.n_vocab {
+        return false;
+    }
+
+    tensor_scratch_reset(&state.scratch);
+    const x: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const norm: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const q: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const k: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const v: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const context: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const attn_out: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const ffn_gate: &f32 = model_scratch_f32(&state.scratch, model.config.n_ff);
+    const ffn_up: &f32 = model_scratch_f32(&state.scratch, model.config.n_ff);
+    const ffn_mid: &f32 = model_scratch_f32(&state.scratch, model.config.n_ff);
+    const ffn_out: &f32 = model_scratch_f32(&state.scratch, model.config.n_embd);
+    const scores: &f32 = model_scratch_f32(&state.scratch, model.config.n_ctx);
+    const probs: &f32 = model_scratch_f32(&state.scratch, model.config.n_ctx);
+    if x == null || norm == null || q == null || k == null || v == null || context == null ||
+        attn_out == null || ffn_gate == null || ffn_up == null || ffn_mid == null || ffn_out == null ||
+        scores == null || probs == null {
+        return false;
+    }
+
+    if !model_copy_embedding(x, model.weights.token_embd, token_id, model.config.n_embd) {
+        return false;
+    }
+
+    var layer: u64 = 0;
+    while layer < model.config.n_layer {
+        if !model_forward_layer(model, state, layer, pos, x, norm, q, k, v, context, attn_out, ffn_gate, ffn_up, ffn_mid, ffn_out, scores, probs) {
+            return false;
+        }
+        layer = layer + 1;
+    }
+
+    if !model_require_data(model.weights.output_norm) {
+        return false;
+    }
+    kernels_rms_norm(norm, x, model.weights.output_norm.data as &const f32, model.config.n_embd, model.config.rms_eps);
+    if !model_matvec(logits, model.weights.output, norm, model.config.n_vocab, model.config.n_embd) {
+        return false;
+    }
+    if pos >= state.next_pos {
+        state.next_pos = pos + 1;
+    }
+    return true;
+}
+
+export fn model_prefill(model: &Model, state: &ModelState, tokens: &const i32, n_tokens: u64, logits: &f32) bool {
+    if n_tokens == 0 || n_tokens > model.config.n_ctx {
+        return false;
+    }
+    model_state_reset(state);
+    var i: u64 = 0;
+    while i < n_tokens {
+        const token: i32 = tokens[i as usize];
+        if token < 0 {
+            return false;
+        }
+        if !model_forward_token(model, state, token as u64, i, logits) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn print_model_forward_status() i32 {
+    _ = printf("ds4-uya: transformer forward reference path is available for bound in-memory F32 fixtures\n");
+    return 0;
+}

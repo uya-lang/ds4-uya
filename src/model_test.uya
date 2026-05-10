@@ -1,0 +1,228 @@
+use ds4.model.Model;
+use ds4.model.ModelConfig;
+use ds4.model.ModelState;
+use ds4.model.ModelWeights;
+use ds4.model.model_config_init;
+use ds4.model.model_config_validate;
+use ds4.model.model_forward_token;
+use ds4.model.model_init;
+use ds4.model.model_prefill;
+use ds4.model.model_state_deinit;
+use ds4.model.model_state_empty;
+use ds4.model.model_state_init;
+use ds4.model.model_state_key_at;
+use ds4.model.model_state_value_at;
+use ds4.model.model_validate;
+use ds4.model.model_weights_bind_from_table;
+use ds4.model.model_weights_deinit;
+use ds4.model.model_weights_init;
+use ds4.tensor.TensorDType;
+use ds4.tensor.TensorView;
+use ds4.tensor.TensorWeightTable;
+use ds4.tensor.tensor_view_init_memory;
+use libc.fabsf;
+use libc.strlen;
+use std.testing.expect;
+
+fn assert_close(actual: f32, expected: f32, tol: f32) !void {
+    try expect(fabsf(actual - expected) <= tol);
+}
+
+fn set_name(view: &TensorView, name: &const byte) void {
+    const len: usize = strlen(name as *const byte);
+    view.name.len = len as u64;
+    view.name.shown = len;
+    var i: usize = 0;
+    while i < 256 {
+        if i < len {
+            view.name.data[i] = name[i];
+        } else {
+            view.name.data[i] = 0;
+        }
+        i = i + 1;
+    }
+}
+
+fn init_f32_view(view: &TensorView, name: &const byte, data: &f32, n_dims: u32, d0: u64, d1: u64) bool {
+    if !tensor_view_init_memory(data as &byte, TensorDType.F32, n_dims, d0, d1, 0, 0, true, view) {
+        return false;
+    }
+    set_name(view, name);
+    return true;
+}
+
+fn init_fixture_views(views: &TensorView, token_embd: &f32, one: &f32, two: &f32, half: &f32, output: &f32) bool {
+    var i: usize = 0;
+    if !init_f32_view(&views[i], "token_embd.weight\0" as &const byte, token_embd, 2, 1, 2) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "output_norm.weight\0" as &const byte, one, 1, 1, 0) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "output.weight\0" as &const byte, output, 2, 1, 2) { return false; }
+    i = i + 1;
+
+    if !init_f32_view(&views[i], "blk.0.attn_norm.weight\0" as &const byte, one, 1, 1, 0) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_q.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_k.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_v.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.attn_output.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.ffn_norm.weight\0" as &const byte, one, 1, 1, 0) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.ffn_gate.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.ffn_up.weight\0" as &const byte, two, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.0.ffn_down.weight\0" as &const byte, half, 2, 1, 1) { return false; }
+    i = i + 1;
+
+    if !init_f32_view(&views[i], "blk.1.attn_norm.weight\0" as &const byte, one, 1, 1, 0) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.1.attn_q.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.1.attn_k.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.1.attn_v.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.1.attn_output.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.1.ffn_norm.weight\0" as &const byte, one, 1, 1, 0) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.1.ffn_gate.weight\0" as &const byte, one, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.1.ffn_up.weight\0" as &const byte, two, 2, 1, 1) { return false; }
+    i = i + 1;
+    if !init_f32_view(&views[i], "blk.1.ffn_down.weight\0" as &const byte, half, 2, 1, 1) { return false; }
+    return true;
+}
+
+fn fixture_table(views: &TensorView) TensorWeightTable {
+    return TensorWeightTable{
+        views: views,
+        count: 21,
+        file_size: 0,
+        incomplete: false,
+        required_end: 0,
+        token_embd: null,
+        output_norm: null,
+        output: null,
+    };
+}
+
+fn fixture_config() ModelConfig {
+    var config: ModelConfig = model_config_init(2, 1, 2, 4, 1, 1);
+    config.rms_eps = 0.0f32;
+    return config;
+}
+
+test "model binds config and layer tensors" {
+    var token_embd: [f32: 2] = [];
+    var one: [f32: 1] = [];
+    var two: [f32: 1] = [];
+    var half: [f32: 1] = [];
+    var output: [f32: 2] = [];
+    token_embd[0] = 1.0f32;
+    token_embd[1] = 2.0f32;
+    one[0] = 1.0f32;
+    two[0] = 2.0f32;
+    half[0] = 0.5f32;
+    output[0] = 2.0f32;
+    output[1] = -1.0f32;
+
+    var views: [TensorView: 21] = [];
+    try expect(init_fixture_views(&views[0], &token_embd[0], &one[0], &two[0], &half[0], &output[0]));
+    var table: TensorWeightTable = fixture_table(&views[0]);
+    var config: ModelConfig = fixture_config();
+    try expect(model_config_validate(&config));
+
+    var weights: ModelWeights = model_weights_init();
+    try expect(model_weights_bind_from_table(&config, &table, &weights));
+    var model: Model = model_init(&config, &weights);
+    try expect(model_validate(&model));
+
+    model_weights_deinit(&weights);
+}
+
+test "single token forward writes logits and kv cache" {
+    var token_embd: [f32: 2] = [];
+    var one: [f32: 1] = [];
+    var two: [f32: 1] = [];
+    var half: [f32: 1] = [];
+    var output: [f32: 2] = [];
+    token_embd[0] = 1.0f32;
+    token_embd[1] = 2.0f32;
+    one[0] = 1.0f32;
+    two[0] = 2.0f32;
+    half[0] = 0.5f32;
+    output[0] = 2.0f32;
+    output[1] = -1.0f32;
+
+    var views: [TensorView: 21] = [];
+    try expect(init_fixture_views(&views[0], &token_embd[0], &one[0], &two[0], &half[0], &output[0]));
+    var table: TensorWeightTable = fixture_table(&views[0]);
+    var config: ModelConfig = fixture_config();
+    var weights: ModelWeights = model_weights_init();
+    try expect(model_weights_bind_from_table(&config, &table, &weights));
+    var model: Model = model_init(&config, &weights);
+    var state: ModelState = model_state_empty();
+    try expect(model_state_init(&state, &config));
+
+    var logits: [f32: 2] = [];
+    try expect(model_forward_token(&model, &state, 0, 0, &logits[0]));
+    try assert_close(logits[0], 2.0f32, 0.00001f32);
+    try assert_close(logits[1], -1.0f32, 0.00001f32);
+    try expect(state.next_pos == 1);
+
+    var kv: f32 = 0.0f32;
+    try expect(model_state_key_at(&state, 0, 0, 0, 0, &kv));
+    try assert_close(kv, 1.0f32, 0.00001f32);
+    try expect(model_state_value_at(&state, 1, 0, 0, 0, &kv));
+    try assert_close(kv, 1.0f32, 0.00001f32);
+
+    model_state_deinit(&state);
+    model_weights_deinit(&weights);
+}
+
+test "prompt prefill walks tokens and returns last logits" {
+    var token_embd: [f32: 2] = [];
+    var one: [f32: 1] = [];
+    var two: [f32: 1] = [];
+    var half: [f32: 1] = [];
+    var output: [f32: 2] = [];
+    token_embd[0] = 1.0f32;
+    token_embd[1] = 2.0f32;
+    one[0] = 1.0f32;
+    two[0] = 2.0f32;
+    half[0] = 0.5f32;
+    output[0] = 2.0f32;
+    output[1] = -1.0f32;
+
+    var views: [TensorView: 21] = [];
+    try expect(init_fixture_views(&views[0], &token_embd[0], &one[0], &two[0], &half[0], &output[0]));
+    var table: TensorWeightTable = fixture_table(&views[0]);
+    var config: ModelConfig = fixture_config();
+    var weights: ModelWeights = model_weights_init();
+    try expect(model_weights_bind_from_table(&config, &table, &weights));
+    var model: Model = model_init(&config, &weights);
+    var state: ModelState = model_state_empty();
+    try expect(model_state_init(&state, &config));
+
+    var tokens: [i32: 2] = [];
+    tokens[0] = 0;
+    tokens[1] = 1;
+    var logits: [f32: 2] = [];
+    try expect(model_prefill(&model, &state, &tokens[0], 2, &logits[0]));
+    try assert_close(logits[0], 2.0f32, 0.00001f32);
+    try assert_close(logits[1], -1.0f32, 0.00001f32);
+    try expect(state.next_pos == 2);
+
+    var kv: f32 = 0.0f32;
+    try expect(model_state_key_at(&state, 0, 1, 0, 0, &kv));
+    try assert_close(kv, 1.0f32, 0.00001f32);
+
+    model_state_deinit(&state);
+    model_weights_deinit(&weights);
+}

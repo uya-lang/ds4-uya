@@ -4,8 +4,8 @@
 
 The current milestone is intentionally small and runnable on this Linux x86_64
 machine: it provides project docs, GGUF loading, tokenizer support, CPU tensor
-views, and scalar reference kernels. Full text generation is planned in stages:
-transformer execution, KV cache integration, sampler, and CLI chat.
+views, scalar reference kernels, and a reference transformer forward path. Full
+text generation is planned in stages: sampler wiring and CLI chat.
 
 ## Build
 
@@ -52,5 +52,6 @@ build/ds4-uya inspect /home/winger/uya/ds4/gguf/DeepSeek-V4-Flash-Q4KExperts-F16
   GPT-2 byte-level BPE encode/decode, BOS/EOS/UNK/control token handling, CPU
   tensor views, root weight binding, scratch arena, KV cache layout, truncation
   diagnostics, and scalar reference kernels for F32/F16 math, RMSNorm, RoPE,
-  Softmax, dense matvec, Q8_0/Q4_K dot, and SiLU/SwiGLU.
-- Not implemented yet: transformer forward and token generation.
+  Softmax, dense matvec, Q8_0/Q4_K dot, SiLU/SwiGLU, and a dense F32
+  transformer forward fixture path with logits output.
+- Not implemented yet: sampler and token generation CLI.

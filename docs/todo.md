@@ -82,11 +82,11 @@
 
 ## Phase 5: Transformer forward
 
-- [ ] 建立模型超参结构。
-- [ ] 绑定每层 tensor。
-- [ ] 实现 single-token forward。
-- [ ] 实现 prompt prefill 的逐 token 路径。
-- [ ] 实现 logits 输出。
+- [x] 建立模型超参结构。
+- [x] 绑定每层 tensor。
+- [x] 实现 single-token forward。
+- [x] 实现 prompt prefill 的逐 token 路径。
+- [x] 实现 logits 输出。
 
 验收标准：
 
