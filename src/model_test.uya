@@ -1,3 +1,6 @@
+use ds4.generation.GenerationConfig;
+use ds4.generation.generation_config_greedy;
+use ds4.generation.generation_generate;
 use ds4.model.Model;
 use ds4.model.ModelConfig;
 use ds4.model.ModelState;
@@ -16,6 +19,8 @@ use ds4.model.model_validate;
 use ds4.model.model_weights_bind_from_table;
 use ds4.model.model_weights_deinit;
 use ds4.model.model_weights_init;
+use ds4.sampler.SamplerState;
+use ds4.sampler.sampler_state_init;
 use ds4.tensor.TensorDType;
 use ds4.tensor.TensorView;
 use ds4.tensor.TensorWeightTable;
@@ -222,6 +227,48 @@ test "prompt prefill walks tokens and returns last logits" {
     var kv: f32 = 0.0f32;
     try expect(model_state_key_at(&state, 0, 1, 0, 0, &kv));
     try assert_close(kv, 1.0f32, 0.00001f32);
+
+    model_state_deinit(&state);
+    model_weights_deinit(&weights);
+}
+
+test "generation loop samples greedy tokens from model logits" {
+    var token_embd: [f32: 2] = [];
+    var one: [f32: 1] = [];
+    var two: [f32: 1] = [];
+    var half: [f32: 1] = [];
+    var output: [f32: 2] = [];
+    token_embd[0] = 1.0f32;
+    token_embd[1] = 2.0f32;
+    one[0] = 1.0f32;
+    two[0] = 2.0f32;
+    half[0] = 0.5f32;
+    output[0] = 2.0f32;
+    output[1] = -1.0f32;
+
+    var views: [TensorView: 21] = [];
+    try expect(init_fixture_views(&views[0], &token_embd[0], &one[0], &two[0], &half[0], &output[0]));
+    var table: TensorWeightTable = fixture_table(&views[0]);
+    var config: ModelConfig = fixture_config();
+    var weights: ModelWeights = model_weights_init();
+    try expect(model_weights_bind_from_table(&config, &table, &weights));
+    var model: Model = model_init(&config, &weights);
+    var state: ModelState = model_state_empty();
+    try expect(model_state_init(&state, &config));
+
+    var tokens: [i32: 4] = [];
+    tokens[0] = 1;
+    var logits: [f32: 2] = [];
+    var gen_config: GenerationConfig = generation_config_greedy(3);
+    var sampler_state: SamplerState = sampler_state_init(5);
+    var generated: u64 = 0;
+    try expect(generation_generate(&model, &state, &tokens[0], 1, 4, &logits[0], &gen_config, &sampler_state, &generated));
+
+    try assert_eq_i32(generated as i32, 3);
+    try assert_eq_i32(tokens[1], 0);
+    try assert_eq_i32(tokens[2], 0);
+    try assert_eq_i32(tokens[3], 0);
+    try expect(state.next_pos == 4);
 
     model_state_deinit(&state);
     model_weights_deinit(&weights);

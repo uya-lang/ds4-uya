@@ -4,8 +4,8 @@
 
 The current milestone is intentionally small and runnable on this Linux x86_64
 machine: it provides project docs, GGUF loading, tokenizer support, CPU tensor
-views, scalar reference kernels, and a reference transformer forward path. Full
-text generation is planned in stages: sampler wiring and CLI chat.
+views, scalar reference kernels, a reference transformer forward path, a sampler,
+an in-memory greedy generation loop, and generation/chat CLI entrypoints.
 
 ## Build
 
@@ -35,6 +35,8 @@ build/ds4-uya view /path/to/model.gguf output_norm.weight
 build/ds4-uya piece /path/to/model.gguf 0
 build/ds4-uya encode /path/to/model.gguf "hello"
 build/ds4-uya decode /path/to/model.gguf 33310
+build/ds4-uya generate /path/to/model.gguf "hello"
+build/ds4-uya chat /path/to/model.gguf
 ```
 
 For the partial model currently present in the sibling `ds4` project:
@@ -53,5 +55,8 @@ build/ds4-uya inspect /home/winger/uya/ds4/gguf/DeepSeek-V4-Flash-Q4KExperts-F16
   tensor views, root weight binding, scratch arena, KV cache layout, truncation
   diagnostics, and scalar reference kernels for F32/F16 math, RMSNorm, RoPE,
   Softmax, dense matvec, Q8_0/Q4_K dot, SiLU/SwiGLU, and a dense F32
-  transformer forward fixture path with logits output.
-- Not implemented yet: sampler and token generation CLI.
+  transformer forward fixture path with logits output, plus deterministic
+  greedy/temperature/top-k/top-p/repeat-penalty sampling, an in-memory greedy
+  generation loop, and `generate`/`chat` command entrypoints.
+- Not implemented yet: end-to-end GGUF-backed token generation from mapped
+  model weights.

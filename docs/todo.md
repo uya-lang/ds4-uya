@@ -95,13 +95,13 @@
 
 ## Phase 6: sampler 和 CLI generation
 
-- [ ] greedy sampler。
-- [ ] temperature。
-- [ ] top-k。
-- [ ] top-p。
-- [ ] repeat penalty。
-- [ ] `generate` 子命令。
-- [ ] `chat` 子命令。
+- [x] greedy sampler。
+- [x] temperature。
+- [x] top-k。
+- [x] top-p。
+- [x] repeat penalty。
+- [x] `generate` 子命令。
+- [x] `chat` 子命令。
 
 验收标准：
 

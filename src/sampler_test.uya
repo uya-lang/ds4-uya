@@ -1,0 +1,87 @@
+use ds4.sampler.SamplerConfig;
+use ds4.sampler.SamplerState;
+use ds4.sampler.sampler_config_default;
+use ds4.sampler.sampler_greedy;
+use ds4.sampler.sampler_sample;
+use ds4.sampler.sampler_state_init;
+use std.testing.assert_eq_i32;
+use std.testing.expect;
+
+fn no_recent() i32 {
+    return -1;
+}
+
+test "greedy picks highest adjusted logit" {
+    var logits: [f32: 4] = [];
+    logits[0] = -1.0f32;
+    logits[1] = 0.5f32;
+    logits[2] = 4.0f32;
+    logits[3] = 3.0f32;
+    var recent: i32 = no_recent();
+
+    const token: i32 = sampler_greedy(&logits[0], 4, &recent, 0, 1.0f32);
+    try assert_eq_i32(token, 2);
+}
+
+test "repeat penalty can change greedy result" {
+    var logits: [f32: 2] = [];
+    logits[0] = 5.0f32;
+    logits[1] = 4.0f32;
+    var recent: [i32: 1] = [];
+    recent[0] = 0;
+
+    const token: i32 = sampler_greedy(&logits[0], 2, &recent[0], 1, 2.0f32);
+    try assert_eq_i32(token, 1);
+}
+
+test "same seed gives reproducible temperature sampling" {
+    var logits: [f32: 3] = [];
+    logits[0] = 0.1f32;
+    logits[1] = 0.2f32;
+    logits[2] = 0.3f32;
+    var recent: i32 = no_recent();
+    var config: SamplerConfig = sampler_config_default();
+    config.temperature = 1.0f32;
+    config.top_k = 0;
+    config.top_p = 1.0f32;
+
+    var a_state: SamplerState = sampler_state_init(123);
+    var b_state: SamplerState = sampler_state_init(123);
+    const a: i32 = sampler_sample(&logits[0], 3, &recent, 0, &config, &a_state);
+    const b: i32 = sampler_sample(&logits[0], 3, &recent, 0, &config, &b_state);
+
+    try assert_eq_i32(a, b);
+    try expect(a_state.seed == b_state.seed);
+}
+
+test "top_k one keeps only the best candidate" {
+    var logits: [f32: 3] = [];
+    logits[0] = 0.0f32;
+    logits[1] = 10.0f32;
+    logits[2] = 9.0f32;
+    var recent: i32 = no_recent();
+    var config: SamplerConfig = sampler_config_default();
+    config.temperature = 1.0f32;
+    config.top_k = 1;
+    config.top_p = 1.0f32;
+    var state: SamplerState = sampler_state_init(7);
+
+    const token: i32 = sampler_sample(&logits[0], 3, &recent, 0, &config, &state);
+    try assert_eq_i32(token, 1);
+}
+
+test "top_p can keep only the leading probability mass" {
+    var logits: [f32: 3] = [];
+    logits[0] = 10.0f32;
+    logits[1] = 0.0f32;
+    logits[2] = -10.0f32;
+    var recent: i32 = no_recent();
+    var config: SamplerConfig = sampler_config_default();
+    config.temperature = 1.0f32;
+    config.top_k = 0;
+    config.top_p = 0.5f32;
+    var state: SamplerState = sampler_state_init(99);
+
+    const token: i32 = sampler_sample(&logits[0], 3, &recent, 0, &config, &state);
+    try assert_eq_i32(token, 0);
+}

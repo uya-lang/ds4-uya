@@ -1,0 +1,236 @@
+use libc.expf;
+use libc.free;
+use libc.malloc;
+use libc.printf;
+
+struct SamplerCandidate {
+    id: u64,
+    logit: f32,
+    prob: f32,
+}
+
+export struct SamplerConfig {
+    temperature: f32,
+    top_k: u64,
+    top_p: f32,
+    repeat_penalty: f32,
+}
+
+export struct SamplerState {
+    seed: u64,
+}
+
+export fn sampler_config_greedy() SamplerConfig {
+    return SamplerConfig{ temperature: 0.0f32, top_k: 1, top_p: 1.0f32, repeat_penalty: 1.0f32 };
+}
+
+export fn sampler_config_default() SamplerConfig {
+    return SamplerConfig{ temperature: 1.0f32, top_k: 40, top_p: 0.95f32, repeat_penalty: 1.0f32 };
+}
+
+export fn sampler_state_init(seed: u64) SamplerState {
+    var s: u64 = seed % 0x80000000u64;
+    if s == 0 {
+        s = 1;
+    }
+    return SamplerState{ seed: s };
+}
+
+fn sampler_next_u32(state: &SamplerState) u32 {
+    state.seed = (state.seed * (1103515245 as u64) + (12345 as u64)) % 0x80000000u64;
+    return ((state.seed >> 16) & 0x7fffu64) as u32;
+}
+
+fn sampler_uniform(state: &SamplerState) f32 {
+    return (sampler_next_u32(state) as f32) / 32768.0f32;
+}
+
+fn sampler_token_in_recent(token: u64, recent: &const i32, n_recent: u64) bool {
+    if recent == null {
+        return false;
+    }
+    var i: u64 = 0;
+    while i < n_recent {
+        const t: i32 = recent[i as usize];
+        if t >= 0 && (t as u64) == token {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn sampler_adjust_logit(id: u64, logit: f32, recent: &const i32, n_recent: u64, repeat_penalty: f32) f32 {
+    if repeat_penalty <= 1.0f32 || !sampler_token_in_recent(id, recent, n_recent) {
+        return logit;
+    }
+    if logit >= 0.0f32 {
+        return logit / repeat_penalty;
+    }
+    return logit * repeat_penalty;
+}
+
+fn sampler_sort_desc(candidates: &SamplerCandidate, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        var best: u64 = i;
+        var j: u64 = i + 1;
+        while j < n {
+            if candidates[j as usize].logit > candidates[best as usize].logit {
+                best = j;
+            }
+            j = j + 1;
+        }
+        if best != i {
+            const tmp_id: u64 = candidates[i as usize].id;
+            const tmp_logit: f32 = candidates[i as usize].logit;
+            const tmp_prob: f32 = candidates[i as usize].prob;
+            candidates[i as usize].id = candidates[best as usize].id;
+            candidates[i as usize].logit = candidates[best as usize].logit;
+            candidates[i as usize].prob = candidates[best as usize].prob;
+            candidates[best as usize].id = tmp_id;
+            candidates[best as usize].logit = tmp_logit;
+            candidates[best as usize].prob = tmp_prob;
+        }
+        i = i + 1;
+    }
+}
+
+fn sampler_candidate_fill(candidates: &SamplerCandidate, logits: &const f32, n_vocab: u64, recent: &const i32, n_recent: u64, repeat_penalty: f32) void {
+    var i: u64 = 0;
+    while i < n_vocab {
+        candidates[i as usize] = SamplerCandidate{
+            id: i,
+            logit: sampler_adjust_logit(i, logits[i as usize], recent, n_recent, repeat_penalty),
+            prob: 0.0f32,
+        };
+        i = i + 1;
+    }
+}
+
+fn sampler_argmax(candidates: &SamplerCandidate, n: u64) i32 {
+    if n == 0 {
+        return -1;
+    }
+    var best: u64 = 0;
+    var i: u64 = 1;
+    while i < n {
+        if candidates[i as usize].logit > candidates[best as usize].logit {
+            best = i;
+        }
+        i = i + 1;
+    }
+    return candidates[best as usize].id as i32;
+}
+
+fn sampler_compute_probs(candidates: &SamplerCandidate, n: u64, temperature: f32) f32 {
+    if n == 0 {
+        return 0.0f32;
+    }
+    var max_logit: f32 = candidates[0].logit;
+    var i: u64 = 1;
+    while i < n {
+        if candidates[i as usize].logit > max_logit {
+            max_logit = candidates[i as usize].logit;
+        }
+        i = i + 1;
+    }
+
+    var total: f32 = 0.0f32;
+    i = 0;
+    while i < n {
+        const p: f32 = expf((candidates[i as usize].logit - max_logit) / temperature);
+        candidates[i as usize].prob = p;
+        total = total + p;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn sampler_apply_top_p(candidates: &SamplerCandidate, n: u64, total: f32, top_p: f32) u64 {
+    if n == 0 || top_p <= 0.0f32 || top_p >= 1.0f32 || total <= 0.0f32 {
+        return n;
+    }
+
+    var kept: u64 = 0;
+    var cumulative: f32 = 0.0f32;
+    while kept < n {
+        cumulative = cumulative + candidates[kept as usize].prob / total;
+        kept = kept + 1;
+        if cumulative >= top_p {
+            return kept;
+        }
+    }
+    return kept;
+}
+
+fn sampler_sum_probs(candidates: &SamplerCandidate, n: u64) f32 {
+    var total: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < n {
+        total = total + candidates[i as usize].prob;
+        i = i + 1;
+    }
+    return total;
+}
+
+fn sampler_sample_from_probs(candidates: &SamplerCandidate, n: u64, total: f32, state: &SamplerState) i32 {
+    if n == 0 || total <= 0.0f32 {
+        return -1;
+    }
+    const target: f32 = sampler_uniform(state) * total;
+    var cumulative: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < n {
+        cumulative = cumulative + candidates[i as usize].prob;
+        if target <= cumulative {
+            return candidates[i as usize].id as i32;
+        }
+        i = i + 1;
+    }
+    return candidates[(n - 1) as usize].id as i32;
+}
+
+export fn sampler_sample(logits: &const f32, n_vocab: u64, recent: &const i32, n_recent: u64, config: &SamplerConfig, state: &SamplerState) i32 {
+    if logits == null || n_vocab == 0 || config == null || state == null {
+        return -1;
+    }
+
+    const bytes: usize = (n_vocab as usize) * (@size_of(SamplerCandidate) as usize);
+    const candidates: &SamplerCandidate = malloc(bytes) as &SamplerCandidate;
+    if candidates == null {
+        return -1;
+    }
+
+    sampler_candidate_fill(candidates, logits, n_vocab, recent, n_recent, config.repeat_penalty);
+    if config.temperature <= 0.0f32 {
+        const greedy: i32 = sampler_argmax(candidates, n_vocab);
+        free(candidates as &void);
+        return greedy;
+    }
+
+    sampler_sort_desc(candidates, n_vocab);
+    var kept: u64 = n_vocab;
+    if config.top_k > 0 && config.top_k < kept {
+        kept = config.top_k;
+    }
+    var total: f32 = sampler_compute_probs(candidates, kept, config.temperature);
+    kept = sampler_apply_top_p(candidates, kept, total, config.top_p);
+    total = sampler_sum_probs(candidates, kept);
+    const sampled: i32 = sampler_sample_from_probs(candidates, kept, total, state);
+    free(candidates as &void);
+    return sampled;
+}
+
+export fn sampler_greedy(logits: &const f32, n_vocab: u64, recent: &const i32, n_recent: u64, repeat_penalty: f32) i32 {
+    var config: SamplerConfig = sampler_config_greedy();
+    config.repeat_penalty = repeat_penalty;
+    var state: SamplerState = sampler_state_init(1);
+    return sampler_sample(logits, n_vocab, recent, n_recent, &config, &state);
+}
+
+export fn print_generation_not_ready(command: &const byte) i32 {
+    _ = printf("ds4-uya: %s command is wired, but full GGUF generation is not available yet\n", command);
+    _ = printf("ds4-uya: Phase 6 sampler is implemented and tested; Phase 7+ must map model weights into the forward path\n");
+    return 9;
+}
