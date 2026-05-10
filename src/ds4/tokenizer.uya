@@ -379,6 +379,33 @@ fn tokenizer_byte_buffer_push(buf: &TokenizerByteBuffer, b: byte) bool {
     return true;
 }
 
+export fn tokenizer_byte_buffer_clear(buf: &TokenizerByteBuffer) void {
+    buf.len = 0;
+    if buf.data != null {
+        buf.data[0] = 0;
+    }
+}
+
+export fn tokenizer_byte_buffer_append_bytes(buf: &TokenizerByteBuffer, ptr: &const byte, len: u64) bool {
+    if !tokenizer_byte_buffer_reserve(buf, buf.len + len) {
+        return false;
+    }
+
+    var i: u64 = 0;
+    while i < len {
+        buf.data[(buf.len + i) as usize] = ptr[i as usize];
+        i = i + 1;
+    }
+    buf.len = buf.len + len;
+    buf.data[buf.len as usize] = 0;
+    return true;
+}
+
+export fn tokenizer_byte_buffer_append_cstr(buf: &TokenizerByteBuffer, text: &const byte) bool {
+    const len: u64 = strlen(text as *const byte) as u64;
+    return tokenizer_byte_buffer_append_bytes(buf, text, len);
+}
+
 export fn tokenizer_byte_buffer_deinit(buf: &TokenizerByteBuffer) void {
     if buf.data != null {
         free(buf.data as &void);
@@ -621,6 +648,52 @@ export fn tokenizer_vocab_load_from_offsets(
         m = m + 1;
     }
     _ = fclose(mfp);
+    return 0;
+}
+
+export fn tokenizer_load_string_from_offset(
+    path: &const byte,
+    file_size: u64,
+    offset: u64,
+    out: &TokenizerByteBuffer,
+) i32 {
+    tokenizer_byte_buffer_clear(out);
+    if offset > file_size {
+        return 3;
+    }
+
+    const fp: &FILE = fopen(path, "rb\0" as &const byte);
+    if fp == null {
+        return 2;
+    }
+    if fseek(fp, offset as i64, TOKENIZER_SEEK_SET) < 0 {
+        _ = fclose(fp);
+        return 2;
+    }
+
+    var r: TokenReader = TokenReader{ fp: fp, size: file_size, pos: offset };
+    var len: u64 = 0;
+    if !tokenizer_read_u64(&r, &len) {
+        _ = fclose(fp);
+        return 3;
+    }
+    if len > tokenizer_reader_remaining(&r) {
+        _ = fclose(fp);
+        return 3;
+    }
+    if !tokenizer_byte_buffer_reserve(out, len) {
+        _ = fclose(fp);
+        return 2;
+    }
+    if len > 0 {
+        if !tokenizer_reader_read(&r, &out.data[0], len as usize) {
+            _ = fclose(fp);
+            return 3;
+        }
+    }
+    out.len = len;
+    out.data[len as usize] = 0;
+    _ = fclose(fp);
     return 0;
 }
 

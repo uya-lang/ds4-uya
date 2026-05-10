@@ -3,6 +3,7 @@ use ds4.gguf.inspect_gguf;
 use ds4.gguf.print_gguf_tensor;
 use ds4.runtime.print_runtime_audit;
 use ds4.runtime.print_runtime_chat;
+use ds4.runtime.print_runtime_format_chat;
 use ds4.runtime.print_runtime_generate;
 use ds4.tensor.print_tensor_weight_view;
 use ds4.tokenizer.TokenizerTokenVec;
@@ -28,12 +29,13 @@ fn print_help() void {
     _ = printf("  ds4-uya piece <model.gguf> <token-id>\n");
     _ = printf("  ds4-uya encode <model.gguf> <text>\n");
     _ = printf("  ds4-uya decode <model.gguf> <token-id>...\n");
+    _ = printf("  ds4-uya format-chat <model.gguf> <text>\n");
     _ = printf("  ds4-uya generate <model.gguf> <prompt>\n");
     _ = printf("  ds4-uya chat <model.gguf>\n");
     _ = printf("  ds4-uya bench\n");
     _ = printf("\n");
     _ = printf("status:\n");
-    _ = printf("  implemented: GGUF loader, tokenizer, CPU tensor views, reference/optimized kernels, transformer forward, sampler, GGUF-backed generation/chat, benchmark\n");
+    _ = printf("  implemented: GGUF loader, tokenizer, chat-template formatting, CPU tensor views, reference/optimized kernels, transformer forward, sampler, GGUF-backed generation/chat, benchmark\n");
     _ = printf("  current CPU generation supports dense decoder GGUFs with dense GQA/MQA and F32/F16/Q8_0/Q2_K/Q4_K matrices when key/value dims equal head_dim\n");
 }
 
@@ -138,6 +140,14 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
             return 1;
         }
         return print_runtime_generate(argv[2] as &const byte, argv[3] as &const byte);
+    }
+
+    if strcmp(cmd as *const byte, "format-chat\0" as *const byte) == 0 {
+        if argc < 4 {
+            _ = printf("ds4-uya: format-chat requires a GGUF file path and user text\n");
+            return 1;
+        }
+        return print_runtime_format_chat(argv[2] as &const byte, argv[3] as &const byte);
     }
 
     if strcmp(cmd as *const byte, "chat\0" as *const byte) == 0 {

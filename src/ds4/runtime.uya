@@ -2,6 +2,7 @@ use ds4.generation.GenerationConfig;
 use ds4.generation.generation_config_greedy;
 use ds4.generation.generation_generate;
 use ds4.gguf.GgufInfo;
+use ds4.gguf.GgufMetadataInfo;
 use ds4.gguf.GgufString;
 use ds4.gguf.GgufTensorInfo;
 use ds4.gguf.GGML_TYPE_F16;
@@ -39,12 +40,17 @@ use ds4.tensor.tensor_weight_table_find;
 use ds4.tensor.tensor_weight_table_init;
 use ds4.tensor.tensor_weight_table_load_from_gguf;
 use ds4.tokenizer.TokenizerByteBuffer;
+use ds4.tokenizer.TokenizerString;
 use ds4.tokenizer.TokenizerTokenVec;
 use ds4.tokenizer.TokenizerVocab;
+use ds4.tokenizer.tokenizer_byte_buffer_append_bytes;
+use ds4.tokenizer.tokenizer_byte_buffer_append_cstr;
+use ds4.tokenizer.tokenizer_byte_buffer_clear;
 use ds4.tokenizer.tokenizer_byte_buffer_deinit;
 use ds4.tokenizer.tokenizer_byte_buffer_init;
 use ds4.tokenizer.tokenizer_decode_tokens;
 use ds4.tokenizer.tokenizer_encode_text;
+use ds4.tokenizer.tokenizer_load_string_from_offset;
 use ds4.tokenizer.tokenizer_token_vec_deinit;
 use ds4.tokenizer.tokenizer_token_vec_init;
 use ds4.tokenizer.tokenizer_token_vec_push;
@@ -72,6 +78,7 @@ use libc.sys_open;
 
 const RUNTIME_DEFAULT_MAX_NEW: u64 = 64;
 const RUNTIME_CHAT_MAX_NEW: u64 = 96;
+const RUNTIME_GGUF_TYPE_STRING: u32 = 8;
 
 extern "libc" fn memcpy(dest: &void, src: &const void, n: usize) &void;
 
@@ -79,6 +86,7 @@ export struct RuntimeSession {
     info: GgufInfo,
     table: TensorWeightTable,
     vocab: TokenizerVocab,
+    chat_template: TokenizerByteBuffer,
     config: ModelConfig,
     weights: ModelWeights,
     model: Model,
@@ -87,6 +95,7 @@ export struct RuntimeSession {
     tensor_data_count: u64,
     mmap_base: &byte,
     mmap_size: u64,
+    has_chat_template: bool,
     loaded: bool,
 }
 
@@ -107,6 +116,7 @@ export fn runtime_session_init() RuntimeSession {
         info: gguf_info_init(),
         table: tensor_weight_table_init(),
         vocab: tokenizer_vocab_init(),
+        chat_template: tokenizer_byte_buffer_init(),
         config: model_config_init(0, 0, 0, 0, 0, 0),
         weights: model_weights_init(),
         model: runtime_empty_model(),
@@ -115,6 +125,7 @@ export fn runtime_session_init() RuntimeSession {
         tensor_data_count: 0,
         mmap_base: null,
         mmap_size: 0,
+        has_chat_template: false,
         loaded: false,
     };
 }
@@ -143,6 +154,7 @@ fn runtime_free_tensor_data(session: &RuntimeSession) void {
 export fn runtime_session_deinit(session: &RuntimeSession) void {
     model_state_deinit(&session.state);
     model_weights_deinit(&session.weights);
+    tokenizer_byte_buffer_deinit(&session.chat_template);
     tokenizer_vocab_deinit(&session.vocab);
     runtime_free_tensor_data(session);
     tensor_weight_table_deinit(&session.table);
@@ -362,6 +374,148 @@ fn runtime_sample_contains(s: &GgufString, needle: &const byte) bool {
     return false;
 }
 
+fn runtime_buffer_contains_bytes(buf: &TokenizerByteBuffer, needle: &const byte, n: u64) bool {
+    if n == 0 {
+        return true;
+    }
+    if buf.data == null || buf.len < n {
+        return false;
+    }
+
+    var i: u64 = 0;
+    while i + n <= buf.len {
+        var j: u64 = 0;
+        var ok: bool = true;
+        while j < n {
+            if buf.data[(i + j) as usize] != needle[j as usize] {
+                ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if ok {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn runtime_buffer_contains_cstr(buf: &TokenizerByteBuffer, needle: &const byte) bool {
+    const n: u64 = strlen(needle as *const byte) as u64;
+    return runtime_buffer_contains_bytes(buf, needle, n);
+}
+
+fn runtime_fill_ds_user_marker(out: &byte) void {
+    out[0] = 60 as byte;
+    out[1] = 239 as byte;
+    out[2] = 189 as byte;
+    out[3] = 156 as byte;
+    out[4] = 85 as byte;
+    out[5] = 115 as byte;
+    out[6] = 101 as byte;
+    out[7] = 114 as byte;
+    out[8] = 239 as byte;
+    out[9] = 189 as byte;
+    out[10] = 156 as byte;
+    out[11] = 62 as byte;
+}
+
+fn runtime_fill_ds_assistant_marker(out: &byte) void {
+    out[0] = 60 as byte;
+    out[1] = 239 as byte;
+    out[2] = 189 as byte;
+    out[3] = 156 as byte;
+    out[4] = 65 as byte;
+    out[5] = 115 as byte;
+    out[6] = 115 as byte;
+    out[7] = 105 as byte;
+    out[8] = 115 as byte;
+    out[9] = 116 as byte;
+    out[10] = 97 as byte;
+    out[11] = 110 as byte;
+    out[12] = 116 as byte;
+    out[13] = 239 as byte;
+    out[14] = 189 as byte;
+    out[15] = 156 as byte;
+    out[16] = 62 as byte;
+}
+
+fn runtime_chat_template_style(session: &RuntimeSession) u32 {
+    if !session.has_chat_template {
+        return 0;
+    }
+
+    var ds_user: [byte: 12] = [];
+    var ds_assistant: [byte: 17] = [];
+    runtime_fill_ds_user_marker(&ds_user[0]);
+    runtime_fill_ds_assistant_marker(&ds_assistant[0]);
+    if runtime_buffer_contains_bytes(&session.chat_template, &ds_user[0] as &const byte, 12) &&
+        runtime_buffer_contains_bytes(&session.chat_template, &ds_assistant[0] as &const byte, 17) {
+        return 1;
+    }
+
+    if runtime_buffer_contains_cstr(&session.chat_template, "<|User|>\0" as &const byte) &&
+        runtime_buffer_contains_cstr(&session.chat_template, "<|Assistant|>\0" as &const byte) {
+        return 2;
+    }
+    return 0;
+}
+
+fn runtime_append_vocab_token_piece(session: &RuntimeSession, token_id: i32, out: &TokenizerByteBuffer) bool {
+    if token_id < 0 || (token_id as u64) >= session.vocab.token_count || session.vocab.tokens == null {
+        return true;
+    }
+    const piece: &TokenizerString = &session.vocab.tokens[token_id as usize];
+    if piece.ptr == null || piece.len == 0 {
+        return true;
+    }
+    return tokenizer_byte_buffer_append_bytes(out, piece.ptr as &const byte, piece.len);
+}
+
+fn runtime_append_chat_marker(style: u32, assistant: bool, out: &TokenizerByteBuffer) bool {
+    if style == 1 {
+        var ds_user: [byte: 12] = [];
+        var ds_assistant: [byte: 17] = [];
+        if assistant {
+            runtime_fill_ds_assistant_marker(&ds_assistant[0]);
+            return tokenizer_byte_buffer_append_bytes(out, &ds_assistant[0] as &const byte, 17);
+        }
+        runtime_fill_ds_user_marker(&ds_user[0]);
+        return tokenizer_byte_buffer_append_bytes(out, &ds_user[0] as &const byte, 12);
+    }
+    if assistant {
+        return tokenizer_byte_buffer_append_cstr(out, "<|Assistant|>\0" as &const byte);
+    }
+    return tokenizer_byte_buffer_append_cstr(out, "<|User|>\0" as &const byte);
+}
+
+fn runtime_load_chat_template(path: &const byte, session: &RuntimeSession) i32 {
+    tokenizer_byte_buffer_clear(&session.chat_template);
+    session.has_chat_template = false;
+
+    var i: u64 = 0;
+    while i < session.info.loaded_metadata_count {
+        const meta: &GgufMetadataInfo = &session.info.metadata[i as usize];
+        if runtime_sample_equals(&meta.key, "tokenizer.chat_template\0" as &const byte) &&
+            meta.value_type == RUNTIME_GGUF_TYPE_STRING {
+            const rc: i32 = tokenizer_load_string_from_offset(
+                path,
+                session.info.file_size,
+                meta.value_offset,
+                &session.chat_template,
+            );
+            if rc != 0 {
+                return rc;
+            }
+            session.has_chat_template = session.chat_template.len > 0;
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 export fn print_runtime_audit(path: &const byte) i32 {
     var info: GgufInfo = gguf_info_init();
     const rc: i32 = load_gguf(path, &info);
@@ -543,6 +697,12 @@ export fn runtime_session_load_gguf(path: &const byte, session: &RuntimeSession)
         return load_rc;
     }
 
+    const chat_template_rc: i32 = runtime_load_chat_template(path, session);
+    if chat_template_rc != 0 {
+        runtime_session_deinit(session);
+        return chat_template_rc;
+    }
+
     const table_rc: i32 = tensor_weight_table_load_from_gguf(path, &session.table);
     if table_rc != 0 {
         runtime_session_deinit(session);
@@ -580,10 +740,7 @@ export fn runtime_session_load_gguf(path: &const byte, session: &RuntimeSession)
 }
 
 fn runtime_clear_byte_buffer(out: &TokenizerByteBuffer) void {
-    out.len = 0;
-    if out.data != null {
-        out.data[0] = 0;
-    }
+    tokenizer_byte_buffer_clear(out);
 }
 
 fn runtime_decode_generated(session: &RuntimeSession, tokens: &i32, start: u64, generated: u64, out: &TokenizerByteBuffer) bool {
@@ -605,11 +762,60 @@ fn runtime_decode_generated(session: &RuntimeSession, tokens: &i32, start: u64, 
     return rc == 0;
 }
 
-export fn runtime_session_generate_to_buffer(
+fn runtime_session_format_chat_prompt_inner(
+    session: &RuntimeSession,
+    user: &const byte,
+    out: &TokenizerByteBuffer,
+    used_template: &bool,
+) i32 {
+    tokenizer_byte_buffer_clear(out);
+    *used_template = false;
+
+    const style: u32 = runtime_chat_template_style(session);
+    if style == 0 {
+        if !tokenizer_byte_buffer_append_cstr(out, user) {
+            return 2;
+        }
+        return 0;
+    }
+
+    if !runtime_append_vocab_token_piece(session, session.vocab.bos_id, out) {
+        return 2;
+    }
+    if !runtime_append_chat_marker(style, false, out) {
+        return 2;
+    }
+    if !tokenizer_byte_buffer_append_cstr(out, user) {
+        return 2;
+    }
+    if !runtime_append_chat_marker(style, true, out) {
+        return 2;
+    }
+    if runtime_buffer_contains_cstr(&session.chat_template, "</think>\0" as &const byte) {
+        if !tokenizer_byte_buffer_append_cstr(out, "</think>\0" as &const byte) {
+            return 2;
+        }
+    }
+
+    *used_template = true;
+    return 0;
+}
+
+export fn runtime_session_format_chat_prompt(
+    session: &RuntimeSession,
+    user: &const byte,
+    out: &TokenizerByteBuffer,
+) i32 {
+    var used_template: bool = false;
+    return runtime_session_format_chat_prompt_inner(session, user, out, &used_template);
+}
+
+fn runtime_session_generate_text_to_buffer(
     session: &RuntimeSession,
     prompt: &const byte,
     max_new_tokens: u64,
     out: &TokenizerByteBuffer,
+    add_bos: bool,
 ) i32 {
     runtime_clear_byte_buffer(out);
     if !session.loaded || max_new_tokens == 0 {
@@ -617,7 +823,7 @@ export fn runtime_session_generate_to_buffer(
     }
 
     var prompt_tokens: TokenizerTokenVec = tokenizer_token_vec_init();
-    const encode_rc: i32 = tokenizer_encode_text(&session.vocab, prompt, &prompt_tokens, true, session.vocab.add_bos, false);
+    const encode_rc: i32 = tokenizer_encode_text(&session.vocab, prompt, &prompt_tokens, true, add_bos, false);
     if encode_rc != 0 || prompt_tokens.len == 0 {
         tokenizer_token_vec_deinit(&prompt_tokens);
         return 10;
@@ -664,6 +870,15 @@ export fn runtime_session_generate_to_buffer(
     return rc;
 }
 
+export fn runtime_session_generate_to_buffer(
+    session: &RuntimeSession,
+    prompt: &const byte,
+    max_new_tokens: u64,
+    out: &TokenizerByteBuffer,
+) i32 {
+    return runtime_session_generate_text_to_buffer(session, prompt, max_new_tokens, out, session.vocab.add_bos);
+}
+
 export fn runtime_generate_to_buffer(path: &const byte, prompt: &const byte, max_new_tokens: u64, out: &TokenizerByteBuffer) i32 {
     var session: RuntimeSession = runtime_session_init();
     const load_rc: i32 = runtime_session_load_gguf(path, &session);
@@ -676,9 +891,49 @@ export fn runtime_generate_to_buffer(path: &const byte, prompt: &const byte, max
     return rc;
 }
 
+export fn runtime_format_chat_prompt_for_gguf(path: &const byte, user: &const byte, out: &TokenizerByteBuffer) i32 {
+    var session: RuntimeSession = runtime_session_init();
+    const load_rc: i32 = load_gguf(path, &session.info);
+    if load_rc != 0 {
+        runtime_session_deinit(&session);
+        return load_rc;
+    }
+
+    const template_rc: i32 = runtime_load_chat_template(path, &session);
+    if template_rc != 0 {
+        runtime_session_deinit(&session);
+        return template_rc;
+    }
+
+    const vocab_rc: i32 = tokenizer_vocab_load_from_gguf(path, &session.vocab);
+    if vocab_rc != 0 {
+        runtime_session_deinit(&session);
+        return vocab_rc;
+    }
+
+    const rc: i32 = runtime_session_format_chat_prompt(&session, user, out);
+    runtime_session_deinit(&session);
+    return rc;
+}
+
 export fn print_runtime_generate(path: &const byte, prompt: &const byte) i32 {
     var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
     const rc: i32 = runtime_generate_to_buffer(path, prompt, RUNTIME_DEFAULT_MAX_NEW, &out);
+    if rc == 0 {
+        if out.data != null {
+            _ = printf("%s", &out.data[0]);
+        }
+        _ = printf("\n");
+    } else {
+        runtime_print_load_error(path, rc);
+    }
+    tokenizer_byte_buffer_deinit(&out);
+    return rc;
+}
+
+export fn print_runtime_format_chat(path: &const byte, user: &const byte) i32 {
+    var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
+    const rc: i32 = runtime_format_chat_prompt_for_gguf(path, user, &out);
     if rc == 0 {
         if out.data != null {
             _ = printf("%s", &out.data[0]);
@@ -730,6 +985,7 @@ export fn print_runtime_chat(path: &const byte) i32 {
 
     _ = printf("ds4-uya chat ready. Type /quit to exit.\n");
     var line: [byte: 4096] = [];
+    var prompt: TokenizerByteBuffer = tokenizer_byte_buffer_init();
     var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
     while true {
         _ = printf("> ");
@@ -742,9 +998,20 @@ export fn print_runtime_chat(path: &const byte) i32 {
             strcmp(&line[0] as *const byte, "/exit\0" as *const byte) == 0 {
             break;
         }
-        const rc: i32 = runtime_session_generate_to_buffer(&session, &line[0] as &const byte, RUNTIME_CHAT_MAX_NEW, &out);
+        var used_template: bool = false;
+        var rc: i32 = runtime_session_format_chat_prompt_inner(&session, &line[0] as &const byte, &prompt, &used_template);
+        if rc == 0 {
+            rc = runtime_session_generate_text_to_buffer(
+                &session,
+                &prompt.data[0] as &const byte,
+                RUNTIME_CHAT_MAX_NEW,
+                &out,
+                session.vocab.add_bos && !used_template,
+            );
+        }
         if rc != 0 {
             runtime_print_load_error(path, rc);
+            tokenizer_byte_buffer_deinit(&prompt);
             tokenizer_byte_buffer_deinit(&out);
             runtime_session_deinit(&session);
             return rc;
@@ -755,6 +1022,7 @@ export fn print_runtime_chat(path: &const byte) i32 {
         _ = printf("\n");
     }
 
+    tokenizer_byte_buffer_deinit(&prompt);
     tokenizer_byte_buffer_deinit(&out);
     runtime_session_deinit(&session);
     return 0;

@@ -2,6 +2,7 @@ use ds4.gguf.GGML_TYPE_F32;
 use ds4.runtime.RuntimeSession;
 use ds4.runtime.print_runtime_audit;
 use ds4.runtime.runtime_session_deinit;
+use ds4.runtime.runtime_session_format_chat_prompt;
 use ds4.runtime.runtime_session_generate_to_buffer;
 use ds4.runtime.runtime_session_init;
 use ds4.runtime.runtime_session_load_gguf;
@@ -115,7 +116,7 @@ fn write_runtime_fixture(path: &const byte) bool {
     ok = ok && write_u32_le(fp, TEST_GGUF_MAGIC);
     ok = ok && write_u32_le(fp, 3);
     ok = ok && write_u64_le(fp, 12);
-    ok = ok && write_u64_le(fp, 10);
+    ok = ok && write_u64_le(fp, 11);
 
     ok = ok && write_meta_string(fp, "general.architecture\0" as &const byte, "deepseek4\0" as &const byte);
     ok = ok && write_meta_string(fp, "general.name\0" as &const byte, "tiny-runtime\0" as &const byte);
@@ -125,6 +126,7 @@ fn write_runtime_fixture(path: &const byte) bool {
     ok = ok && write_meta_u32(fp, "deepseek4.attention.head_count\0" as &const byte, 1);
     ok = ok && write_meta_u32(fp, "deepseek4.attention.head_count_kv\0" as &const byte, 1);
     ok = ok && write_meta_u32(fp, "tokenizer.ggml.add_bos_token\0" as &const byte, 0);
+    ok = ok && write_meta_string(fp, "tokenizer.chat_template\0" as &const byte, "<|User|><|Assistant|></think>\0" as &const byte);
     ok = ok && write_meta_tokens(fp);
     ok = ok && write_meta_empty_merges(fp);
 
@@ -218,6 +220,7 @@ test "runtime maps GGUF tensors into forward and generates decoded text" {
     try expect(session.mmap_size > 0);
     try expect(session.table.token_embd.data != null);
     try expect(session.weights.output.data != null);
+    try expect(session.has_chat_template);
 
     var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
     try assert_eq_i32(runtime_session_generate_to_buffer(&session, "b\0" as &const byte, 3, &out), 0);
@@ -226,6 +229,21 @@ test "runtime maps GGUF tensors into forward and generates decoded text" {
     try assert_eq_i32(out.data[1] as i32, 97);
     try assert_eq_i32(out.data[2] as i32, 97);
 
+    var prompt: TokenizerByteBuffer = tokenizer_byte_buffer_init();
+    try assert_eq_i32(runtime_session_format_chat_prompt(&session, "hi\0" as &const byte, &prompt), 0);
+    try assert_eq_i32(prompt.len as i32, 31);
+    try assert_eq_i32(prompt.data[0] as i32, 60);
+    try assert_eq_i32(prompt.data[1] as i32, 124);
+    try assert_eq_i32(prompt.data[2] as i32, 85);
+    try assert_eq_i32(prompt.data[7] as i32, 62);
+    try assert_eq_i32(prompt.data[8] as i32, 104);
+    try assert_eq_i32(prompt.data[9] as i32, 105);
+    try assert_eq_i32(prompt.data[10] as i32, 60);
+    try assert_eq_i32(prompt.data[11] as i32, 124);
+    try assert_eq_i32(prompt.data[27] as i32, 105);
+    try assert_eq_i32(prompt.data[30] as i32, 62);
+
+    tokenizer_byte_buffer_deinit(&prompt);
     tokenizer_byte_buffer_deinit(&out);
     runtime_session_deinit(&session);
     _ = remove(path);

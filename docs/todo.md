@@ -150,9 +150,9 @@
 - [x] 实现 `Q2_K`、`IQ2_XXS`、`IQ2_XS`、`IQ2_S` matvec reference kernel，并按 ggml 表格式接入 dense matvec；真实 Q2 文件当前实际命中 `IQ2_XXS`。
 - [x] 扩展现有 F16/Q8_0/Q4_K/Q2_K/IQ2_* dense matvec dtype 覆盖；Flash experts/shared/output 的 3D expert 权重路径仍待接入 MoE forward。
 - [x] 改造权重加载策略：生成路径对已支持的 dense GGUF 使用整文件只读 `mmap` 挂接 tensor view，避免逐 tensor `malloc` 复制；`audit` 继续避免读取 tensor data。
-- [ ] 支持真实 tokenizer chat template，把 `chat` 从裸 prompt REPL 升级为模型格式化对话输入。
+- [x] 支持真实 tokenizer chat template，把 `chat` 从裸 prompt REPL 升级为模型格式化对话输入；当前会读取完整 `tokenizer.chat_template`，对 DS4/DeepSeek 的 `<User>/<Assistant></think>` 模板做实际格式化。
 - [x] 增加真实模型 audit target：`make flash-q2-audit DS4_FLASH_Q2_GGUF=/path/to/model.gguf`。
-- [ ] 增加真实模型 smoke：`inspect`、`encode`、`generate`、`chat` 在 DS4 Flash Q2 GGUF 上不崩溃，并能产出非空文本；`make flash-q2-smoke` 已建目标，但生成仍会因 Flash forward 未接入而报 unsupported。
+- [ ] 增加真实模型 smoke：`inspect`、`encode`、`format-chat`、`generate`、`chat` 在 DS4 Flash Q2 GGUF 上不崩溃，并能产出非空文本；`make flash-q2-smoke` 已包含 tokenizer/template 检查，但生成仍会因 Flash forward 未接入而报 unsupported。
 - [ ] 增加 golden 对照：同 prompt 与原 DS4 或可信参考实现对齐 logits top-k / token 序列，误差和可接受差异写入测试说明。
 - [ ] 增加性能验收：报告真实 DS4 Flash Q2 的 prompt/decode tokens/s、峰值内存、加载时间。
 

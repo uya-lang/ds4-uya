@@ -31,6 +31,7 @@ flash-q2-smoke: build
 	$(BIN) audit "$(DS4_FLASH_Q2_GGUF)"
 	$(BIN) inspect "$(DS4_FLASH_Q2_GGUF)"
 	$(BIN) encode "$(DS4_FLASH_Q2_GGUF)" "hello"
+	$(BIN) format-chat "$(DS4_FLASH_Q2_GGUF)" "hello"
 	$(BIN) generate "$(DS4_FLASH_Q2_GGUF)" "hello"
 
 clean:
