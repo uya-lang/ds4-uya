@@ -1,3 +1,4 @@
+use ds4.binary.le_u32_from_bytes;
 use ds4.binary.le_u64_from_bytes;
 use ds4.gguf.GgufInfo;
 use ds4.gguf.GgufString;
@@ -8,15 +9,108 @@ use libc.FILE;
 use libc.fclose;
 use libc.fopen;
 use libc.fread;
+use libc.free;
 use libc.fseek;
+use libc.malloc;
 use libc.printf;
+use libc.realloc;
+use libc.strlen;
 
 const TOKENIZER_SEEK_SET: i32 = 0;
+const TOKENIZER_NORMAL: i32 = 1;
+const TOKENIZER_UNKNOWN: i32 = 2;
+const TOKENIZER_CONTROL: i32 = 3;
+const TOKENIZER_USER_DEFINED: i32 = 4;
 
 struct TokenReader {
     fp: &FILE,
     size: u64,
     pos: u64,
+}
+
+export struct TokenizerString {
+    ptr: &byte,
+    len: u64,
+}
+
+export struct TokenizerTableEntry {
+    key: TokenizerString,
+    value: i32,
+    used: bool,
+}
+
+export struct TokenizerTable {
+    entries: &TokenizerTableEntry,
+    cap: u64,
+    used: u64,
+}
+
+export struct TokenizerVocab {
+    tokens: &TokenizerString,
+    token_types: &i32,
+    token_count: u64,
+    merges: &TokenizerString,
+    merge_count: u64,
+    token_to_id: TokenizerTable,
+    merge_rank: TokenizerTable,
+    bos_id: i32,
+    eos_id: i32,
+    unk_id: i32,
+    pad_id: i32,
+    add_bos: bool,
+    add_eos: bool,
+}
+
+export struct TokenizerTokenVec {
+    data: &i32,
+    len: u64,
+    cap: u64,
+}
+
+export struct TokenizerByteBuffer {
+    data: &byte,
+    len: u64,
+    cap: u64,
+}
+
+fn tokenizer_string_empty() TokenizerString {
+    return TokenizerString{ ptr: null, len: 0 };
+}
+
+fn tokenizer_table_empty() TokenizerTable {
+    return TokenizerTable{ entries: null, cap: 0, used: 0 };
+}
+
+export fn tokenizer_vocab_init() TokenizerVocab {
+    return TokenizerVocab{
+        tokens: null,
+        token_types: null,
+        token_count: 0,
+        merges: null,
+        merge_count: 0,
+        token_to_id: tokenizer_table_empty(),
+        merge_rank: tokenizer_table_empty(),
+        bos_id: -1,
+        eos_id: -1,
+        unk_id: -1,
+        pad_id: -1,
+        add_bos: false,
+        add_eos: false,
+    };
+}
+
+export fn tokenizer_token_vec_init() TokenizerTokenVec {
+    return TokenizerTokenVec{ data: null, len: 0, cap: 0 };
+}
+
+export fn tokenizer_byte_buffer_init() TokenizerByteBuffer {
+    return TokenizerByteBuffer{ data: null, len: 0, cap: 0 };
+}
+
+fn tokenizer_byte_set(ptr: &byte, cap: usize, idx: usize, val: byte) void {
+    if ptr != null && idx < cap {
+        ptr[idx] = val;
+    }
 }
 
 fn tokenizer_string_clear(out: &GgufString) void {
@@ -62,6 +156,15 @@ fn tokenizer_reader_skip(r: &TokenReader, n: u64) bool {
     return true;
 }
 
+fn tokenizer_read_u32(r: &TokenReader, out: &u32) bool {
+    var buf: [byte: 4] = [];
+    if !tokenizer_reader_read(r, &buf[0], 4) {
+        return false;
+    }
+    *out = le_u32_from_bytes(buf[0], buf[1], buf[2], buf[3]);
+    return true;
+}
+
 fn tokenizer_read_u64(r: &TokenReader, out: &u64) bool {
     var buf: [byte: 8] = [];
     if !tokenizer_reader_read(r, &buf[0], 8) {
@@ -102,6 +205,476 @@ fn read_piece_sample(r: &TokenReader, out: &GgufString) bool {
         return tokenizer_reader_skip(r, rest);
     }
     return true;
+}
+
+fn tokenizer_read_owned_string(r: &TokenReader, out: &TokenizerString) bool {
+    *out = tokenizer_string_empty();
+    var len: u64 = 0;
+    if !tokenizer_read_u64(r, &len) {
+        return false;
+    }
+
+    const alloc_len: usize = (len + 1) as usize;
+    const ptr: &byte = malloc(alloc_len) as &byte;
+    if ptr == null {
+        return false;
+    }
+    if len > 0 {
+        if !tokenizer_reader_read(r, ptr, len as usize) {
+            free(ptr as &void);
+            return false;
+        }
+    }
+    tokenizer_byte_set(ptr, alloc_len, len as usize, 0 as byte);
+    out.ptr = ptr;
+    out.len = len;
+    return true;
+}
+
+fn tokenizer_hash_bytes(ptr: &const byte, offset: u64, len: u64) u64 {
+    var h: u64 = 1469598103934665603;
+    var i: u64 = 0;
+    while i < len {
+        h = h ^ (ptr[(offset + i) as usize] as u64);
+        h = h * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn tokenizer_next_pow2(n: u64) u64 {
+    var p: u64 = 1;
+    while p < n {
+        p = p << 1;
+    }
+    return p;
+}
+
+fn tokenizer_table_init(t: &TokenizerTable, expected: u64) bool {
+    t.cap = tokenizer_next_pow2(expected * 2 + 16);
+    t.used = 0;
+    const bytes: usize = (t.cap as usize) * (@size_of(TokenizerTableEntry) as usize);
+    t.entries = malloc(bytes) as &TokenizerTableEntry;
+    if t.entries == null {
+        return false;
+    }
+
+    var i: u64 = 0;
+    while i < t.cap {
+        t.entries[i as usize] = TokenizerTableEntry{ key: tokenizer_string_empty(), value: 0, used: false };
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tokenizer_table_deinit(t: &TokenizerTable) void {
+    if t.entries != null {
+        free(t.entries as &void);
+    }
+    *t = tokenizer_table_empty();
+}
+
+fn tokenizer_bytes_equal(key: &TokenizerString, ptr: &const byte, offset: u64, len: u64) bool {
+    if key.len != len {
+        return false;
+    }
+    var i: u64 = 0;
+    while i < len {
+        if key.ptr[i as usize] != ptr[(offset + i) as usize] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tokenizer_table_put(t: &TokenizerTable, key: &TokenizerString, value: i32) bool {
+    if t.cap == 0 {
+        return false;
+    }
+
+    const mask: u64 = t.cap - 1;
+    var i: u64 = tokenizer_hash_bytes(key.ptr as &const byte, 0, key.len) & mask;
+    while t.entries[i as usize].used {
+        if tokenizer_bytes_equal(&t.entries[i as usize].key, key.ptr as &const byte, 0, key.len) {
+            t.entries[i as usize].value = value;
+            return true;
+        }
+        i = (i + 1) & mask;
+    }
+
+    t.entries[i as usize].used = true;
+    t.entries[i as usize].key = TokenizerString{ ptr: key.ptr, len: key.len };
+    t.entries[i as usize].value = value;
+    t.used = t.used + 1;
+    return true;
+}
+
+fn tokenizer_table_get(t: &TokenizerTable, ptr: &const byte, offset: u64, len: u64, value: &i32) bool {
+    if t.cap == 0 {
+        return false;
+    }
+
+    const mask: u64 = t.cap - 1;
+    var i: u64 = tokenizer_hash_bytes(ptr, offset, len) & mask;
+    while t.entries[i as usize].used {
+        if tokenizer_bytes_equal(&t.entries[i as usize].key, ptr, offset, len) {
+            *value = t.entries[i as usize].value;
+            return true;
+        }
+        i = (i + 1) & mask;
+    }
+    return false;
+}
+
+fn tokenizer_owned_copy(ptr: &const byte, offset: u64, len: u64) TokenizerString {
+    const alloc_len: usize = (len + 1) as usize;
+    const out: &byte = malloc(alloc_len) as &byte;
+    if out == null {
+        return tokenizer_string_empty();
+    }
+    var i: u64 = 0;
+    while i < len {
+        out[i as usize] = ptr[(offset + i) as usize];
+        i = i + 1;
+    }
+    tokenizer_byte_set(out, alloc_len, len as usize, 0 as byte);
+    return TokenizerString{ ptr: out, len: len };
+}
+
+fn tokenizer_byte_buffer_reserve(buf: &TokenizerByteBuffer, needed: u64) bool {
+    if buf.cap > needed {
+        return true;
+    }
+
+    var new_cap: u64 = buf.cap;
+    if new_cap == 0 {
+        new_cap = 64;
+    }
+    while new_cap <= needed {
+        new_cap = new_cap * 2;
+    }
+
+    var np: &void = null;
+    if buf.data == null {
+        np = malloc(new_cap as usize);
+    } else {
+        np = realloc(buf.data as &void, new_cap as usize);
+    }
+    if np == null {
+        return false;
+    }
+    buf.data = np as &byte;
+    buf.cap = new_cap;
+    return true;
+}
+
+fn tokenizer_byte_buffer_push(buf: &TokenizerByteBuffer, b: byte) bool {
+    if !tokenizer_byte_buffer_reserve(buf, buf.len + 1) {
+        return false;
+    }
+    buf.data[buf.len as usize] = b;
+    buf.len = buf.len + 1;
+    buf.data[buf.len as usize] = 0;
+    return true;
+}
+
+export fn tokenizer_byte_buffer_deinit(buf: &TokenizerByteBuffer) void {
+    if buf.data != null {
+        free(buf.data as &void);
+    }
+    *buf = tokenizer_byte_buffer_init();
+}
+
+export fn tokenizer_token_vec_push(vec: &TokenizerTokenVec, token: i32) bool {
+    if vec.len >= vec.cap {
+        var new_cap: u64 = vec.cap;
+        if new_cap == 0 {
+            new_cap = 16;
+        } else {
+            new_cap = new_cap * 2;
+        }
+        const bytes: usize = (new_cap as usize) * (@size_of(i32) as usize);
+        var np: &void = null;
+        if vec.data == null {
+            np = malloc(bytes);
+        } else {
+            np = realloc(vec.data as &void, bytes);
+        }
+        if np == null {
+            return false;
+        }
+        vec.data = np as &i32;
+        vec.cap = new_cap;
+    }
+    vec.data[vec.len as usize] = token;
+    vec.len = vec.len + 1;
+    return true;
+}
+
+export fn tokenizer_token_vec_deinit(vec: &TokenizerTokenVec) void {
+    if vec.data != null {
+        free(vec.data as &void);
+    }
+    *vec = tokenizer_token_vec_init();
+}
+
+export fn tokenizer_vocab_deinit(vocab: &TokenizerVocab) void {
+    var i: u64 = 0;
+    while i < vocab.token_count {
+        if vocab.tokens != null && vocab.tokens[i as usize].ptr != null {
+            free(vocab.tokens[i as usize].ptr as &void);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < vocab.merge_count {
+        if vocab.merges != null && vocab.merges[i as usize].ptr != null {
+            free(vocab.merges[i as usize].ptr as &void);
+        }
+        i = i + 1;
+    }
+    if vocab.tokens != null {
+        free(vocab.tokens as &void);
+    }
+    if vocab.token_types != null {
+        free(vocab.token_types as &void);
+    }
+    if vocab.merges != null {
+        free(vocab.merges as &void);
+    }
+    tokenizer_table_deinit(&vocab.token_to_id);
+    tokenizer_table_deinit(&vocab.merge_rank);
+    *vocab = tokenizer_vocab_init();
+}
+
+export fn tokenizer_vocab_init_manual(vocab: &TokenizerVocab, token_count: u64, merge_count: u64) bool {
+    tokenizer_vocab_deinit(vocab);
+    vocab.token_count = token_count;
+    vocab.merge_count = merge_count;
+
+    if token_count > 0 {
+        vocab.tokens = malloc((token_count as usize) * (@size_of(TokenizerString) as usize)) as &TokenizerString;
+        vocab.token_types = malloc((token_count as usize) * (@size_of(i32) as usize)) as &i32;
+        if vocab.tokens == null || vocab.token_types == null {
+            tokenizer_vocab_deinit(vocab);
+            return false;
+        }
+        var i: u64 = 0;
+        while i < token_count {
+            vocab.tokens[i as usize] = tokenizer_string_empty();
+            vocab.token_types[i as usize] = TOKENIZER_NORMAL;
+            i = i + 1;
+        }
+    }
+
+    if merge_count > 0 {
+        vocab.merges = malloc((merge_count as usize) * (@size_of(TokenizerString) as usize)) as &TokenizerString;
+        if vocab.merges == null {
+            tokenizer_vocab_deinit(vocab);
+            return false;
+        }
+        var m: u64 = 0;
+        while m < merge_count {
+            vocab.merges[m as usize] = tokenizer_string_empty();
+            m = m + 1;
+        }
+    }
+
+    if !tokenizer_table_init(&vocab.token_to_id, token_count) || !tokenizer_table_init(&vocab.merge_rank, merge_count) {
+        tokenizer_vocab_deinit(vocab);
+        return false;
+    }
+    return true;
+}
+
+export fn tokenizer_vocab_set_token(vocab: &TokenizerVocab, token_id: u64, text: &const byte, token_type: i32) bool {
+    if token_id >= vocab.token_count || vocab.tokens == null {
+        return false;
+    }
+    const len: u64 = strlen(text as *const byte) as u64;
+    const s: TokenizerString = tokenizer_owned_copy(text, 0, len);
+    if s.ptr == null && len != 0 {
+        return false;
+    }
+    if vocab.tokens[token_id as usize].ptr != null {
+        free(vocab.tokens[token_id as usize].ptr as &void);
+    }
+    vocab.tokens[token_id as usize] = s;
+    if vocab.token_types != null {
+        vocab.token_types[token_id as usize] = token_type;
+    }
+    return tokenizer_table_put(&vocab.token_to_id, &vocab.tokens[token_id as usize], token_id as i32);
+}
+
+export fn tokenizer_vocab_set_merge(vocab: &TokenizerVocab, merge_index: u64, text: &const byte) bool {
+    if merge_index >= vocab.merge_count || vocab.merges == null {
+        return false;
+    }
+    const len: u64 = strlen(text as *const byte) as u64;
+    const s: TokenizerString = tokenizer_owned_copy(text, 0, len);
+    if s.ptr == null && len != 0 {
+        return false;
+    }
+    if vocab.merges[merge_index as usize].ptr != null {
+        free(vocab.merges[merge_index as usize].ptr as &void);
+    }
+    vocab.merges[merge_index as usize] = s;
+    return tokenizer_table_put(&vocab.merge_rank, &vocab.merges[merge_index as usize], merge_index as i32);
+}
+
+fn tokenizer_load_token_types(path: &const byte, file_size: u64, offset: u64, count: u64, out: &i32) bool {
+    if count == 0 {
+        return true;
+    }
+    if offset > file_size {
+        return false;
+    }
+    const fp: &FILE = fopen(path, "rb\0" as &const byte);
+    if fp == null {
+        return false;
+    }
+    if fseek(fp, offset as i64, TOKENIZER_SEEK_SET) < 0 {
+        _ = fclose(fp);
+        return false;
+    }
+
+    var r: TokenReader = TokenReader{ fp: fp, size: file_size, pos: offset };
+    var i: u64 = 0;
+    while i < count {
+        var raw: u32 = 0;
+        if !tokenizer_read_u32(&r, &raw) {
+            _ = fclose(fp);
+            return false;
+        }
+        out[i as usize] = raw as i32;
+        i = i + 1;
+    }
+    _ = fclose(fp);
+    return true;
+}
+
+export fn tokenizer_vocab_load_from_offsets(
+    path: &const byte,
+    file_size: u64,
+    tokens_offset: u64,
+    token_count: u64,
+    token_types_offset: u64,
+    has_token_types: bool,
+    merges_offset: u64,
+    merge_count: u64,
+    vocab: &TokenizerVocab,
+) i32 {
+    if !tokenizer_vocab_init_manual(vocab, token_count, merge_count) {
+        return 2;
+    }
+
+    const fp: &FILE = fopen(path, "rb\0" as &const byte);
+    if fp == null {
+        tokenizer_vocab_deinit(vocab);
+        return 2;
+    }
+    if fseek(fp, tokens_offset as i64, TOKENIZER_SEEK_SET) < 0 {
+        _ = fclose(fp);
+        tokenizer_vocab_deinit(vocab);
+        return 2;
+    }
+    var r: TokenReader = TokenReader{ fp: fp, size: file_size, pos: tokens_offset };
+    var i: u64 = 0;
+    while i < token_count {
+        if !tokenizer_read_owned_string(&r, &vocab.tokens[i as usize]) {
+            _ = fclose(fp);
+            tokenizer_vocab_deinit(vocab);
+            return 3;
+        }
+        _ = tokenizer_table_put(&vocab.token_to_id, &vocab.tokens[i as usize], i as i32);
+        i = i + 1;
+    }
+    _ = fclose(fp);
+
+    if has_token_types && vocab.token_types != null {
+        if !tokenizer_load_token_types(path, file_size, token_types_offset, token_count, vocab.token_types) {
+            tokenizer_vocab_deinit(vocab);
+            return 3;
+        }
+    }
+
+    const mfp: &FILE = fopen(path, "rb\0" as &const byte);
+    if mfp == null {
+        tokenizer_vocab_deinit(vocab);
+        return 2;
+    }
+    if fseek(mfp, merges_offset as i64, TOKENIZER_SEEK_SET) < 0 {
+        _ = fclose(mfp);
+        tokenizer_vocab_deinit(vocab);
+        return 2;
+    }
+    r = TokenReader{ fp: mfp, size: file_size, pos: merges_offset };
+    var m: u64 = 0;
+    while m < merge_count {
+        if !tokenizer_read_owned_string(&r, &vocab.merges[m as usize]) {
+            _ = fclose(mfp);
+            tokenizer_vocab_deinit(vocab);
+            return 3;
+        }
+        _ = tokenizer_table_put(&vocab.merge_rank, &vocab.merges[m as usize], m as i32);
+        m = m + 1;
+    }
+    _ = fclose(mfp);
+    return 0;
+}
+
+export fn tokenizer_vocab_load_from_gguf(path: &const byte, vocab: &TokenizerVocab) i32 {
+    tokenizer_vocab_deinit(vocab);
+
+    var info: GgufInfo = gguf_info_init();
+    const load_rc: i32 = load_gguf(path, &info);
+    if load_rc != 0 && load_rc != 6 {
+        gguf_info_deinit(&info);
+        return load_rc;
+    }
+    if !info.has_tokenizer_tokens || !info.has_tokenizer_merges {
+        gguf_info_deinit(&info);
+        return 8;
+    }
+
+    const rc: i32 = tokenizer_vocab_load_from_offsets(
+        path,
+        info.file_size,
+        info.tokenizer_tokens_offset,
+        info.tokenizer_tokens_count,
+        info.tokenizer_token_types_offset,
+        info.has_tokenizer_token_types,
+        info.tokenizer_merges_offset,
+        info.tokenizer_merges_count,
+        vocab,
+    );
+    if rc != 0 {
+        gguf_info_deinit(&info);
+        return rc;
+    }
+
+    vocab.bos_id = -1;
+    vocab.eos_id = -1;
+    vocab.unk_id = -1;
+    vocab.pad_id = -1;
+    if info.has_bos_token_id {
+        vocab.bos_id = info.bos_token_id as i32;
+    }
+    if info.has_eos_token_id {
+        vocab.eos_id = info.eos_token_id as i32;
+    }
+    if info.has_unk_token_id {
+        vocab.unk_id = info.unk_token_id as i32;
+    }
+    if info.has_padding_token_id {
+        vocab.pad_id = info.padding_token_id as i32;
+    }
+    vocab.add_bos = info.has_add_bos_token && info.add_bos_token;
+    vocab.add_eos = info.has_add_eos_token && info.add_eos_token;
+
+    gguf_info_deinit(&info);
+    return 0;
 }
 
 export fn tokenizer_piece_from_tokens_offset(
@@ -171,6 +744,605 @@ export fn tokenizer_piece_for_id(path: &const byte, token_id: u64, out: &GgufStr
     return rc;
 }
 
+fn tokenizer_utf8_put(out: &byte, pos: &u64, cp: u32) void {
+    if cp <= 0x7f {
+        out[*pos as usize] = cp as byte;
+        *pos = *pos + 1;
+    } else if cp <= 0x7ff {
+        out[*pos as usize] = (0xc0u32 | (cp >> 6)) as byte;
+        *pos = *pos + 1;
+        out[*pos as usize] = (0x80u32 | (cp & 0x3fu32)) as byte;
+        *pos = *pos + 1;
+    } else if cp <= 0xffff {
+        out[*pos as usize] = (0xe0u32 | (cp >> 12)) as byte;
+        *pos = *pos + 1;
+        out[*pos as usize] = (0x80u32 | ((cp >> 6) & 0x3fu32)) as byte;
+        *pos = *pos + 1;
+        out[*pos as usize] = (0x80u32 | (cp & 0x3fu32)) as byte;
+        *pos = *pos + 1;
+    } else {
+        out[*pos as usize] = (0xf0u32 | (cp >> 18)) as byte;
+        *pos = *pos + 1;
+        out[*pos as usize] = (0x80u32 | ((cp >> 12) & 0x3fu32)) as byte;
+        *pos = *pos + 1;
+        out[*pos as usize] = (0x80u32 | ((cp >> 6) & 0x3fu32)) as byte;
+        *pos = *pos + 1;
+        out[*pos as usize] = (0x80u32 | (cp & 0x3fu32)) as byte;
+        *pos = *pos + 1;
+    }
+}
+
+fn tokenizer_gpt2_byte_to_codepoint(b: byte) u32 {
+    if (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174 {
+        return b as u32;
+    }
+
+    var n: u32 = 0;
+    var x: u32 = 0;
+    while x < 256 {
+        if (x >= 33 && x <= 126) || (x >= 161 && x <= 172) || x >= 174 {
+        } else {
+            if x == b as u32 {
+                return 256 + n;
+            }
+            n = n + 1;
+        }
+        x = x + 1;
+    }
+    return b as u32;
+}
+
+fn tokenizer_gpt2_codepoint_to_byte(cp: u32) i32 {
+    if (cp >= 33 && cp <= 126) || (cp >= 161 && cp <= 172) || (cp >= 174 && cp <= 255) {
+        return cp as i32;
+    }
+
+    var n: u32 = 0;
+    var b: u32 = 0;
+    while b < 256 {
+        if (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174 {
+        } else {
+            if cp == 256 + n {
+                return b as i32;
+            }
+            n = n + 1;
+        }
+        b = b + 1;
+    }
+    return -1;
+}
+
+fn tokenizer_byte_encode(ptr: &const byte, offset: u64, len: u64) TokenizerString {
+    const alloc_len: usize = (len * 4 + 1) as usize;
+    const out: &byte = malloc(alloc_len) as &byte;
+    if out == null {
+        return tokenizer_string_empty();
+    }
+
+    var out_pos: u64 = 0;
+    var i: u64 = 0;
+    while i < len {
+        tokenizer_utf8_put(out, &out_pos, tokenizer_gpt2_byte_to_codepoint(ptr[(offset + i) as usize]));
+        i = i + 1;
+    }
+    tokenizer_byte_set(out, alloc_len, out_pos as usize, 0 as byte);
+    return TokenizerString{ ptr: out, len: out_pos };
+}
+
+fn tokenizer_utf8_len_from_first_byte(c: byte) i32 {
+    if c < 0x80 {
+        return 1;
+    }
+    const x: u32 = c as u32;
+    if (x & 0xe0u32) == 0xc0u32 {
+        return 2;
+    }
+    if (x & 0xf0u32) == 0xe0u32 {
+        return 3;
+    }
+    if (x & 0xf8u32) == 0xf0u32 {
+        return 4;
+    }
+    return 1;
+}
+
+fn tokenizer_bpe_rank(vocab: &TokenizerVocab, a: &TokenizerString, b: &TokenizerString) i32 {
+    const len: u64 = a.len + 1 + b.len;
+    const alloc_len: usize = (len + 1) as usize;
+    const key: &byte = malloc(alloc_len) as &byte;
+    if key == null {
+        return -1;
+    }
+
+    var i: u64 = 0;
+    while i < a.len {
+        key[i as usize] = a.ptr[i as usize];
+        i = i + 1;
+    }
+    tokenizer_byte_set(key, alloc_len, a.len as usize, 32 as byte);
+    i = 0;
+    while i < b.len {
+        tokenizer_byte_set(key, alloc_len, (a.len + 1 + i) as usize, b.ptr[i as usize]);
+        i = i + 1;
+    }
+    tokenizer_byte_set(key, alloc_len, len as usize, 0 as byte);
+
+    var rank: i32 = -1;
+    _ = tokenizer_table_get(&vocab.merge_rank, key as &const byte, 0, len, &rank);
+    free(key as &void);
+    return rank;
+}
+
+fn tokenizer_bpe_emit_piece(vocab: &TokenizerVocab, ptr: &const byte, offset: u64, len: u64, out: &TokenizerTokenVec) bool {
+    const encoded: TokenizerString = tokenizer_byte_encode(ptr, offset, len);
+    if encoded.ptr == null && len != 0 {
+        return false;
+    }
+
+    var cap_sym: u64 = 32;
+    if encoded.len > cap_sym {
+        cap_sym = encoded.len;
+    }
+    var sym: &TokenizerString = malloc((cap_sym as usize) * (@size_of(TokenizerString) as usize)) as &TokenizerString;
+    if sym == null {
+        if encoded.ptr != null {
+            free(encoded.ptr as &void);
+        }
+        return false;
+    }
+
+    var n_sym: u64 = 0;
+    var off: u64 = 0;
+    while off < encoded.len {
+        var n: i32 = tokenizer_utf8_len_from_first_byte(encoded.ptr[off as usize]);
+        if off + (n as u64) > encoded.len {
+            n = 1;
+        }
+        sym[n_sym as usize] = tokenizer_owned_copy(encoded.ptr as &const byte, off, n as u64);
+        if sym[n_sym as usize].ptr == null && n != 0 {
+            free(sym as &void);
+            free(encoded.ptr as &void);
+            return false;
+        }
+        n_sym = n_sym + 1;
+        off = off + (n as u64);
+    }
+
+    var merging: bool = true;
+    while merging {
+        var best_i: i64 = -1;
+        var best_rank: i32 = 2147483647;
+        var i: u64 = 0;
+        while i + 1 < n_sym {
+            const rank: i32 = tokenizer_bpe_rank(vocab, &sym[i as usize], &sym[(i + 1) as usize]);
+            if rank >= 0 && rank < best_rank {
+                best_rank = rank;
+                best_i = i as i64;
+            }
+            i = i + 1;
+        }
+
+        if best_i < 0 {
+            merging = false;
+        } else {
+            const bi: u64 = best_i as u64;
+            const merged_len: u64 = sym[bi as usize].len + sym[(bi + 1) as usize].len;
+            const alloc_len: usize = (merged_len + 1) as usize;
+            const merged_ptr: &byte = malloc(alloc_len) as &byte;
+            if merged_ptr == null {
+                free(sym as &void);
+                free(encoded.ptr as &void);
+                return false;
+            }
+            var j: u64 = 0;
+            while j < sym[bi as usize].len {
+                merged_ptr[j as usize] = sym[bi as usize].ptr[j as usize];
+                j = j + 1;
+            }
+            j = 0;
+            while j < sym[(bi + 1) as usize].len {
+                tokenizer_byte_set(
+                    merged_ptr,
+                    alloc_len,
+                    (sym[bi as usize].len + j) as usize,
+                    sym[(bi + 1) as usize].ptr[j as usize],
+                );
+                j = j + 1;
+            }
+            tokenizer_byte_set(merged_ptr, alloc_len, merged_len as usize, 0 as byte);
+            free(sym[bi as usize].ptr as &void);
+            free(sym[(bi + 1) as usize].ptr as &void);
+            sym[bi as usize] = TokenizerString{ ptr: merged_ptr, len: merged_len };
+
+            j = bi + 1;
+            while j + 1 < n_sym {
+                sym[j as usize] = sym[(j + 1) as usize];
+                j = j + 1;
+            }
+            n_sym = n_sym - 1;
+        }
+    }
+
+    var ok: bool = true;
+    var si: u64 = 0;
+    while si < n_sym {
+        var token: i32 = -1;
+        if tokenizer_table_get(&vocab.token_to_id, sym[si as usize].ptr as &const byte, 0, sym[si as usize].len, &token) {
+            if !tokenizer_token_vec_push(out, token) {
+                ok = false;
+            }
+        } else {
+            var j: u64 = 0;
+            while j < sym[si as usize].len {
+                if tokenizer_table_get(&vocab.token_to_id, sym[si as usize].ptr as &const byte, j, 1, &token) {
+                    if !tokenizer_token_vec_push(out, token) {
+                        ok = false;
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        free(sym[si as usize].ptr as &void);
+        si = si + 1;
+    }
+
+    free(sym as &void);
+    if encoded.ptr != null {
+        free(encoded.ptr as &void);
+    }
+    return ok;
+}
+
+fn tokenizer_next_utf8_char(text: &const byte, end: u64, pos: u64) u64 {
+    var n: i32 = tokenizer_utf8_len_from_first_byte(text[pos as usize]);
+    if pos + (n as u64) > end {
+        n = 1;
+    }
+    return pos + (n as u64);
+}
+
+fn tokenizer_ascii_alpha(c: byte) bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+fn tokenizer_ascii_digit(c: byte) bool {
+    return c >= 48 && c <= 57;
+}
+
+fn tokenizer_ascii_space(c: byte) bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+}
+
+fn tokenizer_ascii_newline(c: byte) bool {
+    return c == 10 || c == 13;
+}
+
+fn tokenizer_joyai_ascii_punct_symbol(c: byte) bool {
+    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+}
+
+fn tokenizer_utf8_peek_one(s: &const byte, end: u64, pos: u64, next: &u64) u32 {
+    const c0: byte = s[pos as usize];
+    const x0: u32 = c0 as u32;
+    var n: i32 = tokenizer_utf8_len_from_first_byte(c0);
+    if pos + (n as u64) > end {
+        n = 1;
+    }
+    *next = pos + (n as u64);
+
+    if n == 1 {
+        return c0 as u32;
+    }
+    if n == 2 {
+        const x1: u32 = s[(pos + 1) as usize] as u32;
+        return ((x0 & 0x1fu32) << 6) | (x1 & 0x3fu32);
+    }
+    if n == 3 {
+        const x1: u32 = s[(pos + 1) as usize] as u32;
+        const x2: u32 = s[(pos + 2) as usize] as u32;
+        return ((x0 & 0x0fu32) << 12) |
+            ((x1 & 0x3fu32) << 6) |
+            (x2 & 0x3fu32);
+    }
+    const x1: u32 = s[(pos + 1) as usize] as u32;
+    const x2: u32 = s[(pos + 2) as usize] as u32;
+    const x3: u32 = s[(pos + 3) as usize] as u32;
+    return ((x0 & 0x07u32) << 18) |
+        ((x1 & 0x3fu32) << 12) |
+        ((x2 & 0x3fu32) << 6) |
+        (x3 & 0x3fu32);
+}
+
+fn tokenizer_utf8_is_cjk_hira_kata(cp: u32) bool {
+    return (cp >= 0x4e00 && cp <= 0x9fa5) || (cp >= 0x3040 && cp <= 0x309f) || (cp >= 0x30a0 && cp <= 0x30ff);
+}
+
+fn tokenizer_joyai_letter_like_at(s: &const byte, end: u64, pos: u64) bool {
+    const c: byte = s[pos as usize];
+    if c < 128 {
+        return tokenizer_ascii_alpha(c);
+    }
+    return true;
+}
+
+fn tokenizer_joyai_consume_letters(s: &const byte, end: u64, pos: u64) u64 {
+    var p: u64 = pos;
+    while p < end && tokenizer_joyai_letter_like_at(s, end, p) {
+        p = tokenizer_next_utf8_char(s, end, p);
+    }
+    return p;
+}
+
+fn tokenizer_joyai_cjk_at(s: &const byte, end: u64, pos: u64) bool {
+    if s[pos as usize] < 128 {
+        return false;
+    }
+    var next: u64 = pos;
+    const cp: u32 = tokenizer_utf8_peek_one(s, end, pos, &next);
+    return tokenizer_utf8_is_cjk_hira_kata(cp);
+}
+
+fn tokenizer_bpe_tokenize_range(vocab: &TokenizerVocab, text: &const byte, start_pos: u64, end: u64, out: &TokenizerTokenVec) bool {
+    var pos: u64 = start_pos;
+    while pos < end {
+        const start: u64 = pos;
+        const c: byte = text[pos as usize];
+
+        if tokenizer_ascii_digit(c) {
+            var ndigits: i32 = 0;
+            while pos < end && tokenizer_ascii_digit(text[pos as usize]) && ndigits < 3 {
+                pos = pos + 1;
+                ndigits = ndigits + 1;
+            }
+        } else if tokenizer_joyai_cjk_at(text, end, pos) {
+            pos = tokenizer_next_utf8_char(text, end, pos);
+            while pos < end && tokenizer_joyai_cjk_at(text, end, pos) {
+                pos = tokenizer_next_utf8_char(text, end, pos);
+            }
+        } else if tokenizer_joyai_ascii_punct_symbol(c) && pos + 1 < end && tokenizer_ascii_alpha(text[(pos + 1) as usize]) {
+            pos = pos + 1;
+            while pos < end && tokenizer_ascii_alpha(text[pos as usize]) {
+                pos = pos + 1;
+            }
+        } else if tokenizer_joyai_letter_like_at(text, end, pos) {
+            pos = tokenizer_joyai_consume_letters(text, end, pos);
+        } else if !tokenizer_ascii_newline(c) && !tokenizer_joyai_ascii_punct_symbol(c) && pos + 1 < end && tokenizer_joyai_letter_like_at(text, end, pos + 1) {
+            pos = pos + 1;
+            pos = tokenizer_joyai_consume_letters(text, end, pos);
+        } else if c == 32 && pos + 1 < end && tokenizer_joyai_ascii_punct_symbol(text[(pos + 1) as usize]) {
+            pos = pos + 1;
+            while pos < end && tokenizer_joyai_ascii_punct_symbol(text[pos as usize]) {
+                pos = pos + 1;
+            }
+            while pos < end && tokenizer_ascii_newline(text[pos as usize]) {
+                pos = pos + 1;
+            }
+        } else if tokenizer_joyai_ascii_punct_symbol(c) {
+            while pos < end && tokenizer_joyai_ascii_punct_symbol(text[pos as usize]) {
+                pos = pos + 1;
+            }
+            while pos < end && tokenizer_ascii_newline(text[pos as usize]) {
+                pos = pos + 1;
+            }
+        } else if tokenizer_ascii_space(c) {
+            var p: u64 = pos;
+            var last_newline_end: u64 = 0;
+            while p < end && tokenizer_ascii_space(text[p as usize]) {
+                const sc: byte = text[p as usize];
+                p = p + 1;
+                if tokenizer_ascii_newline(sc) {
+                    last_newline_end = p;
+                }
+            }
+            if last_newline_end != 0 {
+                pos = last_newline_end;
+            } else if p < end && p > pos + 1 && (tokenizer_joyai_letter_like_at(text, end, p) || tokenizer_joyai_ascii_punct_symbol(text[p as usize])) {
+                pos = p - 1;
+            } else {
+                pos = p;
+            }
+        } else {
+            pos = tokenizer_next_utf8_char(text, end, pos);
+        }
+
+        if pos == start {
+            pos = tokenizer_next_utf8_char(text, end, pos);
+        }
+        if !tokenizer_bpe_emit_piece(vocab, text, start, pos - start, out) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn tokenizer_token_type_at(vocab: &TokenizerVocab, token_id: u64) i32 {
+    if vocab.token_types == null || token_id >= vocab.token_count {
+        return TOKENIZER_NORMAL;
+    }
+    return vocab.token_types[token_id as usize];
+}
+
+fn tokenizer_control_type(token_type: i32) bool {
+    return token_type == TOKENIZER_CONTROL || token_type == TOKENIZER_USER_DEFINED || token_type == TOKENIZER_UNKNOWN;
+}
+
+fn tokenizer_token_is_literal_special(s: &TokenizerString) bool {
+    var i: u64 = 0;
+    while i + 3 <= s.len {
+        if s.ptr[i as usize] == 0xef && s.ptr[(i + 1) as usize] == 0xbd && s.ptr[(i + 2) as usize] == 0x9c {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn tokenizer_is_special_id(vocab: &TokenizerVocab, token_id: u64) bool {
+    const id: i32 = token_id as i32;
+    if id == vocab.bos_id || id == vocab.eos_id || id == vocab.unk_id || id == vocab.pad_id {
+        return true;
+    }
+    if tokenizer_control_type(tokenizer_token_type_at(vocab, token_id)) {
+        return true;
+    }
+    return tokenizer_token_is_literal_special(&vocab.tokens[token_id as usize]);
+}
+
+fn tokenizer_special_token_at(vocab: &TokenizerVocab, text: &const byte, pos: u64, end: u64, token: &i32, token_len: &u64) bool {
+    var best_id: i32 = -1;
+    var best_len: u64 = 0;
+    var i: u64 = 0;
+    while i < vocab.token_count {
+        const s: &TokenizerString = &vocab.tokens[i as usize];
+        if s.len > best_len && s.len <= end - pos && s.len > 0 && tokenizer_is_special_id(vocab, i) {
+            if s.ptr[0] == text[pos as usize] && tokenizer_bytes_equal(s, text, pos, s.len) {
+                best_id = i as i32;
+                best_len = s.len;
+            }
+        }
+        i = i + 1;
+    }
+    if best_id >= 0 {
+        *token = best_id;
+        *token_len = best_len;
+        return true;
+    }
+    return false;
+}
+
+export fn tokenizer_encode_text(
+    vocab: &TokenizerVocab,
+    text: &const byte,
+    out: &TokenizerTokenVec,
+    allow_special: bool,
+    add_bos: bool,
+    add_eos: bool,
+) i32 {
+    if add_bos && vocab.bos_id >= 0 {
+        if !tokenizer_token_vec_push(out, vocab.bos_id) {
+            return 2;
+        }
+    }
+
+    const len: u64 = strlen(text as *const byte) as u64;
+    var span_start: u64 = 0;
+    var pos: u64 = 0;
+    while pos < len {
+        var special_id: i32 = -1;
+        var special_len: u64 = 0;
+        if allow_special && tokenizer_special_token_at(vocab, text, pos, len, &special_id, &special_len) {
+            if span_start < pos {
+                if !tokenizer_bpe_tokenize_range(vocab, text, span_start, pos, out) {
+                    return 3;
+                }
+            }
+            if !tokenizer_token_vec_push(out, special_id) {
+                return 2;
+            }
+            pos = pos + special_len;
+            span_start = pos;
+        } else {
+            pos = pos + 1;
+        }
+    }
+
+    if span_start < len {
+        if !tokenizer_bpe_tokenize_range(vocab, text, span_start, len, out) {
+            return 3;
+        }
+    }
+
+    if add_eos && vocab.eos_id >= 0 {
+        if !tokenizer_token_vec_push(out, vocab.eos_id) {
+            return 2;
+        }
+    }
+    return 0;
+}
+
+fn tokenizer_utf8_decode_string(s: &TokenizerString, pos: &u64) u32 {
+    const c: byte = s.ptr[*pos as usize];
+    const x0: u32 = c as u32;
+    if c < 0x80 || *pos + 1 >= s.len {
+        *pos = *pos + 1;
+        return c as u32;
+    }
+    if (x0 & 0xe0u32) == 0xc0u32 && *pos + 1 < s.len {
+        const x1: u32 = s.ptr[(*pos + 1) as usize] as u32;
+        const cp: u32 = ((x0 & 0x1fu32) << 6) | (x1 & 0x3fu32);
+        *pos = *pos + 2;
+        return cp;
+    }
+    if (x0 & 0xf0u32) == 0xe0u32 && *pos + 2 < s.len {
+        const x1: u32 = s.ptr[(*pos + 1) as usize] as u32;
+        const x2: u32 = s.ptr[(*pos + 2) as usize] as u32;
+        const cp: u32 = ((x0 & 0x0fu32) << 12) |
+            ((x1 & 0x3fu32) << 6) |
+            (x2 & 0x3fu32);
+        *pos = *pos + 3;
+        return cp;
+    }
+    if (x0 & 0xf8u32) == 0xf0u32 && *pos + 3 < s.len {
+        const x1: u32 = s.ptr[(*pos + 1) as usize] as u32;
+        const x2: u32 = s.ptr[(*pos + 2) as usize] as u32;
+        const x3: u32 = s.ptr[(*pos + 3) as usize] as u32;
+        const cp: u32 = ((x0 & 0x07u32) << 18) |
+            ((x1 & 0x3fu32) << 12) |
+            ((x2 & 0x3fu32) << 6) |
+            (x3 & 0x3fu32);
+        *pos = *pos + 4;
+        return cp;
+    }
+    *pos = *pos + 1;
+    return c as u32;
+}
+
+export fn tokenizer_decode_tokens(vocab: &TokenizerVocab, tokens: &TokenizerTokenVec, out: &TokenizerByteBuffer) i32 {
+    var i: u64 = 0;
+    while i < tokens.len {
+        const id: i32 = tokens.data[i as usize];
+        if id < 0 || id as u64 >= vocab.token_count {
+            return 7;
+        }
+        const s: &TokenizerString = &vocab.tokens[id as usize];
+        if tokenizer_token_is_literal_special(s) {
+            var j: u64 = 0;
+            while j < s.len {
+                if !tokenizer_byte_buffer_push(out, s.ptr[j as usize]) {
+                    return 2;
+                }
+                j = j + 1;
+            }
+        } else {
+            var pos: u64 = 0;
+            while pos < s.len {
+                const cp: u32 = tokenizer_utf8_decode_string(s, &pos);
+                const b: i32 = tokenizer_gpt2_codepoint_to_byte(cp);
+                if b >= 0 {
+                    if !tokenizer_byte_buffer_push(out, b as byte) {
+                        return 2;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn tokenizer_print_token_vec(tokens: &TokenizerTokenVec) void {
+    _ = printf("[");
+    var i: u64 = 0;
+    while i < tokens.len {
+        if i > 0 {
+            _ = printf(", ");
+        }
+        _ = printf("%d", tokens.data[i as usize]);
+        i = i + 1;
+    }
+    _ = printf("]\n");
+}
+
 export fn print_tokenizer_piece(path: &const byte, token_id: u64) i32 {
     var piece: GgufString = GgufString{ len: 0, shown: 0, data: [] };
     const rc: i32 = tokenizer_piece_for_id(path, token_id, &piece);
@@ -190,5 +1362,51 @@ export fn print_tokenizer_piece(path: &const byte, token_id: u64) i32 {
     } else {
         _ = printf("ds4-uya: cannot load tokenizer metadata, rc=%d\n", rc);
     }
+    return rc;
+}
+
+export fn print_tokenizer_encode_text(path: &const byte, text: &const byte) i32 {
+    var vocab: TokenizerVocab = tokenizer_vocab_init();
+    const load_rc: i32 = tokenizer_vocab_load_from_gguf(path, &vocab);
+    if load_rc != 0 {
+        _ = printf("ds4-uya: cannot load tokenizer vocab, rc=%d\n", load_rc);
+        tokenizer_vocab_deinit(&vocab);
+        return load_rc;
+    }
+
+    var tokens: TokenizerTokenVec = tokenizer_token_vec_init();
+    const rc: i32 = tokenizer_encode_text(&vocab, text, &tokens, true, vocab.add_bos, vocab.add_eos);
+    if rc == 0 {
+        tokenizer_print_token_vec(&tokens);
+    } else {
+        _ = printf("ds4-uya: encode failed, rc=%d\n", rc);
+    }
+    tokenizer_token_vec_deinit(&tokens);
+    tokenizer_vocab_deinit(&vocab);
+    return rc;
+}
+
+export fn print_tokenizer_decode_ids(path: &const byte, tokens: &TokenizerTokenVec) i32 {
+    var vocab: TokenizerVocab = tokenizer_vocab_init();
+    const load_rc: i32 = tokenizer_vocab_load_from_gguf(path, &vocab);
+    if load_rc != 0 {
+        _ = printf("ds4-uya: cannot load tokenizer vocab, rc=%d\n", load_rc);
+        tokenizer_vocab_deinit(&vocab);
+        return load_rc;
+    }
+
+    var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
+    const rc: i32 = tokenizer_decode_tokens(&vocab, tokens, &out);
+    if rc == 0 {
+        if out.data == null {
+            _ = printf("\n");
+        } else {
+            _ = printf("%s\n", &out.data[0]);
+        }
+    } else {
+        _ = printf("ds4-uya: decode failed, rc=%d\n", rc);
+    }
+    tokenizer_byte_buffer_deinit(&out);
+    tokenizer_vocab_deinit(&vocab);
     return rc;
 }

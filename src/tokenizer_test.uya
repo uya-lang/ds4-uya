@@ -1,5 +1,19 @@
 use ds4.gguf.GgufString;
+use ds4.tokenizer.TokenizerByteBuffer;
+use ds4.tokenizer.TokenizerTokenVec;
+use ds4.tokenizer.TokenizerVocab;
+use ds4.tokenizer.tokenizer_byte_buffer_deinit;
+use ds4.tokenizer.tokenizer_byte_buffer_init;
+use ds4.tokenizer.tokenizer_decode_tokens;
+use ds4.tokenizer.tokenizer_encode_text;
 use ds4.tokenizer.tokenizer_piece_from_tokens_offset;
+use ds4.tokenizer.tokenizer_token_vec_deinit;
+use ds4.tokenizer.tokenizer_token_vec_init;
+use ds4.tokenizer.tokenizer_vocab_deinit;
+use ds4.tokenizer.tokenizer_vocab_init;
+use ds4.tokenizer.tokenizer_vocab_init_manual;
+use ds4.tokenizer.tokenizer_vocab_set_merge;
+use ds4.tokenizer.tokenizer_vocab_set_token;
 use libc.FILE;
 use libc.fclose;
 use libc.fopen;
@@ -59,4 +73,65 @@ test "tokenizer_piece_from_tokens_offset" {
     const out_of_range: i32 = tokenizer_piece_from_tokens_offset(path, 32, 0, 3, 3, &piece);
     try assert_eq_i32(out_of_range, 7);
     _ = remove(path);
+}
+
+test "tokenizer_encode_decode_roundtrip_with_control" {
+    var vocab: TokenizerVocab = tokenizer_vocab_init();
+    try assert_eq_i32(tokenizer_vocab_init_manual(&vocab, 6, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 0, "b\0" as &const byte, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 1, "c\0" as &const byte, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 2, "bc\0" as &const byte, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 3, "a\0" as &const byte, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 4, "x\0" as &const byte, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 5, "<think>\0" as &const byte, 3) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_merge(&vocab, 0, "b c\0" as &const byte) as i32, 1);
+
+    var tokens: TokenizerTokenVec = tokenizer_token_vec_init();
+    const encode_rc: i32 = tokenizer_encode_text(&vocab, "a<think>bc\0" as &const byte, &tokens, true, false, false);
+    try assert_eq_i32(encode_rc, 0);
+    try assert_eq_i32(tokens.len as i32, 3);
+    try assert_eq_i32(tokens.data[0], 3);
+    try assert_eq_i32(tokens.data[1], 5);
+    try assert_eq_i32(tokens.data[2], 2);
+
+    var decoded: TokenizerByteBuffer = tokenizer_byte_buffer_init();
+    const decode_rc: i32 = tokenizer_decode_tokens(&vocab, &tokens, &decoded);
+    try assert_eq_i32(decode_rc, 0);
+    try assert_eq_i32(decoded.len as i32, 10);
+    try assert_eq_i32(decoded.data[0] as i32, 97);
+    try assert_eq_i32(decoded.data[1] as i32, 60);
+    try assert_eq_i32(decoded.data[7] as i32, 62);
+    try assert_eq_i32(decoded.data[8] as i32, 98);
+    try assert_eq_i32(decoded.data[9] as i32, 99);
+
+    tokenizer_byte_buffer_deinit(&decoded);
+    tokenizer_token_vec_deinit(&tokens);
+    tokenizer_vocab_deinit(&vocab);
+}
+
+test "tokenizer_adds_bos_eos_and_unknown_special" {
+    var vocab: TokenizerVocab = tokenizer_vocab_init();
+    try assert_eq_i32(tokenizer_vocab_init_manual(&vocab, 6, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 0, "b\0" as &const byte, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 1, "c\0" as &const byte, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 2, "bc\0" as &const byte, 1) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 3, "<unk>\0" as &const byte, 2) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 4, "<bos>\0" as &const byte, 3) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_token(&vocab, 5, "<eos>\0" as &const byte, 3) as i32, 1);
+    try assert_eq_i32(tokenizer_vocab_set_merge(&vocab, 0, "b c\0" as &const byte) as i32, 1);
+    vocab.bos_id = 4;
+    vocab.eos_id = 5;
+    vocab.unk_id = 3;
+
+    var tokens: TokenizerTokenVec = tokenizer_token_vec_init();
+    const encode_rc: i32 = tokenizer_encode_text(&vocab, "<unk>bc\0" as &const byte, &tokens, true, true, true);
+    try assert_eq_i32(encode_rc, 0);
+    try assert_eq_i32(tokens.len as i32, 4);
+    try assert_eq_i32(tokens.data[0], 4);
+    try assert_eq_i32(tokens.data[1], 3);
+    try assert_eq_i32(tokens.data[2], 2);
+    try assert_eq_i32(tokens.data[3], 5);
+
+    tokenizer_token_vec_deinit(&tokens);
+    tokenizer_vocab_deinit(&vocab);
 }

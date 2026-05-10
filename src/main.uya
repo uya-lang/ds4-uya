@@ -1,6 +1,12 @@
 use ds4.gguf.inspect_gguf;
 use ds4.gguf.print_gguf_tensor;
+use ds4.tokenizer.TokenizerTokenVec;
+use ds4.tokenizer.print_tokenizer_decode_ids;
+use ds4.tokenizer.print_tokenizer_encode_text;
 use ds4.tokenizer.print_tokenizer_piece;
+use ds4.tokenizer.tokenizer_token_vec_deinit;
+use ds4.tokenizer.tokenizer_token_vec_init;
+use ds4.tokenizer.tokenizer_token_vec_push;
 use libc.atoi;
 use libc.printf;
 use libc.strcmp;
@@ -13,10 +19,12 @@ fn print_help() void {
     _ = printf("  ds4-uya inspect <model.gguf>\n");
     _ = printf("  ds4-uya tensor <model.gguf> <tensor-name>\n");
     _ = printf("  ds4-uya piece <model.gguf> <token-id>\n");
+    _ = printf("  ds4-uya encode <model.gguf> <text>\n");
+    _ = printf("  ds4-uya decode <model.gguf> <token-id>...\n");
     _ = printf("\n");
     _ = printf("status:\n");
-    _ = printf("  implemented: GGUF loader, inspection, token lookup\n");
-    _ = printf("  planned: tokenizer, CPU tensors, quant kernels, generation\n");
+    _ = printf("  implemented: GGUF loader, inspection, tokenizer encode/decode\n");
+    _ = printf("  planned: CPU tensors, quant kernels, generation\n");
 }
 
 export extern fn main(argc: i32, argv: & &byte) i32 {
@@ -62,6 +70,40 @@ export extern fn main(argc: i32, argv: & &byte) i32 {
             return 1;
         }
         return print_tokenizer_piece(argv[2] as &const byte, token_id_i32 as u64);
+    }
+
+    if strcmp(cmd as *const byte, "encode\0" as *const byte) == 0 {
+        if argc < 4 {
+            _ = printf("ds4-uya: encode requires a GGUF file path and text\n");
+            return 1;
+        }
+        return print_tokenizer_encode_text(argv[2] as &const byte, argv[3] as &const byte);
+    }
+
+    if strcmp(cmd as *const byte, "decode\0" as *const byte) == 0 {
+        if argc < 4 {
+            _ = printf("ds4-uya: decode requires a GGUF file path and at least one token id\n");
+            return 1;
+        }
+        var tokens: TokenizerTokenVec = tokenizer_token_vec_init();
+        var i: i32 = 3;
+        while i < argc {
+            const token_id: i32 = atoi(argv[i] as &const byte);
+            if token_id < 0 {
+                _ = printf("ds4-uya: token id must be non-negative\n");
+                tokenizer_token_vec_deinit(&tokens);
+                return 1;
+            }
+            if !tokenizer_token_vec_push(&tokens, token_id) {
+                _ = printf("ds4-uya: out of memory while collecting token ids\n");
+                tokenizer_token_vec_deinit(&tokens);
+                return 2;
+            }
+            i = i + 1;
+        }
+        const rc: i32 = print_tokenizer_decode_ids(argv[2] as &const byte, &tokens);
+        tokenizer_token_vec_deinit(&tokens);
+        return rc;
     }
 
     _ = printf("ds4-uya: unknown command: %s\n", cmd);

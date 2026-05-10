@@ -33,6 +33,8 @@ build/ds4-uya --help
 build/ds4-uya inspect /path/to/model.gguf
 build/ds4-uya tensor /path/to/model.gguf output_norm.weight
 build/ds4-uya piece /path/to/model.gguf 0
+build/ds4-uya encode /path/to/model.gguf "hello"
+build/ds4-uya decode /path/to/model.gguf 33310
 ```
 
 For the partial model currently present in the sibling `ds4` project:
@@ -46,6 +48,7 @@ build/ds4-uya inspect /home/winger/uya/ds4/gguf/DeepSeek-V4-Flash-Q4KExperts-F16
 - Pure Uya source only; no Metal, no C runtime reuse from the original DS4 code.
 - CPU target: Linux x86_64 first.
 - Implemented now: CLI plus GGUF loader, metadata/tensor-directory inspection,
-  tensor lookup, tensor offsets, tokenizer token lookup, and truncation
-  diagnostics.
-- Not implemented yet: tokenizer and token generation.
+  tensor lookup, tensor offsets, tokenizer metadata loading, token lookup,
+  GPT-2 byte-level BPE encode/decode, BOS/EOS/UNK/control token handling, and
+  truncation diagnostics.
+- Not implemented yet: CPU tensor runtime and token generation.

@@ -39,10 +39,10 @@
 
 - [x] 解析 GGUF tokenizer metadata。
 - [x] 实现 token id 到 piece。
-- [ ] 实现 encode。
-- [ ] 实现 decode。
-- [ ] 支持 BOS/EOS/UNK/control tokens。
-- [ ] 增加 roundtrip tests。
+- [x] 实现 encode。
+- [x] 实现 decode。
+- [x] 支持 BOS/EOS/UNK/control tokens。
+- [x] 增加 roundtrip tests。
 
 验收标准：
 
