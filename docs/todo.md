@@ -136,3 +136,29 @@
 - 测试会写入一个小型 GGUF 文件，并从文件 tensor offsets 加载权重。
 - `runtime_session_generate_to_buffer` 能基于 GGUF 权重生成可 decode 文本。
 - 不支持的 DS4 MoE/GQA/命名布局返回明确 unsupported-layout 错误，而不是静默假生成。
+
+## Phase 9: DS4 Flash Q2 完整支持
+
+当前 Phase 8 已经能跑 GGUF-backed dense decoder 子集，但还不是 DS4 Flash Q2
+生产模型的完整支持。完整支持还需要补齐以下内容：
+
+- [ ] 用完整 DS4 Flash Q2 GGUF 跑一次 schema audit，记录所有 metadata key、tensor name、shape、dtype、分片/对齐规则。
+- [ ] 解析 DS4 Flash Q2 必需超参：`feed_forward_length`、RoPE theta/scale、RMS eps、GQA key/value 维度、expert/router 相关参数。
+- [ ] 支持 GQA/MQA：允许 `n_head != n_head_kv`，KV cache、attention 读写和 head 映射按 kv heads 工作。
+- [ ] 支持 DS4 Flash 的 MoE forward：router logits、top-k expert 选择、shared expert、expert 权重绑定和 expert-major dispatch 真正接入模型层。
+- [ ] 支持 DS4 Flash 特有 compressor/indexer/HC tensor 命名和 forward 分支，缺失或未知 tensor 要给出具体诊断。
+- [ ] 实现 Q2 系列 matvec kernel：至少覆盖实际文件中出现的 `Q2_K`、`IQ2_XXS`、`IQ2_XS`、`IQ2_S` 等 dtype，并与 reference dot 对照。
+- [ ] 扩展现有 Q4/Q8/F16 路径，覆盖 experts、attention、shared/output 等不同 tensor 位置的混合 dtype。
+- [ ] 改造权重加载策略：大模型不能默认 `malloc` 读入所有 tensor，需要 mmap/按需加载/分块加载，并保持 tensor lifetime 清晰。
+- [ ] 支持真实 tokenizer chat template，把 `chat` 从裸 prompt REPL 升级为模型格式化对话输入。
+- [ ] 增加真实模型 smoke：`inspect`、`encode`、`generate`、`chat` 在 DS4 Flash Q2 GGUF 上不崩溃，并能产出非空文本。
+- [ ] 增加 golden 对照：同 prompt 与原 DS4 或可信参考实现对齐 logits top-k / token 序列，误差和可接受差异写入测试说明。
+- [ ] 增加性能验收：报告真实 DS4 Flash Q2 的 prompt/decode tokens/s、峰值内存、加载时间。
+
+验收标准：
+
+- `build/ds4-uya generate <ds4-flash-q2.gguf> "<prompt>"` 能加载完整模型并产出文本。
+- `build/ds4-uya chat <ds4-flash-q2.gguf>` 使用 chat template，多轮输入不会破坏 KV/cache 状态或内存。
+- DS4 Flash Q2 中出现的所有 tensor dtype 和结构分支都有实现或明确跳过理由。
+- 对 unsupported/缺 tensor/坏 shape/坏 dtype 的报错能定位到具体 layer 和 tensor name。
+- 真实模型 smoke、golden 对照、性能 benchmark 纳入 `make test` 或单独的 documented test target。
