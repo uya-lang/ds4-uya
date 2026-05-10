@@ -65,15 +65,15 @@
 
 ## Phase 4: reference kernels
 
-- [ ] F32 vector ops。
-- [ ] F16 load/convert。
-- [ ] RMSNorm。
-- [ ] RoPE。
-- [ ] Softmax。
-- [ ] Dense matvec。
-- [ ] Q8 dot。
-- [ ] Q4_K reference dot。
-- [ ] SwiGLU/SiLU。
+- [x] F32 vector ops。
+- [x] F16 load/convert。
+- [x] RMSNorm。
+- [x] RoPE。
+- [x] Softmax。
+- [x] Dense matvec。
+- [x] Q8 dot。
+- [x] Q4_K reference dot。
+- [x] SwiGLU/SiLU。
 
 验收标准：
 

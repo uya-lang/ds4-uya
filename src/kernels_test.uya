@@ -1,0 +1,179 @@
+use ds4.kernels.kernels_dense_matvec_f32;
+use ds4.kernels.kernels_f16_load;
+use ds4.kernels.kernels_f16_to_f32;
+use ds4.kernels.kernels_f32_add;
+use ds4.kernels.kernels_f32_copy;
+use ds4.kernels.kernels_f32_dot;
+use ds4.kernels.kernels_f32_fill;
+use ds4.kernels.kernels_f32_mul;
+use ds4.kernels.kernels_f32_to_f16;
+use ds4.kernels.kernels_q4_k_dot_f32;
+use ds4.kernels.kernels_q8_0_dot_f32;
+use ds4.kernels.kernels_rms_norm;
+use ds4.kernels.kernels_rope_f32;
+use ds4.kernels.kernels_silu;
+use ds4.kernels.kernels_softmax;
+use ds4.kernels.kernels_swiglu;
+use libc.fabsf;
+use std.testing.expect;
+
+fn assert_close(actual: f32, expected: f32, tol: f32) !void {
+    try expect(fabsf(actual - expected) <= tol);
+}
+
+test "f32 vector ops" {
+    var a: [f32: 4] = [];
+    var b: [f32: 4] = [];
+    var out: [f32: 4] = [];
+    a[0] = 1.0f32;
+    a[1] = 2.0f32;
+    a[2] = 3.0f32;
+    a[3] = 4.0f32;
+    b[0] = 4.0f32;
+    b[1] = -1.0f32;
+    b[2] = 0.5f32;
+    b[3] = 2.0f32;
+
+    kernels_f32_fill(&out[0], 4, 7.0f32);
+    try assert_close(out[2], 7.0f32, 0.00001f32);
+    kernels_f32_copy(&out[0], &a[0], 4);
+    try assert_close(out[3], 4.0f32, 0.00001f32);
+    kernels_f32_add(&out[0], &a[0], &b[0], 4);
+    try assert_close(out[0], 5.0f32, 0.00001f32);
+    try assert_close(out[1], 1.0f32, 0.00001f32);
+    kernels_f32_mul(&out[0], &a[0], &b[0], 4);
+    try assert_close(out[2], 1.5f32, 0.00001f32);
+    try assert_close(kernels_f32_dot(&a[0], &b[0], 4), 11.5f32, 0.00001f32);
+}
+
+test "f16 load and convert" {
+    try assert_close(kernels_f16_to_f32(0x3c00 as u16), 1.0f32, 0.00001f32);
+    try assert_close(kernels_f16_to_f32(0xc000 as u16), -2.0f32, 0.00001f32);
+    try assert_close(kernels_f16_to_f32(0x0000 as u16), 0.0f32, 0.00001f32);
+    try expect(kernels_f32_to_f16(1.0f32) == 0x3c00 as u16);
+    try expect(kernels_f32_to_f16(-2.0f32) == 0xc000 as u16);
+
+    var bytes: [byte: 4] = [];
+    bytes[0] = 0;
+    bytes[1] = 0x3c;
+    bytes[2] = 0;
+    bytes[3] = 0xc0;
+    try assert_close(kernels_f16_load(&bytes[0], 0), 1.0f32, 0.00001f32);
+    try assert_close(kernels_f16_load(&bytes[0], 1), -2.0f32, 0.00001f32);
+}
+
+test "rmsnorm" {
+    var x: [f32: 2] = [];
+    var w: [f32: 2] = [];
+    var out: [f32: 2] = [];
+    x[0] = 3.0f32;
+    x[1] = 4.0f32;
+    w[0] = 1.0f32;
+    w[1] = 2.0f32;
+
+    kernels_rms_norm(&out[0], &x[0], &w[0], 2, 0.0f32);
+    try assert_close(out[0], 0.848528f32, 0.00001f32);
+    try assert_close(out[1], 2.262741f32, 0.00001f32);
+}
+
+test "rope" {
+    var x: [f32: 4] = [];
+    var out: [f32: 4] = [];
+    x[0] = 1.0f32;
+    x[1] = 0.0f32;
+    x[2] = 0.5f32;
+    x[3] = -0.5f32;
+
+    kernels_rope_f32(&out[0], &x[0], 4, 0, 1.0f32, false);
+    try assert_close(out[0], 1.0f32, 0.00001f32);
+    try assert_close(out[3], -0.5f32, 0.00001f32);
+
+    kernels_rope_f32(&out[0], &x[0], 4, 1, 1.0f32, false);
+    try assert_close(out[0], 0.540302f32, 0.00001f32);
+    try assert_close(out[1], 0.841471f32, 0.00001f32);
+}
+
+test "softmax" {
+    var x: [f32: 3] = [];
+    var out: [f32: 3] = [];
+    x[0] = 1.0f32;
+    x[1] = 2.0f32;
+    x[2] = 3.0f32;
+
+    kernels_softmax(&out[0], &x[0], 3);
+    try assert_close(out[0], 0.090031f32, 0.00001f32);
+    try assert_close(out[1], 0.244728f32, 0.00001f32);
+    try assert_close(out[2], 0.665241f32, 0.00001f32);
+}
+
+test "dense matvec" {
+    var matrix: [f32: 6] = [];
+    var x: [f32: 3] = [];
+    var out: [f32: 2] = [];
+    matrix[0] = 1.0f32;
+    matrix[1] = 2.0f32;
+    matrix[2] = 3.0f32;
+    matrix[3] = -1.0f32;
+    matrix[4] = 0.5f32;
+    matrix[5] = 4.0f32;
+    x[0] = 2.0f32;
+    x[1] = -1.0f32;
+    x[2] = 0.5f32;
+
+    kernels_dense_matvec_f32(&out[0], &matrix[0], &x[0], 2, 3);
+    try assert_close(out[0], 1.5f32, 0.00001f32);
+    try assert_close(out[1], -0.5f32, 0.00001f32);
+}
+
+test "q8_0 dot f32" {
+    var block: [byte: 34] = [];
+    var x: [f32: 4] = [];
+    block[0] = 0;
+    block[1] = 0x3c;
+    block[2] = 1;
+    block[3] = 2;
+    block[4] = 253;
+    block[5] = 4;
+    x[0] = 1.0f32;
+    x[1] = 2.0f32;
+    x[2] = 3.0f32;
+    x[3] = 4.0f32;
+
+    try assert_close(kernels_q8_0_dot_f32(&block[0], &x[0], 4), 12.0f32, 0.00001f32);
+}
+
+test "q4_k reference dot f32" {
+    var block: [byte: 144] = [];
+    var x: [f32: 4] = [];
+    block[0] = 0;
+    block[1] = 0x3c;
+    block[2] = 0;
+    block[3] = 0;
+    block[4] = 1;
+    block[16] = 1;
+    block[17] = 2;
+    block[18] = 3;
+    block[19] = 4;
+    x[0] = 1.0f32;
+    x[1] = 1.0f32;
+    x[2] = 1.0f32;
+    x[3] = 1.0f32;
+
+    try assert_close(kernels_q4_k_dot_f32(&block[0], &x[0], 4), 10.0f32, 0.00001f32);
+}
+
+test "silu and swiglu" {
+    var gate: [f32: 2] = [];
+    var up: [f32: 2] = [];
+    var out: [f32: 2] = [];
+    gate[0] = 0.0f32;
+    gate[1] = 1.0f32;
+    up[0] = 3.0f32;
+    up[1] = 2.0f32;
+
+    try assert_close(kernels_silu(0.0f32), 0.0f32, 0.00001f32);
+    try assert_close(kernels_silu(1.0f32), 0.731059f32, 0.00001f32);
+    kernels_swiglu(&out[0], &gate[0], &up[0], 2);
+    try assert_close(out[0], 0.0f32, 0.00001f32);
+    try assert_close(out[1], 1.462117f32, 0.00001f32);
+}

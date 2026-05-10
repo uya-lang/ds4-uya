@@ -1,0 +1,330 @@
+use libc.cosf;
+use libc.expf;
+use libc.powf;
+use libc.sinf;
+use libc.sqrtf;
+
+const Q8_0_BLOCK_ELEMS: u64 = 32;
+const Q8_0_BLOCK_BYTES: u64 = 34;
+const QK_K: u64 = 256;
+const Q4_K_BLOCK_BYTES: u64 = 144;
+
+extern "libc" fn memcpy(dest: &void, src: &const void, n: usize) &void;
+
+fn bits_to_f32(bits: u32) f32 {
+    var u: u32 = bits;
+    var f: f32 = 0.0f32;
+    _ = memcpy(&f as &void, &u as &const void, 4 as usize);
+    return f;
+}
+
+fn f32_to_bits(value: f32) u32 {
+    var u: u32 = 0;
+    var f: f32 = value;
+    _ = memcpy(&u as &void, &f as &const void, 4 as usize);
+    return u;
+}
+
+fn le_u16_at(data: &const byte, off: u64) u16 {
+    const i: usize = off as usize;
+    return (data[i] as u16) | ((data[i + 1] as u16) << 8);
+}
+
+fn signed_byte_value(b: byte) i32 {
+    const u: i32 = b as i32;
+    if u >= 128 {
+        return u - 256;
+    }
+    return u;
+}
+
+fn q4_k_scale_min(scales: &const byte, group: u64, scale_out: &u32, min_out: &u32) void {
+    const j: usize = group as usize;
+    if j < 4 {
+        *scale_out = (scales[j] & (63 as byte)) as u32;
+        *min_out = (scales[j + 4] & (63 as byte)) as u32;
+        return;
+    }
+
+    *scale_out = ((scales[j + 4] & (15 as byte)) | ((scales[j - 4] & (0xc0 as byte)) >> 2)) as u32;
+    *min_out = (((scales[j + 4] >> 4) & (15 as byte)) | ((scales[j] & (0xc0 as byte)) >> 2)) as u32;
+}
+
+export fn kernels_f32_fill(x: &f32, n: u64, value: f32) void {
+    var i: u64 = 0;
+    while i < n {
+        x[i as usize] = value;
+        i = i + 1;
+    }
+}
+
+export fn kernels_f32_copy(dst: &f32, src: &const f32, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        dst[i as usize] = src[i as usize];
+        i = i + 1;
+    }
+}
+
+export fn kernels_f32_add(dst: &f32, a: &const f32, b: &const f32, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        dst[i as usize] = a[i as usize] + b[i as usize];
+        i = i + 1;
+    }
+}
+
+export fn kernels_f32_mul(dst: &f32, a: &const f32, b: &const f32, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        dst[i as usize] = a[i as usize] * b[i as usize];
+        i = i + 1;
+    }
+}
+
+export fn kernels_f32_dot(a: &const f32, b: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < n {
+        acc = acc + a[i as usize] * b[i as usize];
+        i = i + 1;
+    }
+    return acc;
+}
+
+export fn kernels_f16_to_f32(bits: u16) f32 {
+    const sign: u32 = ((bits & (0x8000 as u16)) as u32) << 16;
+    var exp: i32 = ((bits >> 10) & (0x1f as u16)) as i32;
+    var mant: u32 = (bits & (0x03ff as u16)) as u32;
+    var out_bits: u32 = 0;
+
+    if exp == 0 {
+        if mant == 0 {
+            out_bits = sign;
+        } else {
+            exp = 1;
+            while (mant & 0x0400u32) == 0 {
+                mant = mant << 1;
+                exp = exp - 1;
+            }
+            mant = mant & 0x03ffu32;
+            out_bits = sign | (((exp + 127 - 15) as u32) << 23) | (mant << 13);
+        }
+    } else if exp == 31 {
+        out_bits = sign | 0x7f800000u32 | (mant << 13);
+    } else {
+        out_bits = sign | (((exp + 127 - 15) as u32) << 23) | (mant << 13);
+    }
+
+    return bits_to_f32(out_bits);
+}
+
+export fn kernels_f32_to_f16(value: f32) u16 {
+    const bits: u32 = f32_to_bits(value);
+    const sign: u32 = (bits >> 16) & 0x8000u32;
+    var exp: i32 = (((bits >> 23) & 0xffu32) as i32) - 127 + 15;
+    var mant: u32 = bits & 0x7fffffu32;
+
+    if exp <= 0 {
+        if exp < -10 {
+            return sign as u16;
+        }
+        mant = mant | 0x800000u32;
+        const shift: i32 = 14 - exp;
+        var half_mant: u32 = mant >> shift;
+        const round_bit: u32 = (mant >> (shift - 1)) & 1u32;
+        const sticky: u32 = mant & ((1u32 << (shift - 1)) - 1u32);
+        if round_bit != 0 && (sticky != 0 || (half_mant & 1u32) != 0) {
+            half_mant = half_mant + 1;
+        }
+        return (sign | half_mant) as u16;
+    }
+
+    if exp >= 31 {
+        if ((bits >> 23) & 0xffu32) == 0xffu32 && mant != 0 {
+            return (sign | 0x7e00u32) as u16;
+        }
+        return (sign | 0x7c00u32) as u16;
+    }
+
+    var half: u32 = sign | ((exp as u32) << 10) | (mant >> 13);
+    const round: u32 = mant & 0x1fffu32;
+    if round > 0x1000u32 || (round == 0x1000u32 && (half & 1u32) != 0) {
+        half = half + 1;
+    }
+    return half as u16;
+}
+
+export fn kernels_f16_load(data: &const byte, index: u64) f32 {
+    return kernels_f16_to_f32(le_u16_at(data, index * 2));
+}
+
+export fn kernels_rms_norm(out: &f32, x: &const f32, weight: &const f32, n: u64, eps: f32) void {
+    if n == 0 {
+        return;
+    }
+
+    var sum: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < n {
+        const v: f32 = x[i as usize];
+        sum = sum + v * v;
+        i = i + 1;
+    }
+
+    const scale: f32 = 1.0f32 / sqrtf(sum / (n as f32) + eps);
+    i = 0;
+    while i < n {
+        out[i as usize] = x[i as usize] * scale * weight[i as usize];
+        i = i + 1;
+    }
+}
+
+export fn kernels_rope_f32(out: &f32, x: &const f32, n_dims: u64, pos: u64, theta_base: f32, inverse: bool) void {
+    if n_dims == 0 {
+        return;
+    }
+
+    const theta_scale: f32 = powf(theta_base, -2.0f32 / (n_dims as f32));
+    var sin_sign: f32 = 1.0f32;
+    if inverse {
+        sin_sign = -1.0f32;
+    }
+    var theta: f32 = pos as f32;
+    var i: u64 = 0;
+    while i + 1 < n_dims {
+        const c: f32 = cosf(theta);
+        const s: f32 = sin_sign * sinf(theta);
+        const x0: f32 = x[i as usize];
+        const x1: f32 = x[(i + 1) as usize];
+        out[i as usize] = x0 * c - x1 * s;
+        out[(i + 1) as usize] = x0 * s + x1 * c;
+        theta = theta * theta_scale;
+        i = i + 2;
+    }
+    if i < n_dims {
+        out[i as usize] = x[i as usize];
+    }
+}
+
+export fn kernels_softmax(out: &f32, x: &const f32, n: u64) void {
+    if n == 0 {
+        return;
+    }
+
+    var maxv: f32 = x[0];
+    var i: u64 = 1;
+    while i < n {
+        const v: f32 = x[i as usize];
+        if v > maxv {
+            maxv = v;
+        }
+        i = i + 1;
+    }
+
+    var sum: f32 = 0.0f32;
+    i = 0;
+    while i < n {
+        const e: f32 = expf(x[i as usize] - maxv);
+        out[i as usize] = e;
+        sum = sum + e;
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < n {
+        out[i as usize] = out[i as usize] / sum;
+        i = i + 1;
+    }
+}
+
+export fn kernels_dense_matvec_f32(out: &f32, matrix: &const f32, x: &const f32, out_dim: u64, in_dim: u64) void {
+    var row: u64 = 0;
+    while row < out_dim {
+        var acc: f32 = 0.0f32;
+        var col: u64 = 0;
+        while col < in_dim {
+            acc = acc + matrix[(row * in_dim + col) as usize] * x[col as usize];
+            col = col + 1;
+        }
+        out[row as usize] = acc;
+        row = row + 1;
+    }
+}
+
+export fn kernels_q8_0_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var b: u64 = 0;
+    while b * Q8_0_BLOCK_ELEMS < n {
+        const base: u64 = b * Q8_0_BLOCK_BYTES;
+        const scale: f32 = kernels_f16_to_f32(le_u16_at(blocks, base));
+        var j: u64 = 0;
+        while j < Q8_0_BLOCK_ELEMS && b * Q8_0_BLOCK_ELEMS + j < n {
+            const q: i32 = signed_byte_value(blocks[(base + 2 + j) as usize]);
+            acc = acc + scale * (q as f32) * x[(b * Q8_0_BLOCK_ELEMS + j) as usize];
+            j = j + 1;
+        }
+        b = b + 1;
+    }
+    return acc;
+}
+
+export fn kernels_q4_k_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var block_index: u64 = 0;
+    while block_index * QK_K < n {
+        const block_base: u64 = block_index * Q4_K_BLOCK_BYTES;
+        const d: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base));
+        const dmin: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base + 2));
+        const scales: &const byte = &blocks[(block_base + 4) as usize];
+        const qs_base: u64 = block_base + 16;
+
+        var group_pair: u64 = 0;
+        while group_pair < 4 {
+            const qoff: u64 = qs_base + group_pair * 32;
+            const g0: u64 = group_pair * 2;
+            const g1: u64 = g0 + 1;
+            var sc0: u32 = 0;
+            var min0: u32 = 0;
+            var sc1: u32 = 0;
+            var min1: u32 = 0;
+            q4_k_scale_min(scales, g0, &sc0, &min0);
+            q4_k_scale_min(scales, g1, &sc1, &min1);
+
+            var j: u64 = 0;
+            while j < 32 {
+                const qbyte: byte = blocks[(qoff + j) as usize];
+                const elem0: u64 = block_index * QK_K + group_pair * 64 + j;
+                if elem0 < n {
+                    const v0: f32 = d * (sc0 as f32) * ((qbyte & 15) as f32) - dmin * (min0 as f32);
+                    acc = acc + v0 * x[elem0 as usize];
+                }
+
+                const elem1: u64 = elem0 + 32;
+                if elem1 < n {
+                    const v1: f32 = d * (sc1 as f32) * ((qbyte >> 4) as f32) - dmin * (min1 as f32);
+                    acc = acc + v1 * x[elem1 as usize];
+                }
+
+                j = j + 1;
+            }
+
+            group_pair = group_pair + 1;
+        }
+
+        block_index = block_index + 1;
+    }
+    return acc;
+}
+
+export fn kernels_silu(value: f32) f32 {
+    return value / (1.0f32 + expf(-value));
+}
+
+export fn kernels_swiglu(out: &f32, gate: &const f32, up: &const f32, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        out[i as usize] = kernels_silu(gate[i as usize]) * up[i as usize];
+        i = i + 1;
+    }
+}
