@@ -51,13 +51,12 @@ use ds4.tokenizer.tokenizer_token_vec_push;
 use ds4.tokenizer.tokenizer_vocab_deinit;
 use ds4.tokenizer.tokenizer_vocab_init;
 use ds4.tokenizer.tokenizer_vocab_load_from_gguf;
-use libc.FILE;
-use libc.fclose;
+use libc.MAP_PRIVATE;
+use libc.O_RDONLY;
+use libc.PROT_READ;
+use libc.Stat;
 use libc.fflush;
-use libc.fopen;
-use libc.fread;
 use libc.free;
-use libc.fseek;
 use libc.malloc;
 use libc.printf;
 use libc.read;
@@ -65,8 +64,12 @@ use libc.snprintf;
 use libc.stdout;
 use libc.strcmp;
 use libc.strlen;
+use libc.sys_close;
+use libc.sys_fstat;
+use libc.sys_mmap;
+use libc.sys_munmap;
+use libc.sys_open;
 
-const RUNTIME_SEEK_SET: i32 = 0;
 const RUNTIME_DEFAULT_MAX_NEW: u64 = 64;
 const RUNTIME_CHAT_MAX_NEW: u64 = 96;
 
@@ -82,6 +85,8 @@ export struct RuntimeSession {
     state: ModelState,
     tensor_data: & &byte,
     tensor_data_count: u64,
+    mmap_base: &byte,
+    mmap_size: u64,
     loaded: bool,
 }
 
@@ -108,11 +113,19 @@ export fn runtime_session_init() RuntimeSession {
         state: model_state_empty(),
         tensor_data: null,
         tensor_data_count: 0,
+        mmap_base: null,
+        mmap_size: 0,
         loaded: false,
     };
 }
 
 fn runtime_free_tensor_data(session: &RuntimeSession) void {
+    if session.mmap_base != null && session.mmap_size != 0 {
+        _ = sys_munmap(session.mmap_base as *void, session.mmap_size as usize);
+    }
+    session.mmap_base = null;
+    session.mmap_size = 0;
+
     if session.tensor_data != null {
         var i: u64 = 0;
         while i < session.tensor_data_count {
@@ -143,57 +156,45 @@ fn runtime_load_tensor_data(path: &const byte, session: &RuntimeSession) i32 {
         return 3;
     }
 
-    const pointer_bytes: usize = (session.table.count as usize) * (@size_of(&byte) as usize);
-    session.tensor_data = malloc(pointer_bytes) as & &byte;
-    if session.tensor_data == null {
+    const fd: i32 = sys_open(path as *const byte, O_RDONLY as i32, 0) catch |_| {
+        return 2;
+    };
+
+    var st: Stat = Stat{
+        st_dev: 0, st_ino: 0, st_nlink: 0, st_mode: 0, st_uid: 0, st_gid: 0, _pad0: 0,
+        st_rdev: 0, st_size: 0, st_blksize: 0, st_blocks: 0, st_atime: 0, st_atime_nsec: 0,
+        st_mtime: 0, st_mtime_nsec: 0, st_ctime: 0, st_ctime_nsec: 0, _unused0: 0,
+        _unused1: 0, _unused2: 0,
+    };
+    if (sys_fstat(fd, &st) catch |_| { _ = sys_close(fd); return 2; }) != 0 || st.st_size <= 0 {
+        _ = sys_close(fd);
         return 2;
     }
-    session.tensor_data_count = session.table.count;
+    const map_size: u64 = st.st_size as u64;
+    const raw: *void = sys_mmap(null as *void, map_size as usize, PROT_READ, MAP_PRIVATE, fd, 0) catch |_| {
+        _ = sys_close(fd);
+        return 2;
+    };
+    _ = sys_close(fd);
+    session.mmap_base = raw as &byte;
+    session.mmap_size = map_size;
+
     var i: u64 = 0;
-    while i < session.tensor_data_count {
-        session.tensor_data[i as usize] = null;
-        i = i + 1;
-    }
-
-    const fp: &FILE = fopen(path, "rb\0" as &const byte);
-    if fp == null {
-        runtime_free_tensor_data(session);
-        return 2;
-    }
-
-    i = 0;
     while i < session.table.count {
         const view: &TensorView = &session.table.views[i as usize];
         if !tensor_view_data_available(view) {
-            _ = fclose(fp);
             runtime_free_tensor_data(session);
             return 3;
         }
-        const data: &byte = malloc(view.byte_size as usize) as &byte;
-        if data == null {
-            _ = fclose(fp);
-            runtime_free_tensor_data(session);
-            return 2;
-        }
-        if fseek(fp, view.file_offset as i64, RUNTIME_SEEK_SET) < 0 {
-            free(data as &void);
-            _ = fclose(fp);
-            runtime_free_tensor_data(session);
-            return 2;
-        }
-        const got: usize = fread(data, 1 as usize, view.byte_size as usize, fp);
-        if got != view.byte_size as usize {
-            free(data as &void);
-            _ = fclose(fp);
+        if view.file_offset > map_size || view.byte_size > (map_size - view.file_offset) {
             runtime_free_tensor_data(session);
             return 3;
         }
-        view.data = data;
-        session.tensor_data[i as usize] = data;
+        const base_addr: usize = @usize_from_ptr(session.mmap_base as &void);
+        view.data = @ptr_from_usize(base_addr + (view.file_offset as usize)) as &byte;
         i = i + 1;
     }
 
-    _ = fclose(fp);
     return 0;
 }
 
@@ -312,7 +313,7 @@ fn runtime_print_load_error(path: &const byte, rc: i32) void {
         _ = printf("ds4-uya: GGUF is missing tokenizer.ggml.tokens or tokenizer.ggml.merges metadata\n");
     } else if rc == 9 {
         _ = printf("ds4-uya: unsupported model layout for current CPU forward path\n");
-        _ = printf("ds4-uya: supported now: dense decoder tensors named blk.N.*, dense GQA/MQA with key/value dims equal to head_dim, F32/F16/Q8_0/Q2_K/Q4_K matrices\n");
+        _ = printf("ds4-uya: supported now: dense decoder tensors named blk.N.*, dense GQA/MQA with key/value dims equal to head_dim, F32/F16/Q8_0/Q2_K/Q4_K/IQ2_* matrices\n");
         _ = printf("ds4-uya: run `ds4-uya audit <model.gguf>` for DS4 Flash/MoE/compressor/indexer diagnostics\n");
     } else {
         _ = printf("ds4-uya: failed to load GGUF-backed runtime, rc=%d\n", rc);
@@ -424,6 +425,9 @@ export fn print_runtime_audit(path: &const byte) i32 {
     var lora_split_tensors: u64 = 0;
     var q2_k_tensors: u64 = 0;
     var iq2_tensors: u64 = 0;
+    var iq2_xxs_tensors: u64 = 0;
+    var iq2_xs_tensors: u64 = 0;
+    var iq2_s_tensors: u64 = 0;
     var q4_k_tensors: u64 = 0;
     var q8_0_tensors: u64 = 0;
     var f16_tensors: u64 = 0;
@@ -475,9 +479,15 @@ export fn print_runtime_audit(path: &const byte) i32 {
 
         if tensor.ggml_type == GGML_TYPE_Q2_K {
             q2_k_tensors = q2_k_tensors + 1;
-        } else if tensor.ggml_type == GGML_TYPE_IQ2_XXS || tensor.ggml_type == GGML_TYPE_IQ2_XS ||
-            tensor.ggml_type == GGML_TYPE_IQ2_S {
+        } else if tensor.ggml_type == GGML_TYPE_IQ2_XXS {
             iq2_tensors = iq2_tensors + 1;
+            iq2_xxs_tensors = iq2_xxs_tensors + 1;
+        } else if tensor.ggml_type == GGML_TYPE_IQ2_XS {
+            iq2_tensors = iq2_tensors + 1;
+            iq2_xs_tensors = iq2_xs_tensors + 1;
+        } else if tensor.ggml_type == GGML_TYPE_IQ2_S {
+            iq2_tensors = iq2_tensors + 1;
+            iq2_s_tensors = iq2_s_tensors + 1;
         } else if tensor.ggml_type == GGML_TYPE_Q4_K {
             q4_k_tensors = q4_k_tensors + 1;
         } else if tensor.ggml_type == GGML_TYPE_Q8_0 {
@@ -496,6 +506,10 @@ export fn print_runtime_audit(path: &const byte) i32 {
         dense_roots, dense_attn, moe_experts, shared_experts, router_tensors, compressor_tensors, indexer_tensors, hc_tensors, lora_split_tensors);
     _ = printf("dtypes: f32=%llu f16=%llu i32=%llu q8_0=%llu q4_k=%llu q2_k=%llu iq2=%llu\n",
         f32_tensors, f16_tensors, i32_tensors, q8_0_tensors, q4_k_tensors, q2_k_tensors, iq2_tensors);
+    if iq2_tensors != 0 {
+        _ = printf("iq2-breakdown: iq2_xxs=%llu iq2_xs=%llu iq2_s=%llu\n",
+            iq2_xxs_tensors, iq2_xs_tensors, iq2_s_tensors);
+    }
 
     if info.has_head_count && info.has_head_count_kv && info.head_count != info.head_count_kv {
         _ = printf("diagnostic: GQA/MQA metadata detected; dense GQA is supported when key_len/value_len equal head_dim\n");
@@ -514,7 +528,7 @@ export fn print_runtime_audit(path: &const byte) i32 {
         _ = printf("diagnostic: Flash compressor/indexer/HC/split-LORA tensors detected; current forward reports unsupported instead of fake generation\n");
     }
     if iq2_tensors != 0 {
-        _ = printf("diagnostic: IQ2 tensors detected; Q2_K has a reference kernel, IQ2_* kernels still need format-specific implementation\n");
+        _ = printf("diagnostic: IQ2 tensors detected; IQ2_XXS/IQ2_XS/IQ2_S reference kernels are wired into dense matvec\n");
     }
 
     gguf_info_deinit(&info);

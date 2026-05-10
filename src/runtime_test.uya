@@ -214,6 +214,8 @@ test "runtime maps GGUF tensors into forward and generates decoded text" {
     try assert_eq_i32(runtime_session_load_gguf(path, &session), 0);
     try assert_eq_i32(session.config.n_vocab as i32, 2);
     try assert_eq_i32(session.config.n_embd as i32, 1);
+    try expect(session.mmap_base != null);
+    try expect(session.mmap_size > 0);
     try expect(session.table.token_embd.data != null);
     try expect(session.weights.output.data != null);
 

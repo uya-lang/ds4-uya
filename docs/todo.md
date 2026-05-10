@@ -147,9 +147,9 @@
 - [x] 支持 dense GQA/MQA：允许 `n_head != n_head_kv`，KV cache、attention 读写和 head 映射按 kv heads 工作；当前 dense forward 要求 key/value per-head dim 等于 query head_dim。
 - [ ] 支持 DS4 Flash 的 MoE forward：router logits、top-k expert 选择、shared expert、expert 权重绑定和 expert-major dispatch 真正接入模型层。
 - [x] 支持 DS4 Flash 特有 compressor/indexer/HC tensor 命名的 schema 识别和具体诊断；forward 分支仍未接入。
-- [x] 实现 `Q2_K` matvec reference kernel，并接入 dense matvec；`IQ2_XXS`、`IQ2_XS`、`IQ2_S` 仍需要按 ggml 具体格式实现。
-- [x] 扩展现有 F16/Q8_0/Q4_K/Q2_K dense matvec dtype 覆盖；Flash experts/shared/output 的 3D expert 权重路径仍待接入 MoE forward。
-- [ ] 改造权重加载策略：大模型不能默认 `malloc` 读入所有 tensor，需要 mmap/按需加载/分块加载，并保持 tensor lifetime 清晰；`audit` 已避免读取 tensor data。
+- [x] 实现 `Q2_K`、`IQ2_XXS`、`IQ2_XS`、`IQ2_S` matvec reference kernel，并按 ggml 表格式接入 dense matvec；真实 Q2 文件当前实际命中 `IQ2_XXS`。
+- [x] 扩展现有 F16/Q8_0/Q4_K/Q2_K/IQ2_* dense matvec dtype 覆盖；Flash experts/shared/output 的 3D expert 权重路径仍待接入 MoE forward。
+- [x] 改造权重加载策略：生成路径对已支持的 dense GGUF 使用整文件只读 `mmap` 挂接 tensor view，避免逐 tensor `malloc` 复制；`audit` 继续避免读取 tensor data。
 - [ ] 支持真实 tokenizer chat template，把 `chat` 从裸 prompt REPL 升级为模型格式化对话输入。
 - [x] 增加真实模型 audit target：`make flash-q2-audit DS4_FLASH_Q2_GGUF=/path/to/model.gguf`。
 - [ ] 增加真实模型 smoke：`inspect`、`encode`、`generate`、`chat` 在 DS4 Flash Q2 GGUF 上不崩溃，并能产出非空文本；`make flash-q2-smoke` 已建目标，但生成仍会因 Flash forward 未接入而报 unsupported。
@@ -169,8 +169,8 @@
 - `layers=43 ctx=1048576 embd=4096 heads=64 kv_heads=1 key_len=512 value_len=512 experts=256 experts_used=6 expert_ff=2048 shared_experts=1 file_type=19`。
 - Flash metadata 包含 `rope_dim=64`、RoPE scaling/freq bits、RMS eps bits、`q_lora=1024`、`out_lora=1024`、`out_groups=8`、`sliding_window=128`、`indexer_heads=64`、`indexer_key_len=128`、`indexer_top_k=512`、`hc_count=4`。
 - layout 识别到 `moe_experts=129 shared_experts=129 router=172 compressor=248 indexer=126 hc=261 split_lora=279`。
-- dtype 分布为 `f32=492 f16=359 i32=3 q8_0=345 q4_k=0 q2_k=43 iq2=86`。
-- 诊断明确指出当前生成路径还缺 IQ2 kernel、Flash compressor/LORA、MoE、indexer、HC forward。
+- dtype 分布为 `f32=492 f16=359 i32=3 q8_0=345 q4_k=0 q2_k=43 iq2=86`，细分为 `iq2_xxs=86 iq2_xs=0 iq2_s=0`。
+- 诊断明确指出 IQ2 reference kernel 已接入 dense matvec；当前真实生成路径还缺 Flash compressor/LORA、MoE、indexer、HC forward。
 
 另有截断的 Q4KExperts/F16HC/F16Compressor/F16Indexer/Q8Attn `.gguf.part` 可用于截断诊断回归：
 

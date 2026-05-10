@@ -1,3 +1,7 @@
+use ds4.iq2_tables.iq2_grid_s;
+use ds4.iq2_tables.iq2_grid_xs;
+use ds4.iq2_tables.iq2_grid_xxs;
+use ds4.iq2_tables.iq2_signs;
 use libc.cosf;
 use libc.expf;
 use libc.powf;
@@ -11,6 +15,9 @@ const Q8_0_BLOCK_BYTES: u64 = 34;
 const QK_K: u64 = 256;
 const Q2_K_BLOCK_BYTES: u64 = 84;
 const Q4_K_BLOCK_BYTES: u64 = 144;
+const IQ2_XXS_BLOCK_BYTES: u64 = 66;
+const IQ2_XS_BLOCK_BYTES: u64 = 74;
+const IQ2_S_BLOCK_BYTES: u64 = 82;
 
 extern "libc" fn memcpy(dest: &void, src: &const void, n: usize) &void;
 
@@ -33,12 +40,47 @@ fn le_u16_at(data: &const byte, off: u64) u16 {
     return (data[i] as u16) | ((data[i + 1] as u16) << 8);
 }
 
+fn le_u32_at(data: &const byte, off: u64) u32 {
+    const i: usize = off as usize;
+    return (data[i] as u32) |
+        ((data[i + 1] as u32) << 8) |
+        ((data[i + 2] as u32) << 16) |
+        ((data[i + 3] as u32) << 24);
+}
+
 fn signed_byte_value(b: byte) i32 {
     const u: i32 = b as i32;
     if u >= 128 {
         return u - 256;
     }
     return u;
+}
+
+fn iq2_grid_byte(grid: u64, index: u64) f32 {
+    const shift: i32 = (index * 8) as i32;
+    return ((grid >> shift) & 0xffu64) as f32;
+}
+
+fn iq2_apply_sign(value: f32, signs: byte, index: u64) f32 {
+    const mask: byte = (1u32 << (index as i32)) as byte;
+    if (signs & mask) != 0 {
+        return -value;
+    }
+    return value;
+}
+
+fn iq2_accum_grid(acc: f32, grid: u64, signs: byte, scale: f32, x: &const f32, elem_base: u64, n: u64) f32 {
+    var out: f32 = acc;
+    var j: u64 = 0;
+    while j < 8 {
+        const elem: u64 = elem_base + j;
+        if elem < n {
+            const v: f32 = iq2_apply_sign(iq2_grid_byte(grid, j), signs, j) * scale;
+            out = out + v * x[elem as usize];
+        }
+        j = j + 1;
+    }
+    return out;
 }
 
 fn q4_k_scale_min(scales: &const byte, group: u64, scale_out: &u32, min_out: &u32) void {
@@ -374,6 +416,122 @@ export fn kernels_q2_k_dot_f32_fast(blocks: &const byte, x: &const f32, n: u64) 
 
 export fn kernels_q2_k_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
     return kernels_q2_k_dot_f32_fast(blocks, x, n);
+}
+
+export fn kernels_iq2_xxs_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var block_index: u64 = 0;
+    while block_index * QK_K < n {
+        const block_base: u64 = block_index * IQ2_XXS_BLOCK_BYTES;
+        const d: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base));
+
+        var ib32: u64 = 0;
+        while ib32 < 8 {
+            const aux_base: u64 = block_base + 2 + ib32 * 8;
+            const aux0: u32 = le_u32_at(blocks, aux_base);
+            const aux1: u32 = le_u32_at(blocks, aux_base + 4);
+            const db: f32 = d * (0.5f32 + ((aux1 >> 28) as f32)) * 0.25f32;
+
+            var l: u64 = 0;
+            while l < 4 {
+                const grid_index: u64 = ((aux0 >> ((l * 8) as i32)) & 0xffu32) as u64;
+                const sign_index: u64 = ((aux1 >> ((l * 7) as i32)) & 127u32) as u64;
+                const elem_base: u64 = block_index * QK_K + ib32 * 32 + l * 8;
+                acc = iq2_accum_grid(acc, iq2_grid_xxs(grid_index), iq2_signs(sign_index), db, x, elem_base, n);
+                l = l + 1;
+            }
+
+            ib32 = ib32 + 1;
+        }
+        block_index = block_index + 1;
+    }
+    return acc;
+}
+
+export fn kernels_iq2_xxs_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+    return kernels_iq2_xxs_dot_f32_reference(blocks, x, n);
+}
+
+export fn kernels_iq2_xs_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var block_index: u64 = 0;
+    while block_index * QK_K < n {
+        const block_base: u64 = block_index * IQ2_XS_BLOCK_BYTES;
+        const d: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base));
+
+        var ib32: u64 = 0;
+        while ib32 < 8 {
+            const scale_byte: byte = blocks[(block_base + 66 + ib32) as usize];
+            const db0: f32 = d * (0.5f32 + ((scale_byte & (15 as byte)) as f32)) * 0.25f32;
+            const db1: f32 = d * (0.5f32 + ((scale_byte >> 4) as f32)) * 0.25f32;
+
+            var l: u64 = 0;
+            while l < 4 {
+                const q: u16 = le_u16_at(blocks, block_base + 2 + (ib32 * 4 + l) * 2);
+                const grid_index: u64 = (q & (511 as u16)) as u64;
+                const sign_index: u64 = (q >> 9) as u64;
+                var db: f32 = db0;
+                if l >= 2 {
+                    db = db1;
+                }
+                const elem_base: u64 = block_index * QK_K + ib32 * 32 + l * 8;
+                acc = iq2_accum_grid(acc, iq2_grid_xs(grid_index), iq2_signs(sign_index), db, x, elem_base, n);
+                l = l + 1;
+            }
+
+            ib32 = ib32 + 1;
+        }
+        block_index = block_index + 1;
+    }
+    return acc;
+}
+
+export fn kernels_iq2_xs_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+    return kernels_iq2_xs_dot_f32_reference(blocks, x, n);
+}
+
+export fn kernels_iq2_s_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    var block_index: u64 = 0;
+    while block_index * QK_K < n {
+        const block_base: u64 = block_index * IQ2_S_BLOCK_BYTES;
+        const d: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base));
+        const qs_base: u64 = block_base + 2;
+        const signs_base: u64 = block_base + 34;
+        const qh_base: u64 = block_base + 66;
+        const scales_base: u64 = block_base + 74;
+
+        var ib32: u64 = 0;
+        while ib32 < 8 {
+            const scale_byte: byte = blocks[(scales_base + ib32) as usize];
+            const qh: u32 = blocks[(qh_base + ib32) as usize] as u32;
+            const db0: f32 = d * (0.5f32 + ((scale_byte & (15 as byte)) as f32)) * 0.25f32;
+            const db1: f32 = d * (0.5f32 + ((scale_byte >> 4) as f32)) * 0.25f32;
+
+            var l: u64 = 0;
+            while l < 4 {
+                const q: u32 = blocks[(qs_base + ib32 * 4 + l) as usize] as u32;
+                const high: u32 = (qh << ((8 - 2 * l) as i32)) & 0x300u32;
+                const grid_index: u64 = (q | high) as u64;
+                var db: f32 = db0;
+                if l >= 2 {
+                    db = db1;
+                }
+                const signs: byte = blocks[(signs_base + ib32 * 4 + l) as usize];
+                const elem_base: u64 = block_index * QK_K + ib32 * 32 + l * 8;
+                acc = iq2_accum_grid(acc, iq2_grid_s(grid_index), signs, db, x, elem_base, n);
+                l = l + 1;
+            }
+
+            ib32 = ib32 + 1;
+        }
+        block_index = block_index + 1;
+    }
+    return acc;
+}
+
+export fn kernels_iq2_s_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
+    return kernels_iq2_s_dot_f32_reference(blocks, x, n);
 }
 
 export fn kernels_q4_k_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {

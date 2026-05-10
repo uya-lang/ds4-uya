@@ -7,6 +7,9 @@ use ds4.kernels.kernels_f32_dot;
 use ds4.kernels.kernels_f32_fill;
 use ds4.kernels.kernels_f32_mul;
 use ds4.kernels.kernels_f32_to_f16;
+use ds4.kernels.kernels_iq2_s_dot_f32;
+use ds4.kernels.kernels_iq2_xs_dot_f32;
+use ds4.kernels.kernels_iq2_xxs_dot_f32;
 use ds4.kernels.kernels_q2_k_dot_f32;
 use ds4.kernels.kernels_q4_k_dot_f32;
 use ds4.kernels.kernels_q8_0_dot_f32;
@@ -178,6 +181,48 @@ test "q4_k reference dot f32" {
     x[3] = 1.0f32;
 
     try assert_close(kernels_q4_k_dot_f32(&block[0], &x[0], 4), 10.0f32, 0.00001f32);
+}
+
+test "iq2_xxs reference dot f32" {
+    var block: [byte: 66] = [];
+    var x: [f32: 8] = [];
+    block[0] = 0;
+    block[1] = 0x3c;
+    var i: usize = 0;
+    while i < 8 {
+        x[i] = 1.0f32;
+        i = i + 1;
+    }
+
+    try assert_close(kernels_iq2_xxs_dot_f32(&block[0], &x[0], 8), 8.0f32, 0.00001f32);
+}
+
+test "iq2_xs reference dot f32" {
+    var block: [byte: 74] = [];
+    var x: [f32: 8] = [];
+    block[0] = 0;
+    block[1] = 0x3c;
+    var i: usize = 0;
+    while i < 8 {
+        x[i] = 1.0f32;
+        i = i + 1;
+    }
+
+    try assert_close(kernels_iq2_xs_dot_f32(&block[0], &x[0], 8), 8.0f32, 0.00001f32);
+}
+
+test "iq2_s reference dot f32" {
+    var block: [byte: 82] = [];
+    var x: [f32: 8] = [];
+    block[0] = 0;
+    block[1] = 0x3c;
+    var i: usize = 0;
+    while i < 8 {
+        x[i] = 1.0f32;
+        i = i + 1;
+    }
+
+    try assert_close(kernels_iq2_s_dot_f32(&block[0], &x[0], 8), 8.0f32, 0.00001f32);
 }
 
 test "silu and swiglu" {

@@ -748,7 +748,11 @@ fn tensor_print_dtype(dtype: TensorDType) void {
     if dtype == TensorDType.F32 { _ = printf("f32"); }
     else if dtype == TensorDType.F16 { _ = printf("f16"); }
     else if dtype == TensorDType.Q8_0 { _ = printf("q8_0"); }
+    else if dtype == TensorDType.Q2_K { _ = printf("q2_k"); }
     else if dtype == TensorDType.Q4_K { _ = printf("q4_k"); }
+    else if dtype == TensorDType.IQ2_XXS { _ = printf("iq2_xxs"); }
+    else if dtype == TensorDType.IQ2_XS { _ = printf("iq2_xs"); }
+    else if dtype == TensorDType.IQ2_S { _ = printf("iq2_s"); }
     else if dtype == TensorDType.I32 { _ = printf("i32"); }
     else { _ = printf("dtype(%d)", dtype as i32); }
 }

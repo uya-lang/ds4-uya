@@ -1,6 +1,9 @@
 use ds4.kernels.kernels_dense_matvec_f32;
 use ds4.kernels.kernels_f16_load;
 use ds4.kernels.kernels_f32_dot;
+use ds4.kernels.kernels_iq2_s_dot_f32;
+use ds4.kernels.kernels_iq2_xs_dot_f32;
+use ds4.kernels.kernels_iq2_xxs_dot_f32;
 use ds4.kernels.kernels_q2_k_dot_f32;
 use ds4.kernels.kernels_q8_0_dot_f32;
 use ds4.kernels.kernels_q4_k_dot_f32;
@@ -186,7 +189,8 @@ fn model_view_is_dense_supported(view: &TensorView, in_dim: u64, out_dim: u64) b
     }
     return view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 ||
         view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q2_K ||
-        view.dtype == TensorDType.Q4_K;
+        view.dtype == TensorDType.Q4_K || view.dtype == TensorDType.IQ2_XXS ||
+        view.dtype == TensorDType.IQ2_XS || view.dtype == TensorDType.IQ2_S;
 }
 
 fn model_view_is_vector_norm(view: &TensorView, n: u64) bool {
@@ -209,7 +213,8 @@ fn model_view_is_output(view: &TensorView, config: &ModelConfig) bool {
     }
     return view.dtype == TensorDType.F32 || view.dtype == TensorDType.F16 ||
         view.dtype == TensorDType.Q8_0 || view.dtype == TensorDType.Q2_K ||
-        view.dtype == TensorDType.Q4_K;
+        view.dtype == TensorDType.Q4_K || view.dtype == TensorDType.IQ2_XXS ||
+        view.dtype == TensorDType.IQ2_XS || view.dtype == TensorDType.IQ2_S;
 }
 
 fn model_layer_weights_validate(layer: &ModelLayerWeights, config: &ModelConfig) bool {
@@ -447,6 +452,33 @@ fn model_matvec(out: &f32, view: &TensorView, x: &const f32, out_dim: u64, in_di
             const row_data: &const byte = model_byte_ptr_add(view.data, row2 * view.stride_bytes[1]);
             out[row2 as usize] = kernels_q4_k_dot_f32(row_data, x, in_dim);
             row2 = row2 + 1;
+        }
+        return true;
+    }
+    if view.dtype == TensorDType.IQ2_XXS {
+        var row_iq2_xxs: u64 = 0;
+        while row_iq2_xxs < out_dim {
+            const row_data: &const byte = model_byte_ptr_add(view.data, row_iq2_xxs * view.stride_bytes[1]);
+            out[row_iq2_xxs as usize] = kernels_iq2_xxs_dot_f32(row_data, x, in_dim);
+            row_iq2_xxs = row_iq2_xxs + 1;
+        }
+        return true;
+    }
+    if view.dtype == TensorDType.IQ2_XS {
+        var row_iq2_xs: u64 = 0;
+        while row_iq2_xs < out_dim {
+            const row_data: &const byte = model_byte_ptr_add(view.data, row_iq2_xs * view.stride_bytes[1]);
+            out[row_iq2_xs as usize] = kernels_iq2_xs_dot_f32(row_data, x, in_dim);
+            row_iq2_xs = row_iq2_xs + 1;
+        }
+        return true;
+    }
+    if view.dtype == TensorDType.IQ2_S {
+        var row_iq2_s: u64 = 0;
+        while row_iq2_s < out_dim {
+            const row_data: &const byte = model_byte_ptr_add(view.data, row_iq2_s * view.stride_bytes[1]);
+            out[row_iq2_s as usize] = kernels_iq2_s_dot_f32(row_data, x, in_dim);
+            row_iq2_s = row_iq2_s + 1;
         }
         return true;
     }
