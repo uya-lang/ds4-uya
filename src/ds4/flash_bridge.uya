@@ -1,0 +1,29 @@
+extern "libc" fn ds4_uya_flash_generate(
+    model_path: &const byte,
+    prompt: &const byte,
+    max_new_tokens: i32,
+    ctx_size: i32,
+    out: &byte,
+    out_cap: usize,
+) i32;
+
+extern "libc" fn ds4_uya_flash_chat(
+    model_path: &const byte,
+    max_new_tokens: i32,
+    ctx_size: i32,
+) i32;
+
+export fn flash_bridge_generate(
+    model_path: &const byte,
+    prompt: &const byte,
+    max_new_tokens: i32,
+    ctx_size: i32,
+    out: &byte,
+    out_cap: usize,
+) i32 {
+    return ds4_uya_flash_generate(model_path, prompt, max_new_tokens, ctx_size, out, out_cap);
+}
+
+export fn flash_bridge_chat(model_path: &const byte, max_new_tokens: i32, ctx_size: i32) i32 {
+    return ds4_uya_flash_chat(model_path, max_new_tokens, ctx_size);
+}

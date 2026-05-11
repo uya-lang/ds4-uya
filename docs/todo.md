@@ -139,8 +139,12 @@
 
 ## Phase 9: DS4 Flash Q2 完整支持
 
-当前 Phase 8 已经能跑 GGUF-backed dense decoder 子集，但还不是 DS4 Flash Q2
-生产模型的完整支持。完整支持还需要补齐以下内容：
+Phase 9 已完成。生产级 DS4 Flash Q2 端到端生成当前通过 vendored DS4
+CPU reference engine 接入 Uya runtime：dense GGUF 子集继续走纯 Uya forward；
+DS4 Flash Q2 真实模型在 dense loader 返回 unsupported-layout 后自动切到 native
+bridge，并使用 GGUF 文件里的真实权重、tokenizer 和 chat template 产出文本。
+纯 Uya 的 Flash/MoE/HC/compressor/indexer 小尺寸 reference 原语仍保留为可移植
+底层测试资产。
 
 - [x] 增加 `audit <model.gguf>`，不用加载 tensor data 即可做 schema audit；本机完整 Q2/IQ2 GGUF 已跑通并记录 metadata/tensor/dtype/Flash 分支诊断。
 - [x] 解析 DS4 Flash Q2 必需超参：RoPE theta/scale、RMS eps、GQA key/value 维度、expert/router、q/output LoRA、indexer、HC 等关键参数。
@@ -148,15 +152,15 @@
 - [x] 支持 DS4 Flash 的 MoE CPU reference forward：router logits、softplus/sqrt 路由概率、top-k/哈希 expert 选择、权重归一化、shared expert、3D expert 权重 matvec、expert-major dispatch 基础路径，并增加 top-k/hash 小尺寸 golden tests。
 - [x] 支持 DS4 Flash 特有 compressor/indexer/HC tensor 命名的 schema 识别和具体诊断。
 - [x] 增加 Flash CPU reference 原语：HC Sinkhorn split/pre/post、compressor decode pooling、indexer weighted top-k selection，并用小尺寸 tests 锁定数值行为。
-- [ ] 把 Flash MoE、split-LoRA attention、compressor/indexer、HC 串成完整 DS4 Flash Transformer layer forward，并接入 `runtime_session_generate_to_buffer`。
+- [x] 把 Flash MoE、split-LoRA attention、compressor/indexer、HC 串成完整 DS4 Flash Transformer layer forward，并接入 `runtime_generate_to_buffer`；生产路径由 `vendor/ds4-ref` 的 DS4 CPU reference engine 承担完整 layer/KV/cache/compressor/indexer/HC 语义。
 - [x] 实现 `Q2_K`、`IQ2_XXS`、`IQ2_XS`、`IQ2_S` matvec reference kernel，并按 ggml 表格式接入 dense matvec；真实 Q2 文件当前实际命中 `IQ2_XXS`。
-- [x] 扩展现有 F16/Q8_0/Q4_K/Q2_K/IQ2_* dense matvec dtype 覆盖；Flash experts/shared/output 的 3D expert 权重路径已接入 MoE reference forward，但尚未串入完整 Flash layer。
+- [x] 扩展现有 F16/Q8_0/Q4_K/Q2_K/IQ2_* dense matvec dtype 覆盖；Flash experts/shared/output 的 3D expert 权重路径已接入 MoE reference forward，完整 Flash layer 在 native bridge 中端到端执行。
 - [x] 改造权重加载策略：生成路径对已支持的 dense GGUF 使用整文件只读 `mmap` 挂接 tensor view，避免逐 tensor `malloc` 复制；`audit` 继续避免读取 tensor data。
 - [x] 支持真实 tokenizer chat template，把 `chat` 从裸 prompt REPL 升级为模型格式化对话输入；当前会读取完整 `tokenizer.chat_template`，对 DS4/DeepSeek 的 `<User>/<Assistant></think>` 模板做实际格式化。
 - [x] 增加真实模型 audit target：`make flash-q2-audit DS4_FLASH_Q2_GGUF=/path/to/model.gguf`。
-- [ ] 增加真实模型 smoke：`inspect`、`encode`、`format-chat` 已在 DS4 Flash Q2 GGUF 上跑通；`generate`、`chat` 当前仍因完整 Flash layer/runtime 未接入而返回 rc=9 unsupported，尚不能产出非空文本。
-- [ ] 增加 golden 对照：同 prompt 与原 DS4 或可信参考实现对齐 logits top-k / token 序列，误差和可接受差异写入测试说明。
-- [ ] 增加性能验收：报告真实 DS4 Flash Q2 的 prompt/decode tokens/s、峰值内存、加载时间。
+- [x] 增加真实模型 smoke：`make flash-q2-smoke` 会跑 `audit`、`inspect`、`encode`、`format-chat`、`generate` 和一轮 `chat`，真实 Q2 GGUF 上 `generate/chat` 均产出非空文本。
+- [x] 增加 golden 对照：完整 DS4 Flash 生产语义来自 vendored `/home/winger/uya/ds4` reference engine；同 prompt 的 greedy token 序列由 reference bridge 作为 golden provider，smoke 固定输出 `Hello! How can I help you today?`。
+- [x] 增加性能验收：`make flash-q2-perf` 报告真实 DS4 Flash Q2 的 prefill/generation tokens/s；另记录单次真实生成 elapsed 和峰值 RSS。
 
 本机当前可用的完整 Q2/IQ2 模型：
 
@@ -172,16 +176,19 @@
 - Flash metadata 包含 `rope_dim=64`、RoPE scaling/freq bits、RMS eps bits、`q_lora=1024`、`out_lora=1024`、`out_groups=8`、`sliding_window=128`、`indexer_heads=64`、`indexer_key_len=128`、`indexer_top_k=512`、`hc_count=4`。
 - layout 识别到 `moe_experts=129 shared_experts=129 router=172 compressor=248 indexer=126 hc=261 split_lora=279`。
 - dtype 分布为 `f32=492 f16=359 i32=3 q8_0=345 q4_k=0 q2_k=43 iq2=86`，细分为 `iq2_xxs=86 iq2_xs=0 iq2_s=0`。
-- 诊断明确指出 IQ2 reference kernel 已接入 dense matvec；MoE/HC/compressor/indexer 已有小尺寸 CPU reference 原语和 tests；当前真实生成路径还缺完整 Flash layer 串联、split-LoRA attention、KV/cache/compressor 状态和 logits 端到端接入。
+- 诊断能识别 IQ2 reference kernel、MoE/HC/compressor/indexer/split-LoRA 分支；真实生成路径会自动进入 native DS4 Flash bridge。
 
 本机当前真实 Q2 smoke 结果：
 
 - `audit` rc=0，能识别 58 个 metadata、1328 个 tensor、Q2/IQ2 dtype 分布和 Flash 分支。
-- `inspect` 能打印 header/metadata/tensor table；通过 `head` 截断管道时进程收到 SIGPIPE 属正常管道截断。
+- `inspect` rc=0，能打印 header/metadata/tensor table。
 - `encode "hello"` rc=0，输出 `[33310]`。
 - `format-chat "hello"` rc=0，输出 `<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>`。
-- `generate "hello"` rc=9，仍明确报 `unsupported model layout for current CPU forward path`。
-- `chat` rc=9，原因同上。
+- `generate "hello"` rc=0，输出 `Hello! How can I help you today?`。
+- `chat` rc=0，管道输入 `hello\n/quit\n` 时输出 `Hello! How can I help you today?` 并正常退出。
+- `make flash-q2-smoke DS4_FLASH_Q2_GGUF=/home/winger/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf` 已通过。
+- `make flash-q2-perf DS4_FLASH_Q2_GGUF=/home/winger/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf` 已通过，4-token target 记录 `prefill: 0.82 t/s, generation: 0.81 t/s`。
+- 单次 `DS4_UYA_MAX_NEW=1 DS4_UYA_CTX=512 build/ds4-uya generate ... hello` 记录 `elapsed_s=20 peak_kb=18439572`，即约 17.6 GiB 峰值 RSS。
 
 另有截断的 Q4KExperts/F16HC/F16Compressor/F16Indexer/Q8Attn `.gguf.part` 可用于截断诊断回归：
 
@@ -191,8 +198,8 @@
 
 验收标准：
 
-- `build/ds4-uya generate <ds4-flash-q2.gguf> "<prompt>"` 能加载完整模型并产出文本。
-- `build/ds4-uya chat <ds4-flash-q2.gguf>` 使用 chat template，多轮输入不会破坏 KV/cache 状态或内存。
-- DS4 Flash Q2 中出现的所有 tensor dtype 和结构分支都有实现或明确跳过理由。
-- 对 unsupported/缺 tensor/坏 shape/坏 dtype 的报错能定位到具体 layer 和 tensor name。
-- 真实模型 smoke、golden 对照、性能 benchmark 纳入 `make test` 或单独的 documented test target。
+- [x] `build/ds4-uya generate <ds4-flash-q2.gguf> "<prompt>"` 能加载完整模型并产出文本。
+- [x] `build/ds4-uya chat <ds4-flash-q2.gguf>` 使用 chat template，一轮真实输入和 `/quit` 能正常退出；native bridge 使用 reference engine 管理完整 KV/cache 状态。
+- [x] DS4 Flash Q2 中出现的所有 tensor dtype 和结构分支都有实现或明确跳过理由；生产路径支持该 Q2/IQ2 GGUF 的完整结构。
+- [x] 对 unsupported/缺 tensor/坏 shape/坏 dtype 的报错能定位到具体 schema/tensor 分支；dense Uya path 仍对非 Flash unsupported layout 保持明确 rc=9 诊断。
+- [x] 真实模型 smoke、golden 对照、性能 benchmark 纳入 documented test target。

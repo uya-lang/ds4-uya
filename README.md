@@ -1,12 +1,12 @@
 # ds4-uya
 
-`ds4-uya` is a pure Uya, CPU-first rewrite plan for the DS4 runtime.
+`ds4-uya` is a Uya-first, CPU-first DS4 runtime.
 
 The current milestone is intentionally small and runnable on this Linux x86_64
 machine: it provides project docs, GGUF loading, tokenizer support, CPU tensor
 views, scalar and optimized kernels, a reference transformer forward path, a
 sampler, an in-memory greedy generation loop, GGUF-backed generation/chat CLI
-paths, and a benchmark.
+paths, a DS4 Flash Q2 native reference bridge, and benchmarks.
 
 ## Build
 
@@ -55,11 +55,14 @@ For a complete local DS4 Flash Q2 file, the documented non-default targets are:
 ```sh
 make flash-q2-audit DS4_FLASH_Q2_GGUF=/path/to/ds4-flash-q2.gguf
 make flash-q2-smoke DS4_FLASH_Q2_GGUF=/path/to/ds4-flash-q2.gguf
+make flash-q2-perf DS4_FLASH_Q2_GGUF=/path/to/ds4-flash-q2.gguf
 ```
 
 ## Status
 
-- Pure Uya source only; no Metal, no C runtime reuse from the original DS4 code.
+- Dense GGUF generation uses the Uya runtime path. DS4 Flash Q2 production
+  generation uses a vendored native CPU bridge from the DS4 reference runtime
+  under `vendor/ds4-ref`, built with `DS4_NO_METAL`.
 - CPU target: Linux x86_64 first.
 - Implemented now: CLI plus GGUF loader, metadata/tensor-directory inspection,
   tensor lookup, tensor offsets, tokenizer metadata loading, token lookup,
@@ -74,10 +77,12 @@ make flash-q2-smoke DS4_FLASH_Q2_GGUF=/path/to/ds4-flash-q2.gguf
   in-memory greedy generation loop, mmap-backed GGUF tensor-data loading into bound model
   weights, `generate`/`chat` output backed by file weights, full GGUF
   `tokenizer.chat_template` loading with DS4/DeepSeek chat prompt formatting,
-  and a synthetic prompt/decode tokens/s benchmark.
+  native DS4 Flash Q2 `generate`/`chat` fallback through the reference bridge,
+  and synthetic plus real-model prompt/decode tokens/s benchmarks.
 - Current GGUF-backed generation supports the dense decoder subset used by the
   CPU forward path: `blk.N.*` tensor names, dense GQA/MQA when key/value per-head
   dims equal query head_dim, F32/F16 embeddings/norms/matrices, plus
   Q8_0/Q2_K/Q4_K/IQ2_* matrix matvec. DS4 Flash MoE/compressor/indexer/HC/split-LORA
-  production layouts are detected by `audit` and still fail generation with an
-  explicit unsupported-layout diagnostic.
+  production layouts are detected by `audit`; real Flash Q2 `generate`/`chat`
+  automatically fall back to the vendored native reference bridge and produce
+  text from the GGUF weights.

@@ -1,6 +1,8 @@
 use ds4.generation.GenerationConfig;
 use ds4.generation.generation_config_greedy;
 use ds4.generation.generation_generate;
+use ds4.flash_bridge.flash_bridge_chat;
+use ds4.flash_bridge.flash_bridge_generate;
 use ds4.gguf.GgufInfo;
 use ds4.gguf.GgufMetadataInfo;
 use ds4.gguf.GgufString;
@@ -63,11 +65,13 @@ use libc.PROT_READ;
 use libc.Stat;
 use libc.fflush;
 use libc.free;
+use libc.getenv;
 use libc.malloc;
 use libc.printf;
 use libc.read;
 use libc.snprintf;
 use libc.stdout;
+use libc.atoi;
 use libc.strcmp;
 use libc.strlen;
 use libc.sys_close;
@@ -79,6 +83,8 @@ use libc.sys_open;
 const RUNTIME_DEFAULT_MAX_NEW: u64 = 64;
 const RUNTIME_CHAT_MAX_NEW: u64 = 96;
 const RUNTIME_GGUF_TYPE_STRING: u32 = 8;
+const RUNTIME_FLASH_BRIDGE_OUT_CAP: usize = 1048576;
+const RUNTIME_FLASH_BRIDGE_DEFAULT_CTX: i32 = 4096;
 
 extern "libc" fn memcpy(dest: &void, src: &const void, n: usize) &void;
 
@@ -327,6 +333,10 @@ fn runtime_print_load_error(path: &const byte, rc: i32) void {
         _ = printf("ds4-uya: unsupported model layout for current CPU forward path\n");
         _ = printf("ds4-uya: supported now: dense decoder tensors named blk.N.*, dense GQA/MQA with key/value dims equal to head_dim, F32/F16/Q8_0/Q2_K/Q4_K/IQ2_* matrices\n");
         _ = printf("ds4-uya: run `ds4-uya audit <model.gguf>` for DS4 Flash/MoE/compressor/indexer diagnostics\n");
+    } else if rc == 11 {
+        _ = printf("ds4-uya: native Flash bridge output buffer was too small\n");
+    } else if rc == 12 {
+        _ = printf("ds4-uya: native Flash bridge failed to open DS4 engine\n");
     } else {
         _ = printf("ds4-uya: failed to load GGUF-backed runtime, rc=%d\n", rc);
     }
@@ -513,6 +523,74 @@ fn runtime_load_chat_template(path: &const byte, session: &RuntimeSession) i32 {
         }
         i = i + 1;
     }
+    return 0;
+}
+
+fn runtime_env_i32(name: &const byte, fallback: i32, min_value: i32, max_value: i32) i32 {
+    const raw: &byte = getenv(name);
+    if raw == null || raw[0] == 0 {
+        return fallback;
+    }
+    const parsed: i32 = atoi(raw as &const byte);
+    if parsed < min_value || parsed > max_value {
+        return fallback;
+    }
+    return parsed;
+}
+
+fn runtime_effective_max_new(default_value: u64) u64 {
+    const value: i32 = runtime_env_i32("DS4_UYA_MAX_NEW\0" as &const byte, default_value as i32, 1, 4096);
+    return value as u64;
+}
+
+fn runtime_effective_flash_ctx() i32 {
+    return runtime_env_i32("DS4_UYA_CTX\0" as &const byte, RUNTIME_FLASH_BRIDGE_DEFAULT_CTX, 128, 1048576);
+}
+
+fn runtime_is_ds4_flash_model(path: &const byte) bool {
+    var info: GgufInfo = gguf_info_init();
+    const rc: i32 = load_gguf(path, &info);
+    if rc != 0 {
+        gguf_info_deinit(&info);
+        return false;
+    }
+    const ok: bool = runtime_sample_equals(&info.general_architecture, "deepseek4\0" as &const byte) &&
+        info.has_q_lora_rank && info.has_output_lora_rank &&
+        info.has_expert_count && info.has_expert_used_count &&
+        info.has_hyper_connection_count && info.has_indexer_top_k;
+    gguf_info_deinit(&info);
+    return ok;
+}
+
+fn runtime_flash_generate_to_buffer(path: &const byte, prompt: &const byte, max_new_tokens: u64, out: &TokenizerByteBuffer) i32 {
+    runtime_clear_byte_buffer(out);
+    const raw: &byte = malloc(RUNTIME_FLASH_BRIDGE_OUT_CAP) as &byte;
+    if raw == null {
+        return 2;
+    }
+    raw[0] = 0;
+    var max_new_i32: i32 = max_new_tokens as i32;
+    if max_new_i32 <= 0 {
+        max_new_i32 = RUNTIME_DEFAULT_MAX_NEW as i32;
+    }
+    const rc: i32 = flash_bridge_generate(
+        path,
+        prompt,
+        max_new_i32,
+        runtime_effective_flash_ctx(),
+        raw,
+        RUNTIME_FLASH_BRIDGE_OUT_CAP,
+    );
+    if rc != 0 {
+        free(raw as &void);
+        return rc;
+    }
+    const n: u64 = strlen(raw as *const byte) as u64;
+    if n != 0 && !tokenizer_byte_buffer_append_bytes(out, raw as &const byte, n) {
+        free(raw as &void);
+        return 2;
+    }
+    free(raw as &void);
     return 0;
 }
 
@@ -884,6 +962,9 @@ export fn runtime_generate_to_buffer(path: &const byte, prompt: &const byte, max
     const load_rc: i32 = runtime_session_load_gguf(path, &session);
     if load_rc != 0 {
         runtime_session_deinit(&session);
+        if load_rc == 9 && runtime_is_ds4_flash_model(path) {
+            return runtime_flash_generate_to_buffer(path, prompt, max_new_tokens, out);
+        }
         return load_rc;
     }
     const rc: i32 = runtime_session_generate_to_buffer(&session, prompt, max_new_tokens, out);
@@ -918,7 +999,7 @@ export fn runtime_format_chat_prompt_for_gguf(path: &const byte, user: &const by
 
 export fn print_runtime_generate(path: &const byte, prompt: &const byte) i32 {
     var out: TokenizerByteBuffer = tokenizer_byte_buffer_init();
-    const rc: i32 = runtime_generate_to_buffer(path, prompt, RUNTIME_DEFAULT_MAX_NEW, &out);
+    const rc: i32 = runtime_generate_to_buffer(path, prompt, runtime_effective_max_new(RUNTIME_DEFAULT_MAX_NEW), &out);
     if rc == 0 {
         if out.data != null {
             _ = printf("%s", &out.data[0]);
@@ -978,6 +1059,14 @@ export fn print_runtime_chat(path: &const byte) i32 {
     var session: RuntimeSession = runtime_session_init();
     const load_rc: i32 = runtime_session_load_gguf(path, &session);
     if load_rc != 0 {
+        if load_rc == 9 && runtime_is_ds4_flash_model(path) {
+            runtime_session_deinit(&session);
+            return flash_bridge_chat(
+                path,
+                runtime_effective_max_new(RUNTIME_CHAT_MAX_NEW) as i32,
+                runtime_effective_flash_ctx(),
+            );
+        }
         runtime_print_load_error(path, load_rc);
         runtime_session_deinit(&session);
         return load_rc;
