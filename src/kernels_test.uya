@@ -13,6 +13,11 @@ use ds4.kernels.kernels_iq2_xxs_dot_f32;
 use ds4.kernels.kernels_q2_k_dot_f32;
 use ds4.kernels.kernels_q4_k_dot_f32;
 use ds4.kernels.kernels_q8_0_dot_f32;
+use ds4.kernels.kernels_q8_0_dot_prequant;
+use ds4.kernels.kernels_q8_0_quantize_activation;
+use ds4.kernels.kernels_q8_k_quantize_activation;
+use ds4.kernels.kernels_q2_k_dot_q8_k;
+use ds4.kernels.kernels_iq2_xxs_dot_q8_k;
 use ds4.kernels.kernels_rms_norm;
 use ds4.kernels.kernels_rope_f32;
 use ds4.kernels.kernels_silu;
@@ -146,6 +151,28 @@ test "q8_0 dot f32" {
     try assert_close(kernels_q8_0_dot_f32(&block[0], &x[0], 4), 12.0f32, 0.00001f32);
 }
 
+test "q8_0 prequant dot" {
+    var block: [byte: 34] = [];
+    var x: [f32: 32] = [];
+    var xq: [i32: 32] = [];
+    var xscale: [f32: 1] = [];
+    block[0] = 0;
+    block[1] = 0x3c;
+    block[2] = 1;
+    block[3] = 2;
+    block[4] = 253;
+    block[5] = 4;
+    x[0] = 32.0f32;
+    x[1] = 64.0f32;
+    x[2] = 95.0f32;
+    x[3] = 127.0f32;
+
+    kernels_q8_0_quantize_activation(&x[0], &xq[0], &xscale[0], 4);
+    try expect(xq[0] == 32);
+    try expect(xq[3] == 127);
+    try assert_close(kernels_q8_0_dot_prequant(&block[0], &xq[0] as &const i32, &xscale[0] as &const f32, 4), 383.0f32, 0.00001f32);
+}
+
 test "q2_k reference dot f32" {
     var block: [byte: 84] = [];
     var x: [f32: 4] = [];
@@ -161,6 +188,28 @@ test "q2_k reference dot f32" {
     x[3] = 1.0f32;
 
     try assert_close(kernels_q2_k_dot_f32(&block[0], &x[0], 4), 6.0f32, 0.00001f32);
+}
+
+test "q2_k q8_k dot" {
+    var block: [byte: 84] = [];
+    var x: [f32: 256] = [];
+    var q8: [i32: 256] = [];
+    var q8d: [f32: 1] = [];
+    var bsums: [i32: 16] = [];
+    block[0] = 1;
+    block[16] = 57;
+    block[80] = 0;
+    block[81] = 0x3c;
+    block[82] = 0;
+    block[83] = 0;
+    var i: usize = 0;
+    while i < 256 {
+        x[i] = 1.0f32;
+        i = i + 1;
+    }
+
+    try expect(kernels_q8_k_quantize_activation(&x[0], &q8[0], &q8d[0], &bsums[0], 256));
+    try assert_close(kernels_q2_k_dot_q8_k(&block[0], &q8[0] as &const i32, &q8d[0] as &const f32, &bsums[0] as &const i32, 256), 1.0f32, 0.00001f32);
 }
 
 test "q4_k reference dot f32" {
@@ -195,6 +244,24 @@ test "iq2_xxs reference dot f32" {
     }
 
     try assert_close(kernels_iq2_xxs_dot_f32(&block[0], &x[0], 8), 8.0f32, 0.00001f32);
+}
+
+test "iq2_xxs q8_k dot" {
+    var block: [byte: 66] = [];
+    var x: [f32: 256] = [];
+    var q8: [i32: 256] = [];
+    var q8d: [f32: 1] = [];
+    var bsums: [i32: 16] = [];
+    block[0] = 0;
+    block[1] = 0x3c;
+    var i: usize = 0;
+    while i < 256 {
+        x[i] = 1.0f32;
+        i = i + 1;
+    }
+
+    try expect(kernels_q8_k_quantize_activation(&x[0], &q8[0], &q8d[0], &bsums[0], 256));
+    try assert_close(kernels_iq2_xxs_dot_q8_k(&block[0], &q8[0] as &const i32, &q8d[0] as &const f32, 256), 256.0f32, 0.00001f32);
 }
 
 test "iq2_xs reference dot f32" {

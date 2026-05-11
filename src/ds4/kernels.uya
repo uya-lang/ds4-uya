@@ -18,6 +18,8 @@ const Q4_K_BLOCK_BYTES: u64 = 144;
 const IQ2_XXS_BLOCK_BYTES: u64 = 66;
 const IQ2_XS_BLOCK_BYTES: u64 = 74;
 const IQ2_S_BLOCK_BYTES: u64 = 82;
+const Q8_K_BLOCK_ELEMS: u64 = 256;
+const Q8_K_GROUP_ELEMS: u64 = 16;
 
 extern "libc" fn memcpy(dest: &void, src: &const void, n: usize) &void;
 
@@ -62,6 +64,16 @@ fn iq2_grid_byte(grid: u64, index: u64) f32 {
 }
 
 fn iq2_apply_sign(value: f32, signs: byte, index: u64) f32 {
+    const mask: byte = (1u32 << (index as i32)) as byte;
+    if (signs & mask) != 0 {
+        return -value;
+    }
+    return value;
+}
+
+fn iq2_grid_signed_i32(grid: u64, signs: byte, index: u64) i32 {
+    const shift: i32 = (index * 8) as i32;
+    const value: i32 = ((grid >> shift) & 0xffu64) as i32;
     const mask: byte = (1u32 << (index as i32)) as byte;
     if (signs & mask) != 0 {
         return -value;
@@ -380,6 +392,267 @@ export fn kernels_q8_0_dot_f32_fast(blocks: &const byte, x: &const f32, n: u64) 
 
 export fn kernels_q8_0_dot_f32(blocks: &const byte, x: &const f32, n: u64) f32 {
     return kernels_q8_0_dot_f32_fast(blocks, x, n);
+}
+
+export fn kernels_q8_0_block_count(n: u64) u64 {
+    return (n + Q8_0_BLOCK_ELEMS - 1) / Q8_0_BLOCK_ELEMS;
+}
+
+export fn kernels_q8_0_padded_elems(n: u64) u64 {
+    return kernels_q8_0_block_count(n) * Q8_0_BLOCK_ELEMS;
+}
+
+fn kernels_q8_round_to_i32(value: f32) i32 {
+    if value >= 0.0f32 {
+        return (value + 0.5f32) as i32;
+    }
+    return (value - 0.5f32) as i32;
+}
+
+export fn kernels_q8_0_quantize_activation(x: &const f32, xq: &i32, xscale: &f32, n: u64) void {
+    const blocks: u64 = kernels_q8_0_block_count(n);
+    var b: u64 = 0;
+    while b < blocks {
+        const elem_base: u64 = b * Q8_0_BLOCK_ELEMS;
+        var limit: u64 = Q8_0_BLOCK_ELEMS;
+        if n - elem_base < limit {
+            limit = n - elem_base;
+        }
+
+        var amax: f32 = 0.0f32;
+        var j: u64 = 0;
+        while j < limit {
+            var ax: f32 = x[(elem_base + j) as usize];
+            if ax < 0.0f32 {
+                ax = -ax;
+            }
+            if ax > amax {
+                amax = ax;
+            }
+            j = j + 1;
+        }
+
+        const d: f32 = amax / 127.0f32;
+        var id: f32 = 0.0f32;
+        if d != 0.0f32 {
+            id = 1.0f32 / d;
+        }
+        xscale[b as usize] = d;
+        j = 0;
+        while j < limit {
+            var q: i32 = kernels_q8_round_to_i32(x[(elem_base + j) as usize] * id);
+            if q > 127 { q = 127; }
+            if q < -128 { q = -128; }
+            xq[(elem_base + j) as usize] = q;
+            j = j + 1;
+        }
+        while j < Q8_0_BLOCK_ELEMS {
+            xq[(elem_base + j) as usize] = 0;
+            j = j + 1;
+        }
+        b = b + 1;
+    }
+}
+
+export fn kernels_q8_0_dot_prequant(blocks: &const byte, xq: &const i32, xscale: &const f32, n: u64) f32 {
+    var acc: f32 = 0.0f32;
+    const block_count: u64 = kernels_q8_0_block_count(n);
+    var b: u64 = 0;
+    while b < block_count {
+        const elem_base: u64 = b * Q8_0_BLOCK_ELEMS;
+        const block_base: u64 = b * Q8_0_BLOCK_BYTES;
+        var limit: u64 = Q8_0_BLOCK_ELEMS;
+        if n - elem_base < limit {
+            limit = n - elem_base;
+        }
+        var isum: i32 = 0;
+        var j: u64 = 0;
+        while j < limit {
+            const q: i32 = signed_byte_value(blocks[(block_base + 2 + j) as usize]);
+            isum = isum + q * xq[(elem_base + j) as usize];
+            j = j + 1;
+        }
+        acc = acc + kernels_f16_load(blocks, b * 17) * xscale[b as usize] * (isum as f32);
+        b = b + 1;
+    }
+    return acc;
+}
+
+export fn kernels_q8_k_block_count(n: u64) u64 {
+    return (n + Q8_K_BLOCK_ELEMS - 1) / Q8_K_BLOCK_ELEMS;
+}
+
+export fn kernels_q8_k_quantize_activation(x: &const f32, qs: &i32, d: &f32, bsums: &i32, n: u64) bool {
+    if (n % Q8_K_BLOCK_ELEMS) != 0 {
+        return false;
+    }
+    const blocks: u64 = n / Q8_K_BLOCK_ELEMS;
+    var b: u64 = 0;
+    while b < blocks {
+        const elem_base: u64 = b * Q8_K_BLOCK_ELEMS;
+        var max: f32 = 0.0f32;
+        var amax: f32 = 0.0f32;
+        var j: u64 = 0;
+        while j < Q8_K_BLOCK_ELEMS {
+            var ax: f32 = x[(elem_base + j) as usize];
+            if ax < 0.0f32 { ax = -ax; }
+            if ax > amax {
+                amax = ax;
+                max = x[(elem_base + j) as usize];
+            }
+            j = j + 1;
+        }
+        if amax == 0.0f32 {
+            d[b as usize] = 0.0f32;
+            j = 0;
+            while j < Q8_K_BLOCK_ELEMS {
+                qs[(elem_base + j) as usize] = 0;
+                j = j + 1;
+            }
+            j = 0;
+            while j < Q8_K_BLOCK_ELEMS / Q8_K_GROUP_ELEMS {
+                bsums[(b * (Q8_K_BLOCK_ELEMS / Q8_K_GROUP_ELEMS) + j) as usize] = 0;
+                j = j + 1;
+            }
+            b = b + 1;
+            continue;
+        }
+
+        const iscale: f32 = -127.0f32 / max;
+        j = 0;
+        while j < Q8_K_BLOCK_ELEMS {
+            var q: i32 = kernels_q8_round_to_i32(iscale * x[(elem_base + j) as usize]);
+            if q > 127 { q = 127; }
+            if q < -128 { q = -128; }
+            qs[(elem_base + j) as usize] = q;
+            j = j + 1;
+        }
+        var group: u64 = 0;
+        while group < Q8_K_BLOCK_ELEMS / Q8_K_GROUP_ELEMS {
+            var sum: i32 = 0;
+            j = 0;
+            while j < Q8_K_GROUP_ELEMS {
+                sum = sum + qs[(elem_base + group * Q8_K_GROUP_ELEMS + j) as usize];
+                j = j + 1;
+            }
+            bsums[(b * (Q8_K_BLOCK_ELEMS / Q8_K_GROUP_ELEMS) + group) as usize] = sum;
+            group = group + 1;
+        }
+        d[b as usize] = 1.0f32 / iscale;
+        b = b + 1;
+    }
+    return true;
+}
+
+fn kernels_iq2_pair_dot16(grid0: u64, signs0: byte, grid1: u64, signs1: byte, q8: &const i32, q8_off: u64) i32 {
+    var sum: i32 = 0;
+    var i: u64 = 0;
+    while i < 8 {
+        sum = sum + iq2_grid_signed_i32(grid0, signs0, i) * q8[(q8_off + i) as usize];
+        i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+        sum = sum + iq2_grid_signed_i32(grid1, signs1, i) * q8[(q8_off + 8 + i) as usize];
+        i = i + 1;
+    }
+    return sum;
+}
+
+export fn kernels_iq2_xxs_dot_q8_k(blocks: &const byte, q8_qs: &const i32, q8_d: &const f32, n: u64) f32 {
+    if (n % Q8_K_BLOCK_ELEMS) != 0 {
+        return 0.0f32;
+    }
+    const block_count: u64 = n / Q8_K_BLOCK_ELEMS;
+    var sumf: f32 = 0.0f32;
+    var b: u64 = 0;
+    while b < block_count {
+        const block_base: u64 = b * IQ2_XXS_BLOCK_BYTES;
+        const d: f32 = kernels_f16_to_f32(le_u16_at(blocks, block_base)) * q8_d[b as usize];
+        var q8_off: u64 = b * Q8_K_BLOCK_ELEMS;
+        var bsum: i32 = 0;
+        var ib32: u64 = 0;
+        while ib32 < 8 {
+            const aux_base: u64 = block_base + 2 + ib32 * 8;
+            const aux0: u32 = le_u32_at(blocks, aux_base);
+            const aux1: u32 = le_u32_at(blocks, aux_base + 4);
+            const aux8_0: u64 = (aux0 & 0xffu32) as u64;
+            const aux8_1: u64 = ((aux0 >> 8) & 0xffu32) as u64;
+            const aux8_2: u64 = ((aux0 >> 16) & 0xffu32) as u64;
+            const aux8_3: u64 = ((aux0 >> 24) & 0xffu32) as u64;
+            const ls: i32 = (2 * ((aux1 >> 28) as i32)) + 1;
+            var sumi: i32 = 0;
+            const sign0: u64 = (aux1 & 127u32) as u64;
+            const sign1: u64 = ((aux1 >> 7) & 127u32) as u64;
+            const sign2: u64 = ((aux1 >> 14) & 127u32) as u64;
+            const sign3: u64 = ((aux1 >> 21) & 127u32) as u64;
+            sumi = sumi + kernels_iq2_pair_dot16(iq2_grid_xxs(aux8_0), iq2_signs(sign0), iq2_grid_xxs(aux8_1), iq2_signs(sign1), q8_qs, q8_off);
+            q8_off = q8_off + 16;
+            sumi = sumi + kernels_iq2_pair_dot16(iq2_grid_xxs(aux8_2), iq2_signs(sign2), iq2_grid_xxs(aux8_3), iq2_signs(sign3), q8_qs, q8_off);
+            q8_off = q8_off + 16;
+            bsum = bsum + sumi * ls;
+            ib32 = ib32 + 1;
+        }
+        sumf = sumf + d * (bsum as f32);
+        b = b + 1;
+    }
+    return 0.125f32 * sumf;
+}
+
+fn kernels_q2_dot16(q2: &const byte, q2_off: u64, q8: &const i32, q8_off: u64, shift: i32) i32 {
+    var sum: i32 = 0;
+    var i: u64 = 0;
+    while i < 16 {
+        const q: i32 = ((q2[(q2_off + i) as usize] >> shift) & (3 as byte)) as i32;
+        sum = sum + q8[(q8_off + i) as usize] * q;
+        i = i + 1;
+    }
+    return sum;
+}
+
+export fn kernels_q2_k_dot_q8_k(blocks: &const byte, q8_qs: &const i32, q8_d: &const f32, q8_bsums: &const i32, n: u64) f32 {
+    if (n % Q8_K_BLOCK_ELEMS) != 0 {
+        return 0.0f32;
+    }
+    const block_count: u64 = n / Q8_K_BLOCK_ELEMS;
+    var sumf: f32 = 0.0f32;
+    var b: u64 = 0;
+    while b < block_count {
+        const block_base: u64 = b * Q2_K_BLOCK_BYTES;
+        const qs_base: u64 = block_base + 16;
+        const sc: &const byte = &blocks[block_base as usize];
+        var summs: i32 = 0;
+        var j: u64 = 0;
+        while j < 16 {
+            summs = summs + q8_bsums[(b * 16 + j) as usize] * ((sc[j as usize] >> 4) as i32);
+            j = j + 1;
+        }
+
+        const dall: f32 = q8_d[b as usize] * kernels_f16_to_f32(le_u16_at(blocks, block_base + 80));
+        const dmin: f32 = q8_d[b as usize] * kernels_f16_to_f32(le_u16_at(blocks, block_base + 82));
+        var isum: i32 = 0;
+        var is: u64 = 0;
+        var k: u64 = 0;
+        while k < 2 {
+            const q2_off: u64 = qs_base + k * 32;
+            var shift: i32 = 0;
+            j = 0;
+            while j < 4 {
+                var scale: i32 = (sc[is as usize] & (15 as byte)) as i32;
+                isum = isum + scale * kernels_q2_dot16(blocks, q2_off, q8_qs, b * Q8_K_BLOCK_ELEMS + k * 128 + j * 32, shift);
+                is = is + 1;
+                scale = (sc[is as usize] & (15 as byte)) as i32;
+                isum = isum + scale * kernels_q2_dot16(blocks, q2_off + 16, q8_qs, b * Q8_K_BLOCK_ELEMS + k * 128 + j * 32 + 16, shift);
+                is = is + 1;
+                shift = shift + 2;
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+        sumf = sumf + dall * (isum as f32) - dmin * (summs as f32);
+        b = b + 1;
+    }
+    return sumf;
 }
 
 export fn kernels_q2_k_dot_f32_reference(blocks: &const byte, x: &const f32, n: u64) f32 {

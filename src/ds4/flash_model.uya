@@ -1,0 +1,2121 @@
+use ds4.flash.flash_compressor_decode_one;
+use ds4.flash.flash_hc_pre_from_state_one;
+use ds4.flash.flash_hc_post_one;
+use ds4.flash.flash_hc_weighted_sum_one;
+use ds4.generation.GenerationConfig;
+use ds4.kernels.kernels_f16_load;
+use ds4.kernels.kernels_f32_dot;
+use ds4.kernels.kernels_f32_to_f16;
+use ds4.kernels.kernels_iq2_s_dot_f32;
+use ds4.kernels.kernels_iq2_xs_dot_f32;
+use ds4.kernels.kernels_iq2_xxs_dot_f32;
+use ds4.kernels.kernels_q2_k_dot_f32;
+use ds4.kernels.kernels_q4_k_dot_f32;
+use ds4.kernels.kernels_q8_0_block_count;
+use ds4.kernels.kernels_q8_0_dot_f32;
+use ds4.kernels.kernels_q8_0_dot_prequant;
+use ds4.kernels.kernels_q8_0_padded_elems;
+use ds4.kernels.kernels_q8_0_quantize_activation;
+use ds4.moe.MoeConfig;
+use ds4.moe.MoeLayerWeights;
+use ds4.moe.MoeScratch;
+use ds4.moe.moe_config_init;
+use ds4.moe.moe_forward_one_scratch;
+use ds4.moe.moe_layer_weights_init;
+use ds4.moe.moe_layer_weights_validate;
+use ds4.moe.moe_matvec;
+use ds4.moe.moe_scratch_deinit;
+use ds4.moe.moe_scratch_empty;
+use ds4.moe.moe_scratch_init;
+use ds4.sampler.SamplerState;
+use ds4.sampler.sampler_sample;
+use ds4.tensor.TensorDType;
+use ds4.tensor.TensorView;
+use ds4.tensor.TensorWeightTable;
+use ds4.tensor.tensor_weight_table_find;
+use ds4.gguf.GgufInfo;
+use libc.ceilf;
+use libc.cosf;
+use libc.expf;
+use libc.fabsf;
+use libc.floorf;
+use libc.free;
+use libc.getenv;
+use libc.logf;
+use libc.log2f;
+use libc.malloc;
+use libc.powf;
+use libc.printf;
+use libc.atoi;
+use libc.pthread_attr_destroy;
+use libc.pthread_attr_init;
+use libc.pthread_attr_setstacksize;
+use libc.pthread_attr_t;
+use libc.pthread_create;
+use libc.pthread_join;
+use libc.pthread_t;
+use libc.sinf;
+use libc.snprintf;
+use libc.sqrtf;
+
+const FLASH_MODEL_NEG_INF: f32 = -1000000000000000019884624838656.0f32;
+const FLASH_RMS_EPS: f32 = 0.000001f32;
+const FLASH_HC_EPS: f32 = 0.000001f32;
+const FLASH_EXPERT_WEIGHT_SCALE: f32 = 1.5f32;
+const FLASH_SWIGLU_CLAMP: f32 = 10.0f32;
+const FLASH_ROPE_FREQ_BASE: f32 = 10000.0f32;
+const FLASH_COMPRESS_ROPE_FREQ_BASE: f32 = 160000.0f32;
+const FLASH_ROPE_SCALE_FACTOR: f32 = 16.0f32;
+const FLASH_ROPE_YARN_BETA_FAST: f32 = 32.0f32;
+const FLASH_ROPE_YARN_BETA_SLOW: f32 = 1.0f32;
+const FLASH_ROPE_ORIG_CTX: u64 = 65536;
+const FLASH_MAX_THREADS: u64 = 16;
+const FLASH_DEFAULT_THREADS: u64 = 8;
+const FLASH_THREAD_STACK: usize = 262144;
+
+export const FLASH_DS4_N_LAYER: u64 = 43;
+export const FLASH_DS4_N_EMBD: u64 = 4096;
+export const FLASH_DS4_N_VOCAB: u64 = 129280;
+export const FLASH_DS4_N_HEAD: u64 = 64;
+export const FLASH_DS4_N_HEAD_KV: u64 = 1;
+export const FLASH_DS4_N_HEAD_DIM: u64 = 512;
+export const FLASH_DS4_N_VALUE_DIM: u64 = 512;
+export const FLASH_DS4_N_ROT: u64 = 64;
+export const FLASH_DS4_N_OUT_GROUP: u64 = 8;
+export const FLASH_DS4_N_LORA_Q: u64 = 1024;
+export const FLASH_DS4_N_LORA_O: u64 = 1024;
+export const FLASH_DS4_N_EXPERT: u64 = 256;
+export const FLASH_DS4_N_EXPERT_USED: u64 = 6;
+export const FLASH_DS4_N_EXPERT_SHARED: u64 = 1;
+export const FLASH_DS4_N_FF_EXP: u64 = 2048;
+export const FLASH_DS4_N_HASH_LAYER: u64 = 3;
+export const FLASH_DS4_N_SWA: u64 = 128;
+export const FLASH_DS4_N_INDEXER_HEAD: u64 = 64;
+export const FLASH_DS4_N_INDEXER_HEAD_DIM: u64 = 128;
+export const FLASH_DS4_N_INDEXER_TOP_K: u64 = 512;
+export const FLASH_DS4_N_HC: u64 = 4;
+export const FLASH_DS4_N_HC_SINKHORN_ITER: u64 = 20;
+
+extern "libc" fn memcpy(dest: &void, src: &const void, n: usize) &void;
+
+export struct FlashConfig {
+    n_vocab: u64,
+    n_embd: u64,
+    n_layer: u64,
+    n_ctx: u64,
+    n_head: u64,
+    n_head_kv: u64,
+    head_dim: u64,
+    value_dim: u64,
+    rope_dim: u64,
+    q_lora: u64,
+    out_lora: u64,
+    out_groups: u64,
+    n_expert: u64,
+    n_expert_used: u64,
+    n_ff_exp: u64,
+    n_shared_expert: u64,
+    hash_layers: u64,
+    sliding_window: u64,
+    indexer_heads: u64,
+    indexer_head_dim: u64,
+    indexer_top_k: u64,
+    n_hc: u64,
+    rms_eps: f32,
+    hc_eps: f32,
+    rope_freq_base: f32,
+    compress_rope_freq_base: f32,
+    rope_scale_factor: f32,
+}
+
+export struct FlashLayerWeights {
+    hc_attn_fn: &TensorView,
+    hc_attn_scale: &TensorView,
+    hc_attn_base: &TensorView,
+    attn_norm: &TensorView,
+    attn_q_a: &TensorView,
+    attn_q_a_norm: &TensorView,
+    attn_q_b: &TensorView,
+    attn_kv: &TensorView,
+    attn_kv_a_norm: &TensorView,
+    attn_sinks: &TensorView,
+    attn_output_a: &TensorView,
+    attn_output_b: &TensorView,
+    attn_compressor_ape: &TensorView,
+    attn_compressor_kv: &TensorView,
+    attn_compressor_gate: &TensorView,
+    attn_compressor_norm: &TensorView,
+    indexer_attn_q_b: &TensorView,
+    indexer_proj: &TensorView,
+    indexer_compressor_ape: &TensorView,
+    indexer_compressor_kv: &TensorView,
+    indexer_compressor_gate: &TensorView,
+    indexer_compressor_norm: &TensorView,
+    hc_ffn_fn: &TensorView,
+    hc_ffn_scale: &TensorView,
+    hc_ffn_base: &TensorView,
+    ffn_norm: &TensorView,
+    moe: MoeLayerWeights,
+}
+
+export struct FlashWeights {
+    token_embd: &TensorView,
+    output_hc_base: &TensorView,
+    output_hc_fn: &TensorView,
+    output_hc_scale: &TensorView,
+    output_norm: &TensorView,
+    output: &TensorView,
+    layers: &FlashLayerWeights,
+    n_layer: u64,
+    owns_layers: bool,
+}
+
+export struct FlashModel {
+    config: FlashConfig,
+    weights: &FlashWeights,
+}
+
+export struct FlashLayerState {
+    raw_kv: &f32,
+    n_raw: u64,
+    cap_raw: u64,
+    compress_ratio: u64,
+    comp_cap: u64,
+    n_comp: u64,
+    attn_comp_kv: &f32,
+    attn_state_kv: &f32,
+    attn_state_score: &f32,
+    n_index_comp: u64,
+    index_comp_kv: &f32,
+    index_state_kv: &f32,
+    index_state_score: &f32,
+}
+
+export struct FlashScratch {
+    plain: &f32,
+    cur: &f32,
+    next: &f32,
+    attn_cur: &f32,
+    attn_norm: &f32,
+    attn_residual: &f32,
+    q: &f32,
+    qr: &f32,
+    qr_norm: &f32,
+    kv_raw: &f32,
+    kv: &f32,
+    heads: &f32,
+    attn_low: &f32,
+    attn_out: &f32,
+    after_attn_hc: &f32,
+    attn_score: &f32,
+    comp: &f32,
+    index_comp: &f32,
+    comp_kv_cur: &f32,
+    comp_sc_cur: &f32,
+    comp_pooled: &f32,
+    index_allowed: &bool,
+    index_q: &f32,
+    index_weights: &f32,
+    index_scores: &f32,
+    ffn_cur: &f32,
+    ffn_norm: &f32,
+    ffn_out: &f32,
+    hc_flat: &f32,
+    hc_mix: &f32,
+    hc_split: &f32,
+    hc_sinkhorn: &f32,
+    output_flat: &f32,
+    output_pre: &f32,
+    output_weights: &f32,
+    output_embd: &f32,
+    output_norm: &f32,
+    q8_xq: &i32,
+    q8_xscale: &f32,
+    q8_cap: u64,
+    q8_block_cap: u64,
+    moe_scratch: MoeScratch,
+    attn_score_cap: u64,
+    index_score_cap: u64,
+}
+
+export struct FlashState {
+    layers: &FlashLayerState,
+    n_layer: u64,
+    ctx_size: u64,
+    raw_cap: u64,
+    scratch: FlashScratch,
+    next_pos: u64,
+    loaded: bool,
+}
+
+struct FlashQ8MatvecThreadCtx {
+    out: &f32,
+    view: &TensorView,
+    xq: &const i32,
+    xscale: &const f32,
+    in_dim: u64,
+    start: u64,
+    end: u64,
+}
+
+struct FlashGroupedQ8ThreadCtx {
+    out: &f32,
+    view: &TensorView,
+    xq: &const i32,
+    xscale: &const f32,
+    rank: u64,
+    group_dim: u64,
+    padded: u64,
+    blocks: u64,
+    start: u64,
+    end: u64,
+}
+
+fn flash_f32_from_bits(bits: u64) f32 {
+    var raw: u32 = bits as u32;
+    var value: f32 = 0.0f32;
+    _ = memcpy(&value as &void, &raw as &const void, 4 as usize);
+    return value;
+}
+
+export fn flash_config_default() FlashConfig {
+    return FlashConfig{
+        n_vocab: FLASH_DS4_N_VOCAB,
+        n_embd: FLASH_DS4_N_EMBD,
+        n_layer: FLASH_DS4_N_LAYER,
+        n_ctx: 0,
+        n_head: FLASH_DS4_N_HEAD,
+        n_head_kv: FLASH_DS4_N_HEAD_KV,
+        head_dim: FLASH_DS4_N_HEAD_DIM,
+        value_dim: FLASH_DS4_N_VALUE_DIM,
+        rope_dim: FLASH_DS4_N_ROT,
+        q_lora: FLASH_DS4_N_LORA_Q,
+        out_lora: FLASH_DS4_N_LORA_O,
+        out_groups: FLASH_DS4_N_OUT_GROUP,
+        n_expert: FLASH_DS4_N_EXPERT,
+        n_expert_used: FLASH_DS4_N_EXPERT_USED,
+        n_ff_exp: FLASH_DS4_N_FF_EXP,
+        n_shared_expert: FLASH_DS4_N_EXPERT_SHARED,
+        hash_layers: FLASH_DS4_N_HASH_LAYER,
+        sliding_window: FLASH_DS4_N_SWA,
+        indexer_heads: FLASH_DS4_N_INDEXER_HEAD,
+        indexer_head_dim: FLASH_DS4_N_INDEXER_HEAD_DIM,
+        indexer_top_k: FLASH_DS4_N_INDEXER_TOP_K,
+        n_hc: FLASH_DS4_N_HC,
+        rms_eps: FLASH_RMS_EPS,
+        hc_eps: FLASH_HC_EPS,
+        rope_freq_base: FLASH_ROPE_FREQ_BASE,
+        compress_rope_freq_base: FLASH_COMPRESS_ROPE_FREQ_BASE,
+        rope_scale_factor: FLASH_ROPE_SCALE_FACTOR,
+    };
+}
+
+export fn flash_layer_compress_ratio(layer: u64) u64 {
+    if layer < 2 {
+        return 0;
+    }
+    if (layer % (2 as u64)) == 0 {
+        return 4;
+    }
+    return 128;
+}
+
+export fn flash_config_from_gguf(info: &GgufInfo, out: &FlashConfig) bool {
+    if info == null || out == null {
+        return false;
+    }
+    if !info.has_block_count || !info.has_embedding_length || !info.has_head_count ||
+        !info.has_head_count_kv || !info.has_key_length || !info.has_value_length ||
+        !info.has_rope_dimension_count || !info.has_q_lora_rank ||
+        !info.has_output_lora_rank || !info.has_output_group_count ||
+        !info.has_expert_count || !info.has_expert_used_count ||
+        !info.has_expert_feed_forward_length || !info.has_expert_shared_count ||
+        !info.has_attention_sliding_window || !info.has_indexer_head_count ||
+        !info.has_indexer_key_length || !info.has_indexer_top_k ||
+        !info.has_hyper_connection_count {
+        return false;
+    }
+
+    if info.block_count != FLASH_DS4_N_LAYER ||
+        info.embedding_length != FLASH_DS4_N_EMBD ||
+        info.head_count != FLASH_DS4_N_HEAD ||
+        info.head_count_kv != FLASH_DS4_N_HEAD_KV ||
+        info.key_length != FLASH_DS4_N_HEAD_DIM ||
+        info.value_length != FLASH_DS4_N_VALUE_DIM ||
+        info.rope_dimension_count != FLASH_DS4_N_ROT ||
+        info.q_lora_rank != FLASH_DS4_N_LORA_Q ||
+        info.output_lora_rank != FLASH_DS4_N_LORA_O ||
+        info.output_group_count != FLASH_DS4_N_OUT_GROUP ||
+        info.expert_count != FLASH_DS4_N_EXPERT ||
+        info.expert_used_count != FLASH_DS4_N_EXPERT_USED ||
+        info.expert_feed_forward_length != FLASH_DS4_N_FF_EXP ||
+        info.expert_shared_count != FLASH_DS4_N_EXPERT_SHARED ||
+        info.attention_sliding_window != FLASH_DS4_N_SWA ||
+        info.indexer_head_count != FLASH_DS4_N_INDEXER_HEAD ||
+        info.indexer_key_length != FLASH_DS4_N_INDEXER_HEAD_DIM ||
+        info.indexer_top_k != FLASH_DS4_N_INDEXER_TOP_K ||
+        info.hyper_connection_count != FLASH_DS4_N_HC {
+        return false;
+    }
+
+    var config: FlashConfig = flash_config_default();
+    if info.has_context_length {
+        config.n_ctx = info.context_length;
+    } else {
+        config.n_ctx = FLASH_ROPE_ORIG_CTX;
+    }
+    if info.has_rms_eps {
+        config.rms_eps = flash_f32_from_bits(info.rms_eps_bits);
+    }
+    if info.has_rope_freq_base {
+        config.rope_freq_base = flash_f32_from_bits(info.rope_freq_base_bits);
+    }
+    if info.has_rope_scaling_factor {
+        config.rope_scale_factor = flash_f32_from_bits(info.rope_scaling_factor_bits);
+    }
+    *out = config;
+    return true;
+}
+
+export fn flash_weights_init() FlashWeights {
+    return FlashWeights{
+        token_embd: null,
+        output_hc_base: null,
+        output_hc_fn: null,
+        output_hc_scale: null,
+        output_norm: null,
+        output: null,
+        layers: null,
+        n_layer: 0,
+        owns_layers: false,
+    };
+}
+
+export fn flash_weights_deinit(weights: &FlashWeights) void {
+    if weights.owns_layers && weights.layers != null {
+        free(weights.layers as &void);
+    }
+    *weights = flash_weights_init();
+}
+
+fn flash_layer_weights_zero() FlashLayerWeights {
+    return FlashLayerWeights{
+        hc_attn_fn: null,
+        hc_attn_scale: null,
+        hc_attn_base: null,
+        attn_norm: null,
+        attn_q_a: null,
+        attn_q_a_norm: null,
+        attn_q_b: null,
+        attn_kv: null,
+        attn_kv_a_norm: null,
+        attn_sinks: null,
+        attn_output_a: null,
+        attn_output_b: null,
+        attn_compressor_ape: null,
+        attn_compressor_kv: null,
+        attn_compressor_gate: null,
+        attn_compressor_norm: null,
+        indexer_attn_q_b: null,
+        indexer_proj: null,
+        indexer_compressor_ape: null,
+        indexer_compressor_kv: null,
+        indexer_compressor_gate: null,
+        indexer_compressor_norm: null,
+        hc_ffn_fn: null,
+        hc_ffn_scale: null,
+        hc_ffn_base: null,
+        ffn_norm: null,
+        moe: moe_layer_weights_init(),
+    };
+}
+
+fn flash_make_layer_name(out: &byte, cap: usize, layer: u64, suffix: &const byte) bool {
+    const rc: i32 = snprintf(out, cap, "blk.%llu.%s\0" as &const byte, layer, suffix);
+    return rc > 0 && (rc as usize) < cap;
+}
+
+fn flash_find_layer_tensor(table: &TensorWeightTable, layer: u64, suffix: &const byte) &TensorView {
+    var name: [byte: 160] = [];
+    if !flash_make_layer_name(&name[0], 160, layer, suffix) {
+        return null;
+    }
+    return tensor_weight_table_find(table, &name[0] as &const byte);
+}
+
+fn flash_view_shape(view: &TensorView, dtype: TensorDType, n_dims: u32, d0: u64, d1: u64, d2: u64) bool {
+    if view == null || view.dtype != dtype || view.n_dims != n_dims {
+        return false;
+    }
+    if n_dims > 0 && view.shape[0] != d0 { return false; }
+    if n_dims > 1 && view.shape[1] != d1 { return false; }
+    if n_dims > 2 && view.shape[2] != d2 { return false; }
+    return true;
+}
+
+fn flash_dtype_is_matvec_supported(dtype: TensorDType) bool {
+    return dtype == TensorDType.F32 || dtype == TensorDType.F16 ||
+        dtype == TensorDType.Q8_0 || dtype == TensorDType.Q2_K ||
+        dtype == TensorDType.Q4_K || dtype == TensorDType.IQ2_XXS ||
+        dtype == TensorDType.IQ2_XS || dtype == TensorDType.IQ2_S;
+}
+
+fn flash_view_matrix_supported(view: &TensorView, in_dim: u64, out_dim: u64) bool {
+    return view != null && view.n_dims == 2 && view.shape[0] == in_dim &&
+        view.shape[1] == out_dim && flash_dtype_is_matvec_supported(view.dtype);
+}
+
+fn flash_view_expert_supported(view: &TensorView, in_dim: u64, out_dim: u64, n_expert: u64) bool {
+    return view != null && view.n_dims == 3 && view.shape[0] == in_dim &&
+        view.shape[1] == out_dim && view.shape[2] == n_expert &&
+        (view.dtype == TensorDType.IQ2_XXS || view.dtype == TensorDType.Q2_K ||
+         view.dtype == TensorDType.Q4_K || view.dtype == TensorDType.IQ2_XS ||
+         view.dtype == TensorDType.IQ2_S);
+}
+
+fn flash_layer_weights_validate(layer: &FlashLayerWeights, config: &FlashConfig, layer_index: u64) bool {
+    const hc_dim: u64 = config.n_embd * config.n_hc;
+    const hc_mix_dim: u64 = 2 * config.n_hc + config.n_hc * config.n_hc;
+    const q_dim: u64 = config.n_head * config.head_dim;
+    const out_low_dim: u64 = config.out_groups * config.out_lora;
+    const group_dim: u64 = config.head_dim * (config.n_head / config.out_groups);
+    const ratio: u64 = flash_layer_compress_ratio(layer_index);
+
+    if !flash_view_shape(layer.hc_attn_fn, TensorDType.F16, 2, hc_dim, hc_mix_dim, 0) ||
+        !flash_view_shape(layer.hc_attn_scale, TensorDType.F32, 1, 3, 0, 0) ||
+        !flash_view_shape(layer.hc_attn_base, TensorDType.F32, 1, hc_mix_dim, 0, 0) ||
+        !flash_view_shape(layer.attn_norm, TensorDType.F32, 1, config.n_embd, 0, 0) ||
+        !flash_view_shape(layer.attn_q_a, TensorDType.Q8_0, 2, config.n_embd, config.q_lora, 0) ||
+        !flash_view_shape(layer.attn_q_a_norm, TensorDType.F32, 1, config.q_lora, 0, 0) ||
+        !flash_view_shape(layer.attn_q_b, TensorDType.Q8_0, 2, config.q_lora, q_dim, 0) ||
+        !flash_view_shape(layer.attn_kv, TensorDType.Q8_0, 2, config.n_embd, config.head_dim, 0) ||
+        !flash_view_shape(layer.attn_kv_a_norm, TensorDType.F32, 1, config.head_dim, 0, 0) ||
+        !flash_view_shape(layer.attn_sinks, TensorDType.F32, 1, config.n_head, 0, 0) ||
+        !flash_view_shape(layer.attn_output_a, TensorDType.Q8_0, 2, group_dim, out_low_dim, 0) ||
+        !flash_view_shape(layer.attn_output_b, TensorDType.Q8_0, 2, out_low_dim, config.n_embd, 0) {
+        return false;
+    }
+
+    if ratio != 0 {
+        var coff: u64 = 1;
+        if ratio == 4 { coff = 2; }
+        const comp_width: u64 = coff * config.head_dim;
+        if !flash_view_shape(layer.attn_compressor_ape, TensorDType.F16, 2, comp_width, ratio, 0) ||
+            !flash_view_shape(layer.attn_compressor_kv, TensorDType.F16, 2, config.n_embd, comp_width, 0) ||
+            !flash_view_shape(layer.attn_compressor_gate, TensorDType.F16, 2, config.n_embd, comp_width, 0) ||
+            !flash_view_shape(layer.attn_compressor_norm, TensorDType.F32, 1, config.head_dim, 0, 0) {
+            return false;
+        }
+    }
+
+    if ratio == 4 {
+        const index_q_dim: u64 = config.indexer_heads * config.indexer_head_dim;
+        const index_width: u64 = 2 * config.indexer_head_dim;
+        if !flash_view_shape(layer.indexer_attn_q_b, TensorDType.F16, 2, config.q_lora, index_q_dim, 0) ||
+            !flash_view_shape(layer.indexer_proj, TensorDType.F16, 2, config.n_embd, config.indexer_heads, 0) ||
+            !flash_view_shape(layer.indexer_compressor_ape, TensorDType.F16, 2, index_width, ratio, 0) ||
+            !flash_view_shape(layer.indexer_compressor_kv, TensorDType.F16, 2, config.n_embd, index_width, 0) ||
+            !flash_view_shape(layer.indexer_compressor_gate, TensorDType.F16, 2, config.n_embd, index_width, 0) ||
+            !flash_view_shape(layer.indexer_compressor_norm, TensorDType.F32, 1, config.indexer_head_dim, 0, 0) {
+            return false;
+        }
+    }
+
+    if !flash_view_shape(layer.hc_ffn_fn, TensorDType.F16, 2, hc_dim, hc_mix_dim, 0) ||
+        !flash_view_shape(layer.hc_ffn_scale, TensorDType.F32, 1, 3, 0, 0) ||
+        !flash_view_shape(layer.hc_ffn_base, TensorDType.F32, 1, hc_mix_dim, 0, 0) ||
+        !flash_view_shape(layer.ffn_norm, TensorDType.F32, 1, config.n_embd, 0, 0) ||
+        !flash_view_matrix_supported(layer.moe.ffn_gate_inp, config.n_embd, config.n_expert) ||
+        !flash_view_expert_supported(layer.moe.ffn_gate_exps, config.n_embd, config.n_ff_exp, config.n_expert) ||
+        !flash_view_expert_supported(layer.moe.ffn_up_exps, config.n_embd, config.n_ff_exp, config.n_expert) ||
+        !flash_view_expert_supported(layer.moe.ffn_down_exps, config.n_ff_exp, config.n_embd, config.n_expert) ||
+        !flash_view_shape(layer.moe.ffn_gate_shexp, TensorDType.Q8_0, 2, config.n_embd, config.n_ff_exp, 0) ||
+        !flash_view_shape(layer.moe.ffn_up_shexp, TensorDType.Q8_0, 2, config.n_embd, config.n_ff_exp, 0) ||
+        !flash_view_shape(layer.moe.ffn_down_shexp, TensorDType.Q8_0, 2, config.n_ff_exp, config.n_embd, 0) {
+        return false;
+    }
+    if layer.moe.ffn_exp_probs_b != null && !flash_view_shape(layer.moe.ffn_exp_probs_b, TensorDType.F32, 1, config.n_expert, 0, 0) {
+        return false;
+    }
+    if layer_index < config.hash_layers && !flash_view_shape(layer.moe.ffn_gate_tid2eid, TensorDType.I32, 2, config.n_expert_used, config.n_vocab, 0) {
+        return false;
+    }
+    return true;
+}
+
+fn flash_bind_one_layer(table: &TensorWeightTable, layer_index: u64, out: &FlashLayerWeights) bool {
+    *out = flash_layer_weights_zero();
+    const ratio: u64 = flash_layer_compress_ratio(layer_index);
+
+    out.hc_attn_fn = flash_find_layer_tensor(table, layer_index, "hc_attn_fn.weight\0" as &const byte);
+    out.hc_attn_scale = flash_find_layer_tensor(table, layer_index, "hc_attn_scale.weight\0" as &const byte);
+    out.hc_attn_base = flash_find_layer_tensor(table, layer_index, "hc_attn_base.weight\0" as &const byte);
+    out.attn_norm = flash_find_layer_tensor(table, layer_index, "attn_norm.weight\0" as &const byte);
+    out.attn_q_a = flash_find_layer_tensor(table, layer_index, "attn_q_a.weight\0" as &const byte);
+    out.attn_q_a_norm = flash_find_layer_tensor(table, layer_index, "attn_q_a_norm.weight\0" as &const byte);
+    out.attn_q_b = flash_find_layer_tensor(table, layer_index, "attn_q_b.weight\0" as &const byte);
+    out.attn_kv = flash_find_layer_tensor(table, layer_index, "attn_kv.weight\0" as &const byte);
+    out.attn_kv_a_norm = flash_find_layer_tensor(table, layer_index, "attn_kv_a_norm.weight\0" as &const byte);
+    out.attn_sinks = flash_find_layer_tensor(table, layer_index, "attn_sinks.weight\0" as &const byte);
+    out.attn_output_a = flash_find_layer_tensor(table, layer_index, "attn_output_a.weight\0" as &const byte);
+    out.attn_output_b = flash_find_layer_tensor(table, layer_index, "attn_output_b.weight\0" as &const byte);
+    if ratio != 0 {
+        out.attn_compressor_ape = flash_find_layer_tensor(table, layer_index, "attn_compressor_ape.weight\0" as &const byte);
+        out.attn_compressor_kv = flash_find_layer_tensor(table, layer_index, "attn_compressor_kv.weight\0" as &const byte);
+        out.attn_compressor_gate = flash_find_layer_tensor(table, layer_index, "attn_compressor_gate.weight\0" as &const byte);
+        out.attn_compressor_norm = flash_find_layer_tensor(table, layer_index, "attn_compressor_norm.weight\0" as &const byte);
+    }
+    if ratio == 4 {
+        out.indexer_attn_q_b = flash_find_layer_tensor(table, layer_index, "indexer.attn_q_b.weight\0" as &const byte);
+        out.indexer_proj = flash_find_layer_tensor(table, layer_index, "indexer.proj.weight\0" as &const byte);
+        out.indexer_compressor_ape = flash_find_layer_tensor(table, layer_index, "indexer_compressor_ape.weight\0" as &const byte);
+        out.indexer_compressor_kv = flash_find_layer_tensor(table, layer_index, "indexer_compressor_kv.weight\0" as &const byte);
+        out.indexer_compressor_gate = flash_find_layer_tensor(table, layer_index, "indexer_compressor_gate.weight\0" as &const byte);
+        out.indexer_compressor_norm = flash_find_layer_tensor(table, layer_index, "indexer_compressor_norm.weight\0" as &const byte);
+    }
+    out.hc_ffn_fn = flash_find_layer_tensor(table, layer_index, "hc_ffn_fn.weight\0" as &const byte);
+    out.hc_ffn_scale = flash_find_layer_tensor(table, layer_index, "hc_ffn_scale.weight\0" as &const byte);
+    out.hc_ffn_base = flash_find_layer_tensor(table, layer_index, "hc_ffn_base.weight\0" as &const byte);
+    out.ffn_norm = flash_find_layer_tensor(table, layer_index, "ffn_norm.weight\0" as &const byte);
+
+    out.moe.ffn_gate_tid2eid = null;
+    if layer_index < FLASH_DS4_N_HASH_LAYER {
+        out.moe.ffn_gate_tid2eid = flash_find_layer_tensor(table, layer_index, "ffn_gate_tid2eid.weight\0" as &const byte);
+    }
+    out.moe.ffn_gate_inp = flash_find_layer_tensor(table, layer_index, "ffn_gate_inp.weight\0" as &const byte);
+    out.moe.ffn_exp_probs_b = flash_find_layer_tensor(table, layer_index, "exp_probs_b.bias\0" as &const byte);
+    out.moe.ffn_gate_exps = flash_find_layer_tensor(table, layer_index, "ffn_gate_exps.weight\0" as &const byte);
+    out.moe.ffn_up_exps = flash_find_layer_tensor(table, layer_index, "ffn_up_exps.weight\0" as &const byte);
+    out.moe.ffn_down_exps = flash_find_layer_tensor(table, layer_index, "ffn_down_exps.weight\0" as &const byte);
+    out.moe.ffn_gate_shexp = flash_find_layer_tensor(table, layer_index, "ffn_gate_shexp.weight\0" as &const byte);
+    out.moe.ffn_up_shexp = flash_find_layer_tensor(table, layer_index, "ffn_up_shexp.weight\0" as &const byte);
+    out.moe.ffn_down_shexp = flash_find_layer_tensor(table, layer_index, "ffn_down_shexp.weight\0" as &const byte);
+
+    return out.hc_attn_fn != null && out.hc_attn_scale != null && out.hc_attn_base != null &&
+        out.attn_norm != null && out.attn_q_a != null && out.attn_q_a_norm != null &&
+        out.attn_q_b != null && out.attn_kv != null && out.attn_kv_a_norm != null &&
+        out.attn_sinks != null && out.attn_output_a != null && out.attn_output_b != null &&
+        out.hc_ffn_fn != null && out.hc_ffn_scale != null && out.hc_ffn_base != null &&
+        out.ffn_norm != null && out.moe.ffn_gate_inp != null && out.moe.ffn_gate_exps != null &&
+        out.moe.ffn_up_exps != null && out.moe.ffn_down_exps != null &&
+        out.moe.ffn_gate_shexp != null && out.moe.ffn_up_shexp != null &&
+        out.moe.ffn_down_shexp != null;
+}
+
+export fn flash_weights_bind_from_table(config: &FlashConfig, table: &TensorWeightTable, weights: &FlashWeights) bool {
+    flash_weights_deinit(weights);
+    if config == null || table == null || config.n_layer != FLASH_DS4_N_LAYER {
+        return false;
+    }
+    const hc_dim: u64 = config.n_embd * config.n_hc;
+    weights.token_embd = tensor_weight_table_find(table, "token_embd.weight\0" as &const byte);
+    weights.output_hc_base = tensor_weight_table_find(table, "output_hc_base.weight\0" as &const byte);
+    weights.output_hc_fn = tensor_weight_table_find(table, "output_hc_fn.weight\0" as &const byte);
+    weights.output_hc_scale = tensor_weight_table_find(table, "output_hc_scale.weight\0" as &const byte);
+    weights.output_norm = tensor_weight_table_find(table, "output_norm.weight\0" as &const byte);
+    weights.output = tensor_weight_table_find(table, "output.weight\0" as &const byte);
+    if !flash_view_shape(weights.token_embd, TensorDType.F16, 2, config.n_embd, config.n_vocab, 0) ||
+        !flash_view_shape(weights.output_hc_base, TensorDType.F32, 1, config.n_hc, 0, 0) ||
+        !flash_view_shape(weights.output_hc_fn, TensorDType.F16, 2, hc_dim, config.n_hc, 0) ||
+        !flash_view_shape(weights.output_hc_scale, TensorDType.F32, 1, 1, 0, 0) ||
+        !flash_view_shape(weights.output_norm, TensorDType.F32, 1, config.n_embd, 0, 0) ||
+        !flash_view_shape(weights.output, TensorDType.Q8_0, 2, config.n_embd, config.n_vocab, 0) {
+        return false;
+    }
+
+    const bytes: usize = (config.n_layer as usize) * (@size_of(FlashLayerWeights) as usize);
+    const layers: &FlashLayerWeights = malloc(bytes) as &FlashLayerWeights;
+    if layers == null {
+        return false;
+    }
+    var i: u64 = 0;
+    while i < config.n_layer {
+        if !flash_bind_one_layer(table, i, &layers[i as usize]) ||
+            !flash_layer_weights_validate(&layers[i as usize], config, i) {
+            free(layers as &void);
+            return false;
+        }
+        i = i + 1;
+    }
+
+    weights.layers = layers;
+    weights.n_layer = config.n_layer;
+    weights.owns_layers = true;
+    return true;
+}
+
+export fn flash_model_init(config: &FlashConfig, weights: &FlashWeights) FlashModel {
+    return FlashModel{ config: *config, weights: weights };
+}
+
+export fn flash_model_validate(model: &FlashModel) bool {
+    if model == null || model.weights == null || model.weights.layers == null {
+        return false;
+    }
+    return model.config.n_layer == model.weights.n_layer &&
+        model.config.n_embd == FLASH_DS4_N_EMBD &&
+        model.config.n_vocab == FLASH_DS4_N_VOCAB;
+}
+
+fn flash_scratch_empty() FlashScratch {
+    return FlashScratch{
+        plain: null,
+        cur: null,
+        next: null,
+        attn_cur: null,
+        attn_norm: null,
+        attn_residual: null,
+        q: null,
+        qr: null,
+        qr_norm: null,
+        kv_raw: null,
+        kv: null,
+        heads: null,
+        attn_low: null,
+        attn_out: null,
+        after_attn_hc: null,
+        attn_score: null,
+        comp: null,
+        index_comp: null,
+        comp_kv_cur: null,
+        comp_sc_cur: null,
+        comp_pooled: null,
+        index_allowed: null,
+        index_q: null,
+        index_weights: null,
+        index_scores: null,
+        ffn_cur: null,
+        ffn_norm: null,
+        ffn_out: null,
+        hc_flat: null,
+        hc_mix: null,
+        hc_split: null,
+        hc_sinkhorn: null,
+        output_flat: null,
+        output_pre: null,
+        output_weights: null,
+        output_embd: null,
+        output_norm: null,
+        q8_xq: null,
+        q8_xscale: null,
+        q8_cap: 0,
+        q8_block_cap: 0,
+        moe_scratch: moe_scratch_empty(),
+        attn_score_cap: 0,
+        index_score_cap: 0,
+    };
+}
+
+export fn flash_state_empty() FlashState {
+    return FlashState{
+        layers: null,
+        n_layer: 0,
+        ctx_size: 0,
+        raw_cap: 0,
+        scratch: flash_scratch_empty(),
+        next_pos: 0,
+        loaded: false,
+    };
+}
+
+fn flash_layer_state_zero() FlashLayerState {
+    return FlashLayerState{
+        raw_kv: null,
+        n_raw: 0,
+        cap_raw: 0,
+        compress_ratio: 0,
+        comp_cap: 0,
+        n_comp: 0,
+        attn_comp_kv: null,
+        attn_state_kv: null,
+        attn_state_score: null,
+        n_index_comp: 0,
+        index_comp_kv: null,
+        index_state_kv: null,
+        index_state_score: null,
+    };
+}
+
+fn flash_alloc_f32(n: u64) &f32 {
+    if n == 0 {
+        return null;
+    }
+    return malloc((n as usize) * (@size_of(f32) as usize)) as &f32;
+}
+
+fn flash_alloc_bool(n: u64) &bool {
+    if n == 0 {
+        return null;
+    }
+    return malloc((n as usize) * (@size_of(bool) as usize)) as &bool;
+}
+
+fn flash_zero_f32(x: &f32, n: u64) void {
+    if x == null {
+        return;
+    }
+    var i: u64 = 0;
+    while i < n {
+        x[i as usize] = 0.0f32;
+        i = i + 1;
+    }
+}
+
+fn flash_fill_f32(x: &f32, n: u64, value: f32) void {
+    if x == null {
+        return;
+    }
+    var i: u64 = 0;
+    while i < n {
+        x[i as usize] = value;
+        i = i + 1;
+    }
+}
+
+fn flash_zero_bool(x: &bool, n: u64) void {
+    if x == null {
+        return;
+    }
+    var i: u64 = 0;
+    while i < n {
+        x[i as usize] = false;
+        i = i + 1;
+    }
+}
+
+fn flash_scratch_deinit(s: &FlashScratch) void {
+    moe_scratch_deinit(&s.moe_scratch);
+    if s.q8_xscale != null { free(s.q8_xscale as &void); }
+    if s.q8_xq != null { free(s.q8_xq as &void); }
+    if s.output_norm != null { free(s.output_norm as &void); }
+    if s.output_embd != null { free(s.output_embd as &void); }
+    if s.output_weights != null { free(s.output_weights as &void); }
+    if s.output_pre != null { free(s.output_pre as &void); }
+    if s.output_flat != null { free(s.output_flat as &void); }
+    if s.hc_sinkhorn != null { free(s.hc_sinkhorn as &void); }
+    if s.hc_split != null { free(s.hc_split as &void); }
+    if s.hc_mix != null { free(s.hc_mix as &void); }
+    if s.hc_flat != null { free(s.hc_flat as &void); }
+    if s.ffn_out != null { free(s.ffn_out as &void); }
+    if s.ffn_norm != null { free(s.ffn_norm as &void); }
+    if s.ffn_cur != null { free(s.ffn_cur as &void); }
+    if s.index_scores != null { free(s.index_scores as &void); }
+    if s.index_weights != null { free(s.index_weights as &void); }
+    if s.index_q != null { free(s.index_q as &void); }
+    if s.index_allowed != null { free(s.index_allowed as &void); }
+    if s.comp_pooled != null { free(s.comp_pooled as &void); }
+    if s.comp_sc_cur != null { free(s.comp_sc_cur as &void); }
+    if s.comp_kv_cur != null { free(s.comp_kv_cur as &void); }
+    if s.index_comp != null { free(s.index_comp as &void); }
+    if s.comp != null { free(s.comp as &void); }
+    if s.attn_score != null { free(s.attn_score as &void); }
+    if s.after_attn_hc != null { free(s.after_attn_hc as &void); }
+    if s.attn_out != null { free(s.attn_out as &void); }
+    if s.attn_low != null { free(s.attn_low as &void); }
+    if s.heads != null { free(s.heads as &void); }
+    if s.kv != null { free(s.kv as &void); }
+    if s.kv_raw != null { free(s.kv_raw as &void); }
+    if s.qr_norm != null { free(s.qr_norm as &void); }
+    if s.qr != null { free(s.qr as &void); }
+    if s.q != null { free(s.q as &void); }
+    if s.attn_residual != null { free(s.attn_residual as &void); }
+    if s.attn_norm != null { free(s.attn_norm as &void); }
+    if s.attn_cur != null { free(s.attn_cur as &void); }
+    if s.next != null { free(s.next as &void); }
+    if s.cur != null { free(s.cur as &void); }
+    if s.plain != null { free(s.plain as &void); }
+    *s = flash_scratch_empty();
+}
+
+fn flash_scratch_init(s: &FlashScratch, config: &FlashConfig, ctx_size: u64, raw_cap: u64) bool {
+    flash_scratch_deinit(s);
+    const hc_dim: u64 = config.n_hc * config.n_embd;
+    const q_dim: u64 = config.n_head * config.head_dim;
+    const out_low_dim: u64 = config.out_groups * config.out_lora;
+    const max_comp: u64 = ctx_size / 4 + 2;
+    const hc_mix_dim: u64 = 2 * config.n_hc + config.n_hc * config.n_hc;
+    const q8_cap: u64 = kernels_q8_0_padded_elems(q_dim);
+
+    s.plain = flash_alloc_f32(config.n_embd);
+    s.cur = flash_alloc_f32(hc_dim);
+    s.next = flash_alloc_f32(hc_dim);
+    s.attn_cur = flash_alloc_f32(config.n_embd);
+    s.attn_norm = flash_alloc_f32(config.n_embd);
+    s.attn_residual = flash_alloc_f32(hc_dim);
+    s.q = flash_alloc_f32(q_dim);
+    s.qr = flash_alloc_f32(config.q_lora);
+    s.qr_norm = flash_alloc_f32(config.q_lora);
+    s.kv_raw = flash_alloc_f32(config.head_dim);
+    s.kv = flash_alloc_f32(config.head_dim);
+    s.heads = flash_alloc_f32(q_dim);
+    s.attn_low = flash_alloc_f32(out_low_dim);
+    s.attn_out = flash_alloc_f32(config.n_embd);
+    s.after_attn_hc = flash_alloc_f32(hc_dim);
+    s.attn_score_cap = raw_cap + max_comp;
+    s.attn_score = flash_alloc_f32(s.attn_score_cap);
+    s.comp = flash_alloc_f32(config.head_dim);
+    s.index_comp = flash_alloc_f32(config.indexer_head_dim);
+    s.comp_kv_cur = flash_alloc_f32(2 * config.head_dim);
+    s.comp_sc_cur = flash_alloc_f32(2 * config.head_dim);
+    s.comp_pooled = flash_alloc_f32(config.head_dim);
+    s.index_allowed = flash_alloc_bool(max_comp);
+    s.index_q = flash_alloc_f32(config.indexer_heads * config.indexer_head_dim);
+    s.index_weights = flash_alloc_f32(config.indexer_heads);
+    s.index_score_cap = max_comp;
+    s.index_scores = flash_alloc_f32(max_comp);
+    s.ffn_cur = flash_alloc_f32(config.n_embd);
+    s.ffn_norm = flash_alloc_f32(config.n_embd);
+    s.ffn_out = flash_alloc_f32(config.n_embd);
+    s.hc_flat = flash_alloc_f32(hc_dim);
+    s.hc_mix = flash_alloc_f32(hc_mix_dim);
+    s.hc_split = flash_alloc_f32(hc_mix_dim);
+    s.hc_sinkhorn = flash_alloc_f32(config.n_hc * config.n_hc);
+    s.output_flat = flash_alloc_f32(hc_dim);
+    s.output_pre = flash_alloc_f32(config.n_hc);
+    s.output_weights = flash_alloc_f32(config.n_hc);
+    s.output_embd = flash_alloc_f32(config.n_embd);
+    s.output_norm = flash_alloc_f32(config.n_embd);
+    s.q8_cap = q8_cap;
+    s.q8_block_cap = kernels_q8_0_block_count(q_dim);
+    s.q8_xq = malloc((s.q8_cap as usize) * (@size_of(i32) as usize)) as &i32;
+    s.q8_xscale = malloc((s.q8_block_cap as usize) * (@size_of(f32) as usize)) as &f32;
+    var moe_config: MoeConfig = moe_config_init(config.n_embd, config.n_expert, config.n_expert_used, config.n_ff_exp);
+    moe_config.expert_weight_scale = FLASH_EXPERT_WEIGHT_SCALE;
+    moe_config.swiglu_clamp = FLASH_SWIGLU_CLAMP;
+    const moe_ok: bool = moe_scratch_init(&s.moe_scratch, &moe_config);
+
+    const ok: bool = s.plain != null && s.cur != null && s.next != null &&
+        s.attn_cur != null && s.attn_norm != null && s.attn_residual != null &&
+        s.q != null && s.qr != null && s.qr_norm != null && s.kv_raw != null &&
+        s.kv != null && s.heads != null && s.attn_low != null &&
+        s.attn_out != null && s.after_attn_hc != null && s.attn_score != null &&
+        s.comp != null && s.index_comp != null && s.comp_kv_cur != null &&
+        s.comp_sc_cur != null && s.comp_pooled != null && s.index_allowed != null &&
+        s.index_q != null && s.index_weights != null && s.index_scores != null &&
+        s.ffn_cur != null && s.ffn_norm != null && s.ffn_out != null &&
+        s.hc_flat != null && s.hc_mix != null && s.hc_split != null &&
+        s.hc_sinkhorn != null && s.output_flat != null && s.output_pre != null &&
+        s.output_weights != null && s.output_embd != null && s.output_norm != null &&
+        s.q8_xq != null && s.q8_xscale != null &&
+        moe_ok;
+    if !ok {
+        flash_scratch_deinit(s);
+    }
+    return ok;
+}
+
+fn flash_layer_state_deinit(layer: &FlashLayerState) void {
+    if layer.index_state_score != null { free(layer.index_state_score as &void); }
+    if layer.index_state_kv != null { free(layer.index_state_kv as &void); }
+    if layer.index_comp_kv != null { free(layer.index_comp_kv as &void); }
+    if layer.attn_state_score != null { free(layer.attn_state_score as &void); }
+    if layer.attn_state_kv != null { free(layer.attn_state_kv as &void); }
+    if layer.attn_comp_kv != null { free(layer.attn_comp_kv as &void); }
+    if layer.raw_kv != null { free(layer.raw_kv as &void); }
+    *layer = flash_layer_state_zero();
+}
+
+export fn flash_state_deinit(state: &FlashState) void {
+    if state.layers != null {
+        var i: u64 = 0;
+        while i < state.n_layer {
+            flash_layer_state_deinit(&state.layers[i as usize]);
+            i = i + 1;
+        }
+        free(state.layers as &void);
+    }
+    flash_scratch_deinit(&state.scratch);
+    *state = flash_state_empty();
+}
+
+fn flash_state_init_scores(layer: &FlashLayerState, config: &FlashConfig) void {
+    const ratio: u64 = layer.compress_ratio;
+    if ratio == 0 {
+        return;
+    }
+    var coff: u64 = 1;
+    if ratio == 4 { coff = 2; }
+    const width: u64 = coff * config.head_dim;
+    const rows: u64 = coff * ratio;
+    flash_zero_f32(layer.attn_state_kv, rows * width);
+    flash_fill_f32(layer.attn_state_score, rows * width, FLASH_MODEL_NEG_INF);
+    if ratio == 4 {
+        const index_width: u64 = coff * config.indexer_head_dim;
+        flash_zero_f32(layer.index_state_kv, rows * index_width);
+        flash_fill_f32(layer.index_state_score, rows * index_width, FLASH_MODEL_NEG_INF);
+    }
+}
+
+export fn flash_state_reset(state: &FlashState, config: &FlashConfig) void {
+    if state.layers == null {
+        return;
+    }
+    var i: u64 = 0;
+    while i < state.n_layer {
+        const layer: &FlashLayerState = &state.layers[i as usize];
+        layer.n_raw = 0;
+        layer.n_comp = 0;
+        layer.n_index_comp = 0;
+        flash_zero_f32(layer.raw_kv, layer.cap_raw * config.head_dim);
+        if layer.compress_ratio != 0 {
+            flash_zero_f32(layer.attn_comp_kv, layer.comp_cap * config.head_dim);
+            if layer.compress_ratio == 4 {
+                flash_zero_f32(layer.index_comp_kv, layer.comp_cap * config.indexer_head_dim);
+            }
+        }
+        flash_state_init_scores(layer, config);
+        i = i + 1;
+    }
+    state.next_pos = 0;
+}
+
+export fn flash_state_init(state: &FlashState, config: &FlashConfig, ctx_size: u64) bool {
+    flash_state_deinit(state);
+    if config == null || ctx_size == 0 {
+        return false;
+    }
+    var raw_cap: u64 = config.sliding_window;
+    if raw_cap > ctx_size { raw_cap = ctx_size; }
+    if raw_cap == 0 { raw_cap = 1; }
+
+    const layer_bytes: usize = (config.n_layer as usize) * (@size_of(FlashLayerState) as usize);
+    state.layers = malloc(layer_bytes) as &FlashLayerState;
+    if state.layers == null {
+        flash_state_deinit(state);
+        return false;
+    }
+    state.n_layer = config.n_layer;
+    state.ctx_size = ctx_size;
+    state.raw_cap = raw_cap;
+    state.next_pos = 0;
+
+    var i: u64 = 0;
+    while i < config.n_layer {
+        state.layers[i as usize] = flash_layer_state_zero();
+        const layer: &FlashLayerState = &state.layers[i as usize];
+        const ratio: u64 = flash_layer_compress_ratio(i);
+        layer.cap_raw = raw_cap;
+        layer.raw_kv = flash_alloc_f32(raw_cap * config.head_dim);
+        layer.compress_ratio = ratio;
+        if layer.raw_kv == null {
+            flash_state_deinit(state);
+            return false;
+        }
+        if ratio != 0 {
+            var coff: u64 = 1;
+            if ratio == 4 { coff = 2; }
+            const comp_cap: u64 = ctx_size / ratio + 2;
+            const attn_width: u64 = coff * config.head_dim;
+            const rows: u64 = coff * ratio;
+            layer.comp_cap = comp_cap;
+            layer.attn_comp_kv = flash_alloc_f32(comp_cap * config.head_dim);
+            layer.attn_state_kv = flash_alloc_f32(rows * attn_width);
+            layer.attn_state_score = flash_alloc_f32(rows * attn_width);
+            if layer.attn_comp_kv == null || layer.attn_state_kv == null || layer.attn_state_score == null {
+                flash_state_deinit(state);
+                return false;
+            }
+            if ratio == 4 {
+                const index_width: u64 = coff * config.indexer_head_dim;
+                layer.index_comp_kv = flash_alloc_f32(comp_cap * config.indexer_head_dim);
+                layer.index_state_kv = flash_alloc_f32(rows * index_width);
+                layer.index_state_score = flash_alloc_f32(rows * index_width);
+                if layer.index_comp_kv == null || layer.index_state_kv == null || layer.index_state_score == null {
+                    flash_state_deinit(state);
+                    return false;
+                }
+            }
+        }
+        flash_state_init_scores(layer, config);
+        i = i + 1;
+    }
+
+    if !flash_scratch_init(&state.scratch, config, ctx_size, raw_cap) {
+        flash_state_deinit(state);
+        return false;
+    }
+    state.loaded = true;
+    flash_state_reset(state, config);
+    return true;
+}
+
+fn flash_require_data(view: &TensorView) bool {
+    return view != null && view.data != null;
+}
+
+fn flash_read_view_f32(view: &TensorView, index: u64) f32 {
+    if view.dtype == TensorDType.F32 {
+        const data: &const f32 = view.data as &const f32;
+        return data[index as usize];
+    }
+    if view.dtype == TensorDType.F16 {
+        return kernels_f16_load(view.data as &const byte, index);
+    }
+    return 0.0f32;
+}
+
+fn flash_byte_ptr_add(data: &byte, off: u64) &const byte {
+    const base: usize = @usize_from_ptr(data as &void);
+    return @ptr_from_usize(base + (off as usize)) as &const byte;
+}
+
+fn flash_matvec_row(view: &TensorView, row: u64, x: &const f32, in_dim: u64) f32 {
+    if !flash_require_data(view) || row >= view.shape[1] {
+        return 0.0f32;
+    }
+    if view.dtype == TensorDType.F32 {
+        const data: &const f32 = view.data as &const f32;
+        return kernels_f32_dot(&data[(row * in_dim) as usize], x, in_dim);
+    }
+    if view.dtype == TensorDType.F16 {
+        var acc: f32 = 0.0f32;
+        var col: u64 = 0;
+        const base: u64 = row * in_dim;
+        while col < in_dim {
+            acc = acc + kernels_f16_load(view.data as &const byte, base + col) * x[col as usize];
+            col = col + 1;
+        }
+        return acc;
+    }
+    const row_data: &const byte = flash_byte_ptr_add(view.data, row * view.stride_bytes[1]);
+    if view.dtype == TensorDType.Q8_0 {
+        return kernels_q8_0_dot_f32(row_data, x, in_dim);
+    }
+    if view.dtype == TensorDType.Q2_K {
+        return kernels_q2_k_dot_f32(row_data, x, in_dim);
+    }
+    if view.dtype == TensorDType.Q4_K {
+        return kernels_q4_k_dot_f32(row_data, x, in_dim);
+    }
+    if view.dtype == TensorDType.IQ2_XXS {
+        return kernels_iq2_xxs_dot_f32(row_data, x, in_dim);
+    }
+    if view.dtype == TensorDType.IQ2_XS {
+        return kernels_iq2_xs_dot_f32(row_data, x, in_dim);
+    }
+    if view.dtype == TensorDType.IQ2_S {
+        return kernels_iq2_s_dot_f32(row_data, x, in_dim);
+    }
+    return 0.0f32;
+}
+
+fn flash_q8_scratch_ready(scratch: &FlashScratch, n: u64) bool {
+    return scratch != null && scratch.q8_xq != null && scratch.q8_xscale != null &&
+        scratch.q8_cap >= kernels_q8_0_padded_elems(n) &&
+        scratch.q8_block_cap >= kernels_q8_0_block_count(n);
+}
+
+fn flash_effective_threads(total: u64) u64 {
+    if total < 1024 {
+        return 1;
+    }
+    var n: u64 = FLASH_DEFAULT_THREADS;
+    const raw: &byte = getenv("DS4_UYA_THREADS\0" as &const byte);
+    if raw != null && raw[0] != 0 {
+        const parsed: i32 = atoi(raw as &const byte);
+        if parsed > 0 {
+            n = parsed as u64;
+        }
+    }
+    if n > FLASH_MAX_THREADS { n = FLASH_MAX_THREADS; }
+    if n > total { n = total; }
+    if n == 0 { n = 1; }
+    return n;
+}
+
+fn flash_join_threads(threads: &pthread_t, count: u64) void {
+    var i: u64 = 0;
+    while i < count {
+        _ = pthread_join(&threads[i as usize], null as & &void);
+        i = i + 1;
+    }
+}
+
+fn flash_q8_matvec_range(ctx: &FlashQ8MatvecThreadCtx) void {
+    var row: u64 = ctx.start;
+    while row < ctx.end {
+        const row_data: &const byte = flash_byte_ptr_add(ctx.view.data, row * ctx.view.stride_bytes[1]);
+        ctx.out[row as usize] = kernels_q8_0_dot_prequant(row_data, ctx.xq, ctx.xscale, ctx.in_dim);
+        row = row + 1;
+    }
+}
+
+fn flash_q8_matvec_thread(arg: &void) &void {
+    flash_q8_matvec_range(arg as &FlashQ8MatvecThreadCtx);
+    return null;
+}
+
+fn flash_grouped_q8_range(ctx: &FlashGroupedQ8ThreadCtx) void {
+    var row: u64 = ctx.start;
+    while row < ctx.end {
+        const group: u64 = row / ctx.rank;
+        const row_data: &const byte = flash_byte_ptr_add(ctx.view.data, row * ctx.view.stride_bytes[1]);
+        ctx.out[row as usize] = kernels_q8_0_dot_prequant(
+            row_data,
+            &ctx.xq[(group * ctx.padded) as usize] as &const i32,
+            &ctx.xscale[(group * ctx.blocks) as usize] as &const f32,
+            ctx.group_dim,
+        );
+        row = row + 1;
+    }
+}
+
+fn flash_grouped_q8_thread(arg: &void) &void {
+    flash_grouped_q8_range(arg as &FlashGroupedQ8ThreadCtx);
+    return null;
+}
+
+fn flash_matvec_q8_0_prequant(out: &f32, view: &TensorView, xq: &const i32, xscale: &const f32, out_dim: u64, in_dim: u64) bool {
+    if !flash_require_data(view) || view.dtype != TensorDType.Q8_0 ||
+        view.n_dims != 2 || view.shape[0] != in_dim || view.shape[1] != out_dim {
+        return false;
+    }
+    const n_threads: u64 = flash_effective_threads(out_dim);
+    if n_threads <= 1 {
+        var ctx1: FlashQ8MatvecThreadCtx = FlashQ8MatvecThreadCtx{ out: out, view: view, xq: xq, xscale: xscale, in_dim: in_dim, start: 0, end: out_dim };
+        flash_q8_matvec_range(&ctx1);
+        return true;
+    }
+
+    var threads: [pthread_t: 16] = [];
+    var ctxs: [FlashQ8MatvecThreadCtx: 16] = [];
+    var attr: pthread_attr_t = pthread_attr_t{};
+    _ = pthread_attr_init(&attr);
+    _ = pthread_attr_setstacksize(&attr, FLASH_THREAD_STACK);
+
+    var created: u64 = 0;
+    var t: u64 = 0;
+    while t < n_threads {
+        const start: u64 = (out_dim * t) / n_threads;
+        const end: u64 = (out_dim * (t + 1)) / n_threads;
+        ctxs[t as usize] = FlashQ8MatvecThreadCtx{ out: out, view: view, xq: xq, xscale: xscale, in_dim: in_dim, start: start, end: end };
+        if pthread_create(&threads[t as usize], &attr as &const pthread_attr_t, &flash_q8_matvec_thread as &void, &ctxs[t as usize] as &void) != 0 {
+            flash_join_threads(&threads[0], created);
+            _ = pthread_attr_destroy(&attr);
+            return false;
+        }
+        created = created + 1;
+        t = t + 1;
+    }
+    flash_join_threads(&threads[0], created);
+    _ = pthread_attr_destroy(&attr);
+    return true;
+}
+
+fn flash_matvec_with_scratch(out: &f32, view: &TensorView, x: &const f32, out_dim: u64, in_dim: u64, scratch: &FlashScratch) bool {
+    if view != null && view.dtype == TensorDType.Q8_0 {
+        if !flash_q8_scratch_ready(scratch, in_dim) {
+            return false;
+        }
+        kernels_q8_0_quantize_activation(x, scratch.q8_xq, scratch.q8_xscale, in_dim);
+        return flash_matvec_q8_0_prequant(out, view, scratch.q8_xq as &const i32, scratch.q8_xscale as &const f32, out_dim, in_dim);
+    }
+    return moe_matvec(out, view, x, out_dim, in_dim);
+}
+
+fn flash_grouped_q8_0_prequant(out: &f32, view: &TensorView, x: &const f32, n_groups: u64, group_dim: u64, rank: u64, scratch: &FlashScratch) bool {
+    if !flash_require_data(view) || view.dtype != TensorDType.Q8_0 ||
+        view.n_dims != 2 || view.shape[0] != group_dim ||
+        view.shape[1] < n_groups * rank || !flash_q8_scratch_ready(scratch, n_groups * group_dim) {
+        return false;
+    }
+    const blocks: u64 = kernels_q8_0_block_count(group_dim);
+    const padded: u64 = kernels_q8_0_padded_elems(group_dim);
+    var g: u64 = 0;
+    while g < n_groups {
+        kernels_q8_0_quantize_activation(
+            &x[(g * group_dim) as usize] as &const f32,
+            &scratch.q8_xq[(g * padded) as usize],
+            &scratch.q8_xscale[(g * blocks) as usize],
+            group_dim,
+        );
+        g = g + 1;
+    }
+    const total: u64 = n_groups * rank;
+    const n_threads: u64 = flash_effective_threads(total);
+    if n_threads <= 1 {
+        var ctx1: FlashGroupedQ8ThreadCtx = FlashGroupedQ8ThreadCtx{
+            out: out,
+            view: view,
+            xq: scratch.q8_xq as &const i32,
+            xscale: scratch.q8_xscale as &const f32,
+            rank: rank,
+            group_dim: group_dim,
+            padded: padded,
+            blocks: blocks,
+            start: 0,
+            end: total,
+        };
+        flash_grouped_q8_range(&ctx1);
+        return true;
+    }
+
+    var threads: [pthread_t: 16] = [];
+    var ctxs: [FlashGroupedQ8ThreadCtx: 16] = [];
+    var attr: pthread_attr_t = pthread_attr_t{};
+    _ = pthread_attr_init(&attr);
+    _ = pthread_attr_setstacksize(&attr, FLASH_THREAD_STACK);
+
+    var created: u64 = 0;
+    var t: u64 = 0;
+    while t < n_threads {
+        const start: u64 = (total * t) / n_threads;
+        const end: u64 = (total * (t + 1)) / n_threads;
+        ctxs[t as usize] = FlashGroupedQ8ThreadCtx{
+            out: out,
+            view: view,
+            xq: scratch.q8_xq as &const i32,
+            xscale: scratch.q8_xscale as &const f32,
+            rank: rank,
+            group_dim: group_dim,
+            padded: padded,
+            blocks: blocks,
+            start: start,
+            end: end,
+        };
+        if pthread_create(&threads[t as usize], &attr as &const pthread_attr_t, &flash_grouped_q8_thread as &void, &ctxs[t as usize] as &void) != 0 {
+            flash_join_threads(&threads[0], created);
+            _ = pthread_attr_destroy(&attr);
+            return false;
+        }
+        created = created + 1;
+        t = t + 1;
+    }
+    flash_join_threads(&threads[0], created);
+    _ = pthread_attr_destroy(&attr);
+    return true;
+}
+
+fn flash_rms_norm_weight(out: &f32, x: &const f32, weight: &TensorView, n: u64, eps: f32) bool {
+    if !flash_require_data(weight) || weight.n_dims != 1 || weight.shape[0] < n {
+        return false;
+    }
+    var ss: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < n {
+        const v: f32 = x[i as usize];
+        ss = ss + v * v;
+        i = i + 1;
+    }
+    const scale: f32 = 1.0f32 / sqrtf(ss / (n as f32) + eps);
+    i = 0;
+    while i < n {
+        out[i as usize] = x[i as usize] * scale * flash_read_view_f32(weight, i);
+        i = i + 1;
+    }
+    return true;
+}
+
+fn flash_model_rms_norm_no_weight(out: &f32, x: &const f32, n: u64, eps: f32) void {
+    var ss: f32 = 0.0f32;
+    var i: u64 = 0;
+    while i < n {
+        const v: f32 = x[i as usize];
+        ss = ss + v * v;
+        i = i + 1;
+    }
+    const scale: f32 = 1.0f32 / sqrtf(ss / (n as f32) + eps);
+    i = 0;
+    while i < n {
+        out[i as usize] = x[i as usize] * scale;
+        i = i + 1;
+    }
+}
+
+fn flash_head_rms_norm_inplace(x: &f32, n_head: u64, head_dim: u64, eps: f32) void {
+    var h: u64 = 0;
+    while h < n_head {
+        const base: u64 = h * head_dim;
+        var ss: f32 = 0.0f32;
+        var d: u64 = 0;
+        while d < head_dim {
+            const v: f32 = x[(base + d) as usize];
+            ss = ss + v * v;
+            d = d + 1;
+        }
+        const scale: f32 = 1.0f32 / sqrtf(ss / (head_dim as f32) + eps);
+        d = 0;
+        while d < head_dim {
+            x[(base + d) as usize] = x[(base + d) as usize] * scale;
+            d = d + 1;
+        }
+        h = h + 1;
+    }
+}
+
+fn flash_copy_embedding(out: &f32, view: &TensorView, token_id: u64, n_embd: u64) bool {
+    if !flash_require_data(view) || view.dtype != TensorDType.F16 || token_id >= view.shape[1] {
+        return false;
+    }
+    const base: u64 = token_id * n_embd;
+    var i: u64 = 0;
+    while i < n_embd {
+        out[i as usize] = kernels_f16_load(view.data as &const byte, base + i);
+        i = i + 1;
+    }
+    return true;
+}
+
+fn flash_hc_from_plain(out_hc: &f32, x: &const f32, n_embd: u64, n_hc: u64) void {
+    var h: u64 = 0;
+    while h < n_hc {
+        var d: u64 = 0;
+        while d < n_embd {
+            out_hc[(h * n_embd + d) as usize] = x[d as usize];
+            d = d + 1;
+        }
+        h = h + 1;
+    }
+}
+
+fn flash_model_sigmoid(x: f32) f32 {
+    if x >= 0.0f32 {
+        const e: f32 = expf(-x);
+        return 1.0f32 / (1.0f32 + e);
+    }
+    const e2: f32 = expf(x);
+    return e2 / (1.0f32 + e2);
+}
+
+fn flash_layer_rope_freq_base(layer: u64) f32 {
+    if flash_layer_compress_ratio(layer) != 0 {
+        return FLASH_COMPRESS_ROPE_FREQ_BASE;
+    }
+    return FLASH_ROPE_FREQ_BASE;
+}
+
+fn flash_layer_rope_freq_scale(layer: u64) f32 {
+    if flash_layer_compress_ratio(layer) == 0 || FLASH_ROPE_SCALE_FACTOR <= 0.0f32 {
+        return 1.0f32;
+    }
+    return 1.0f32 / FLASH_ROPE_SCALE_FACTOR;
+}
+
+fn flash_yarn_ramp(low: f32, high: f32, i0: u64) f32 {
+    var den: f32 = high - low;
+    if den < 0.001f32 {
+        den = 0.001f32;
+    }
+    const y: f32 = (((i0 / 2) as f32) - low) / den;
+    var clamped: f32 = y;
+    if clamped < 0.0f32 { clamped = 0.0f32; }
+    if clamped > 1.0f32 { clamped = 1.0f32; }
+    return 1.0f32 - clamped;
+}
+
+fn flash_yarn_corr_dim(n_dims: u64, n_ctx_orig: u64, n_rot: f32, base: f32) f32 {
+    return (n_dims as f32) * logf((n_ctx_orig as f32) / (n_rot * 2.0f32 * 3.14159265358979323846f32)) /
+        (2.0f32 * logf(base));
+}
+
+fn flash_rope_tail_inplace(x: &f32, n_head: u64, head_dim: u64, n_rot: u64, pos: u64, layer: u64, inverse: bool) void {
+    if x == null || n_rot == 0 || head_dim < n_rot {
+        return;
+    }
+    const compressed: bool = flash_layer_compress_ratio(layer) != 0;
+    const freq_base: f32 = flash_layer_rope_freq_base(layer);
+    const freq_scale: f32 = flash_layer_rope_freq_scale(layer);
+    var ext_factor: f32 = 0.0f32;
+    if compressed && FLASH_ROPE_SCALE_FACTOR > 1.0f32 {
+        ext_factor = 1.0f32;
+    }
+    var attn_factor: f32 = 1.0f32;
+    if ext_factor != 0.0f32 && freq_scale > 0.0f32 {
+        attn_factor = attn_factor / (1.0f32 + 0.1f32 * logf(1.0f32 / freq_scale));
+    }
+
+    var corr0: f32 = 0.0f32;
+    var corr1: f32 = 0.0f32;
+    if ext_factor != 0.0f32 {
+        corr0 = floorf(flash_yarn_corr_dim(n_rot, FLASH_ROPE_ORIG_CTX, FLASH_ROPE_YARN_BETA_FAST, freq_base));
+        corr1 = ceilf(flash_yarn_corr_dim(n_rot, FLASH_ROPE_ORIG_CTX, FLASH_ROPE_YARN_BETA_SLOW, freq_base));
+        if corr0 < 0.0f32 { corr0 = 0.0f32; }
+        if corr1 > ((n_rot - 1) as f32) { corr1 = (n_rot - 1) as f32; }
+    }
+
+    const n_nope: u64 = head_dim - n_rot;
+    const theta_scale: f32 = powf(freq_base, -2.0f32 / (n_rot as f32));
+    var sin_sign: f32 = 1.0f32;
+    if inverse {
+        sin_sign = -1.0f32;
+    }
+    var h: u64 = 0;
+    while h < n_head {
+        const base_off: u64 = h * head_dim + n_nope;
+        var theta_extrap: f32 = pos as f32;
+        var i: u64 = 0;
+        while i < n_rot {
+            const theta_interp: f32 = freq_scale * theta_extrap;
+            var theta: f32 = theta_interp;
+            var mscale: f32 = attn_factor;
+            if ext_factor != 0.0f32 {
+                const ramp_mix: f32 = flash_yarn_ramp(corr0, corr1, i) * ext_factor;
+                theta = theta_interp * (1.0f32 - ramp_mix) + theta_extrap * ramp_mix;
+                mscale = mscale * (1.0f32 + 0.1f32 * logf(1.0f32 / freq_scale));
+            }
+            const c: f32 = cosf(theta) * mscale;
+            const s: f32 = sin_sign * sinf(theta) * mscale;
+            const x0: f32 = x[(base_off + i) as usize];
+            const x1: f32 = x[(base_off + i + 1) as usize];
+            x[(base_off + i) as usize] = x0 * c - x1 * s;
+            x[(base_off + i + 1) as usize] = x0 * s + x1 * c;
+            theta_extrap = theta_extrap * theta_scale;
+            i = i + 2;
+        }
+        h = h + 1;
+    }
+}
+
+fn flash_e4m3_value(i: i32) f32 {
+    const exp: i32 = (i >> 3) & 15;
+    const mant: i32 = i & 7;
+    var exp_scale: f32 = 1.0f32;
+    if exp == 0 { exp_scale = 0.0f32; }
+    else if exp == 1 { exp_scale = 0.015625f32; }
+    else if exp == 2 { exp_scale = 0.03125f32; }
+    else if exp == 3 { exp_scale = 0.0625f32; }
+    else if exp == 4 { exp_scale = 0.125f32; }
+    else if exp == 5 { exp_scale = 0.25f32; }
+    else if exp == 6 { exp_scale = 0.5f32; }
+    else if exp == 7 { exp_scale = 1.0f32; }
+    else if exp == 8 { exp_scale = 2.0f32; }
+    else if exp == 9 { exp_scale = 4.0f32; }
+    else if exp == 10 { exp_scale = 8.0f32; }
+    else if exp == 11 { exp_scale = 16.0f32; }
+    else if exp == 12 { exp_scale = 32.0f32; }
+    else if exp == 13 { exp_scale = 64.0f32; }
+    else if exp == 14 { exp_scale = 128.0f32; }
+    else { exp_scale = 256.0f32; }
+    if exp == 0 {
+        return (mant as f32) * 0.001953125f32;
+    }
+    return (1.0f32 + (mant as f32) * 0.125f32) * exp_scale;
+}
+
+fn flash_e4m3_dequant(x: f32) f32 {
+    var sign: f32 = 1.0f32;
+    if x < 0.0f32 {
+        sign = -1.0f32;
+    }
+    var ax: f32 = fabsf(x);
+    if ax > 448.0f32 {
+        ax = 448.0f32;
+    }
+    var lo: i32 = 0;
+    var hi: i32 = 126;
+    while lo < hi {
+        const mid: i32 = (lo + hi + 1) >> 1;
+        if flash_e4m3_value(mid) <= ax {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    var best: i32 = lo;
+    if best < 126 {
+        const best_diff: f32 = fabsf(ax - flash_e4m3_value(best));
+        const next_diff: f32 = fabsf(ax - flash_e4m3_value(best + 1));
+        if next_diff < best_diff || (next_diff == best_diff && (((best + 1) & 1) == 0) && ((best & 1) != 0)) {
+            best = best + 1;
+        }
+    }
+    return sign * flash_e4m3_value(best);
+}
+
+fn flash_fp8_kv_quantize_inplace(x: &f32, head_dim: u64, n_rot: u64) void {
+    if head_dim <= n_rot {
+        return;
+    }
+    const n_nope: u64 = head_dim - n_rot;
+    var off: u64 = 0;
+    while off < n_nope {
+        var amax: f32 = 0.0f32;
+        var i: u64 = 0;
+        while i < 64 && off + i < n_nope {
+            const av: f32 = fabsf(x[(off + i) as usize]);
+            if av > amax { amax = av; }
+            i = i + 1;
+        }
+        if amax < 0.0001f32 {
+            amax = 0.0001f32;
+        }
+        const exp: f32 = ceilf(log2f(amax / 448.0f32));
+        const scale: f32 = powf(2.0f32, exp);
+        i = 0;
+        while i < 64 && off + i < n_nope {
+            var v: f32 = x[(off + i) as usize] / scale;
+            if v > 448.0f32 { v = 448.0f32; }
+            if v < -448.0f32 { v = -448.0f32; }
+            x[(off + i) as usize] = flash_e4m3_dequant(v) * scale;
+            i = i + 1;
+        }
+        off = off + 64;
+    }
+}
+
+fn flash_f16_round_inplace(x: &f32, n: u64) void {
+    var i: u64 = 0;
+    while i < n {
+        const bits: u16 = kernels_f32_to_f16(x[i as usize]);
+        var tmp: [byte: 2] = [];
+        tmp[0] = (bits & (255 as u16)) as byte;
+        tmp[1] = ((bits >> 8) & (255 as u16)) as byte;
+        x[i as usize] = kernels_f16_load(&tmp[0] as &const byte, 0);
+        i = i + 1;
+    }
+}
+
+fn flash_q_projection(model: &FlashModel, layer: &FlashLayerWeights, norm: &const f32, q: &f32, qr_norm: &f32, scratch: &FlashScratch) bool {
+    if !flash_matvec_with_scratch(scratch.qr, layer.attn_q_a, norm, model.config.q_lora, model.config.n_embd, scratch) {
+        return false;
+    }
+    if !flash_rms_norm_weight(qr_norm, scratch.qr as &const f32, layer.attn_q_a_norm, model.config.q_lora, model.config.rms_eps) {
+        return false;
+    }
+    if !flash_matvec_with_scratch(q, layer.attn_q_b, qr_norm as &const f32, model.config.n_head * model.config.head_dim, model.config.q_lora, scratch) {
+        return false;
+    }
+    flash_head_rms_norm_inplace(q, model.config.n_head, model.config.head_dim, model.config.rms_eps);
+    return true;
+}
+
+fn flash_kv_projection(model: &FlashModel, layer: &FlashLayerWeights, norm: &const f32, kv: &f32, scratch: &FlashScratch) bool {
+    if !flash_matvec_with_scratch(scratch.kv_raw, layer.attn_kv, norm, model.config.head_dim, model.config.n_embd, scratch) {
+        return false;
+    }
+    return flash_rms_norm_weight(kv, scratch.kv_raw as &const f32, layer.attn_kv_a_norm, model.config.head_dim, model.config.rms_eps);
+}
+
+fn flash_cache_push_raw(cache: &FlashLayerState, kv: &const f32, head_dim: u64) bool {
+    if cache.raw_kv == null || cache.cap_raw == 0 {
+        return false;
+    }
+    var row: u64 = 0;
+    if cache.n_raw < cache.cap_raw {
+        row = cache.n_raw;
+        cache.n_raw = cache.n_raw + 1;
+    } else {
+        var i: u64 = 0;
+        while i + head_dim < cache.cap_raw * head_dim {
+            cache.raw_kv[i as usize] = cache.raw_kv[(i + head_dim) as usize];
+            i = i + 1;
+        }
+        row = cache.cap_raw - 1;
+    }
+    var d: u64 = 0;
+    while d < head_dim {
+        const bits: u16 = kernels_f32_to_f16(kv[d as usize]);
+        var tmp: [byte: 2] = [];
+        tmp[0] = (bits & (255 as u16)) as byte;
+        tmp[1] = ((bits >> 8) & (255 as u16)) as byte;
+        cache.raw_kv[(row * head_dim + d) as usize] = kernels_f16_load(&tmp[0] as &const byte, 0);
+        d = d + 1;
+    }
+    return true;
+}
+
+fn flash_cache_push_comp(rows: &f32, n_rows: &u64, cap_rows: u64, row_dim: u64, kv: &const f32) bool {
+    if rows == null || *n_rows >= cap_rows {
+        return false;
+    }
+    const row: u64 = *n_rows;
+    var d: u64 = 0;
+    while d < row_dim {
+        const bits: u16 = kernels_f32_to_f16(kv[d as usize]);
+        var tmp: [byte: 2] = [];
+        tmp[0] = (bits & (255 as u16)) as byte;
+        tmp[1] = ((bits >> 8) & (255 as u16)) as byte;
+        rows[(row * row_dim + d) as usize] = kernels_f16_load(&tmp[0] as &const byte, 0);
+        d = d + 1;
+    }
+    *n_rows = *n_rows + 1;
+    return true;
+}
+
+fn flash_attention_mixed(
+    out_heads: &f32,
+    model: &FlashModel,
+    layer: &FlashLayerWeights,
+    q: &const f32,
+    raw_kv: &const f32,
+    n_raw: u64,
+    comp_kv: &const f32,
+    n_comp: u64,
+    comp_allowed: &bool,
+    scores: &f32,
+    score_cap: u64,
+) bool {
+    const total: u64 = n_raw + n_comp;
+    if total > score_cap || out_heads == null || q == null || raw_kv == null {
+        return false;
+    }
+    const kq_scale: f32 = 1.0f32 / sqrtf(model.config.head_dim as f32);
+    const head_dim: u64 = model.config.head_dim;
+    var h: u64 = 0;
+    while h < model.config.n_head {
+        const qh: &const f32 = &q[(h * head_dim) as usize] as &const f32;
+        var max_score: f32 = flash_read_view_f32(layer.attn_sinks, h);
+        var idx: u64 = 0;
+        var r: u64 = 0;
+        while r < n_raw {
+            const kv: &const f32 = &raw_kv[(r * head_dim) as usize] as &const f32;
+            scores[idx as usize] = kernels_f32_dot(qh, kv, head_dim) * kq_scale;
+            if scores[idx as usize] > max_score { max_score = scores[idx as usize]; }
+            idx = idx + 1;
+            r = r + 1;
+        }
+        r = 0;
+        while r < n_comp {
+            if comp_allowed != null && !comp_allowed[r as usize] {
+                scores[idx as usize] = FLASH_MODEL_NEG_INF;
+            } else {
+                const ckv: &const f32 = &comp_kv[(r * head_dim) as usize] as &const f32;
+                scores[idx as usize] = kernels_f32_dot(qh, ckv, head_dim) * kq_scale;
+                if scores[idx as usize] > max_score { max_score = scores[idx as usize]; }
+            }
+            idx = idx + 1;
+            r = r + 1;
+        }
+        var d: u64 = 0;
+        while d < head_dim {
+            out_heads[(h * head_dim + d) as usize] = 0.0f32;
+            d = d + 1;
+        }
+        var denom: f32 = expf(flash_read_view_f32(layer.attn_sinks, h) - max_score);
+        idx = 0;
+        r = 0;
+        while r < n_raw {
+            const w: f32 = expf(scores[idx as usize] - max_score);
+            const kv2: &const f32 = &raw_kv[(r * head_dim) as usize] as &const f32;
+            denom = denom + w;
+            d = 0;
+            while d < head_dim {
+                out_heads[(h * head_dim + d) as usize] = out_heads[(h * head_dim + d) as usize] + w * kv2[d as usize];
+                d = d + 1;
+            }
+            idx = idx + 1;
+            r = r + 1;
+        }
+        r = 0;
+        while r < n_comp {
+            if scores[idx as usize] > FLASH_MODEL_NEG_INF * 0.5f32 {
+                const w2: f32 = expf(scores[idx as usize] - max_score);
+                const ckv2: &const f32 = &comp_kv[(r * head_dim) as usize] as &const f32;
+                denom = denom + w2;
+                d = 0;
+                while d < head_dim {
+                    out_heads[(h * head_dim + d) as usize] = out_heads[(h * head_dim + d) as usize] + w2 * ckv2[d as usize];
+                    d = d + 1;
+                }
+            }
+            idx = idx + 1;
+            r = r + 1;
+        }
+        const inv: f32 = 1.0f32 / denom;
+        d = 0;
+        while d < head_dim {
+            out_heads[(h * head_dim + d) as usize] = out_heads[(h * head_dim + d) as usize] * inv;
+            d = d + 1;
+        }
+        h = h + 1;
+    }
+    return true;
+}
+
+fn flash_grouped_out(out: &f32, model: &FlashModel, layer: &FlashLayerWeights, heads: &const f32, low: &f32, scratch: &FlashScratch) bool {
+    const n_groups: u64 = model.config.out_groups;
+    const group_heads: u64 = model.config.n_head / n_groups;
+    const group_dim: u64 = model.config.head_dim * group_heads;
+    const rank: u64 = model.config.out_lora;
+    if low == null || out == null {
+        return false;
+    }
+    if !flash_grouped_q8_0_prequant(low, layer.attn_output_a, heads, n_groups, group_dim, rank, scratch) {
+        return false;
+    }
+    return flash_matvec_with_scratch(out, layer.attn_output_b, low as &const f32, model.config.n_embd, n_groups * rank, scratch);
+}
+
+fn flash_indexer_allowed(model: &FlashModel, layer: &FlashLayerWeights, cur: &const f32, qr_norm: &const f32, index_comp: &const f32, n_comp: u64, pos: u64, layer_index: u64, scratch: &FlashScratch) &bool {
+    if n_comp == 0 {
+        return null;
+    }
+    if n_comp > scratch.index_score_cap {
+        return null;
+    }
+    flash_zero_bool(scratch.index_allowed, n_comp);
+    var top_k: u64 = model.config.indexer_top_k;
+    if top_k > n_comp { top_k = n_comp; }
+    if top_k == n_comp {
+        var i: u64 = 0;
+        while i < n_comp {
+            scratch.index_allowed[i as usize] = true;
+            i = i + 1;
+        }
+        return scratch.index_allowed;
+    }
+
+    const q_dim: u64 = model.config.indexer_heads * model.config.indexer_head_dim;
+    if !moe_matvec(scratch.index_q, layer.indexer_attn_q_b, qr_norm, q_dim, model.config.q_lora) ||
+        !moe_matvec(scratch.index_weights, layer.indexer_proj, cur, model.config.indexer_heads, model.config.n_embd) {
+        return null;
+    }
+    flash_rope_tail_inplace(scratch.index_q, model.config.indexer_heads, model.config.indexer_head_dim, model.config.rope_dim, pos, layer_index, false);
+    const scale: f32 = 1.0f32 / sqrtf(q_dim as f32);
+    var h: u64 = 0;
+    while h < model.config.indexer_heads {
+        scratch.index_weights[h as usize] = scratch.index_weights[h as usize] * scale;
+        h = h + 1;
+    }
+    var c: u64 = 0;
+    while c < n_comp {
+        var s: f32 = 0.0f32;
+        h = 0;
+        while h < model.config.indexer_heads {
+            const qh: &const f32 = &scratch.index_q[(h * model.config.indexer_head_dim) as usize] as &const f32;
+            const kv: &const f32 = &index_comp[(c * model.config.indexer_head_dim) as usize] as &const f32;
+            var dot: f32 = kernels_f32_dot(kv, qh, model.config.indexer_head_dim);
+            if dot < 0.0f32 { dot = 0.0f32; }
+            s = s + dot * scratch.index_weights[h as usize];
+            h = h + 1;
+        }
+        scratch.index_scores[c as usize] = s;
+        c = c + 1;
+    }
+    var k: u64 = 0;
+    while k < top_k {
+        var best: u64 = 0;
+        var best_score: f32 = FLASH_MODEL_NEG_INF;
+        c = 0;
+        while c < n_comp {
+            if !scratch.index_allowed[c as usize] && scratch.index_scores[c as usize] > best_score {
+                best = c;
+                best_score = scratch.index_scores[c as usize];
+            }
+            c = c + 1;
+        }
+        scratch.index_allowed[best as usize] = true;
+        k = k + 1;
+    }
+    return scratch.index_allowed;
+}
+
+fn flash_compressor_step(
+    out_comp: &f32,
+    model: &FlashModel,
+    wkv: &TensorView,
+    wgate: &TensorView,
+    ape: &TensorView,
+    norm: &TensorView,
+    x: &const f32,
+    state_kv: &f32,
+    state_score: &f32,
+    head_dim: u64,
+    ratio: u64,
+    pos: u64,
+    layer_index: u64,
+    scratch: &FlashScratch,
+) bool {
+    const ok: bool = flash_compressor_decode_one(
+        out_comp,
+        wkv,
+        wgate,
+        ape,
+        norm,
+        x,
+        state_kv,
+        state_score,
+        head_dim,
+        ratio,
+        pos,
+        scratch.comp_kv_cur,
+        scratch.comp_sc_cur,
+        scratch.comp_pooled,
+    );
+    if !ok {
+        return false;
+    }
+    const comp_pos: u64 = pos + 1 - ratio;
+    flash_rope_tail_inplace(out_comp, 1, head_dim, model.config.rope_dim, comp_pos, layer_index, false);
+    if head_dim == model.config.head_dim {
+        flash_fp8_kv_quantize_inplace(out_comp, head_dim, model.config.rope_dim);
+    }
+    return true;
+}
+
+fn flash_attention_layer(
+    out_hc: &f32,
+    model: &FlashModel,
+    layer: &FlashLayerWeights,
+    cache: &FlashLayerState,
+    inp_hc: &const f32,
+    layer_index: u64,
+    pos: u64,
+    scratch: &FlashScratch,
+) bool {
+    var post: [f32: 4] = [];
+    var comb: [f32: 16] = [];
+    const hc_dim: u64 = model.config.n_hc * model.config.n_embd;
+    var i: u64 = 0;
+    while i < hc_dim {
+        scratch.attn_residual[i as usize] = inp_hc[i as usize];
+        i = i + 1;
+    }
+    if !flash_hc_pre_from_state_one(
+        scratch.attn_cur,
+        &post[0],
+        &comb[0],
+        layer.hc_attn_fn,
+        layer.hc_attn_scale,
+        layer.hc_attn_base,
+        scratch.attn_residual as &const f32,
+        model.config.n_embd,
+        model.config.n_hc,
+        model.config.hc_eps,
+        scratch.hc_flat,
+        scratch.hc_mix,
+        scratch.hc_split,
+        scratch.hc_sinkhorn,
+    ) {
+        return false;
+    }
+    if !flash_rms_norm_weight(scratch.attn_norm, scratch.attn_cur as &const f32, layer.attn_norm, model.config.n_embd, model.config.rms_eps) {
+        return false;
+    }
+    if !flash_q_projection(model, layer, scratch.attn_norm as &const f32, scratch.q, scratch.qr_norm, scratch) ||
+        !flash_kv_projection(model, layer, scratch.attn_norm as &const f32, scratch.kv, scratch) {
+        return false;
+    }
+
+    flash_rope_tail_inplace(scratch.q, model.config.n_head, model.config.head_dim, model.config.rope_dim, pos, layer_index, false);
+    flash_rope_tail_inplace(scratch.kv, model.config.n_head_kv, model.config.head_dim, model.config.rope_dim, pos, layer_index, false);
+    flash_fp8_kv_quantize_inplace(scratch.kv, model.config.head_dim, model.config.rope_dim);
+    if !flash_cache_push_raw(cache, scratch.kv as &const f32, model.config.head_dim) {
+        return false;
+    }
+
+    var comp_allowed: &bool = null;
+    const ratio: u64 = cache.compress_ratio;
+    if ratio != 0 {
+        if flash_compressor_step(
+            scratch.comp,
+            model,
+            layer.attn_compressor_kv,
+            layer.attn_compressor_gate,
+            layer.attn_compressor_ape,
+            layer.attn_compressor_norm,
+            scratch.attn_norm as &const f32,
+            cache.attn_state_kv,
+            cache.attn_state_score,
+            model.config.head_dim,
+            ratio,
+            pos,
+            layer_index,
+            scratch,
+        ) {
+            if !flash_cache_push_comp(cache.attn_comp_kv, &cache.n_comp, cache.comp_cap, model.config.head_dim, scratch.comp as &const f32) {
+                return false;
+            }
+        }
+        if ratio == 4 {
+            if flash_compressor_step(
+                scratch.index_comp,
+                model,
+                layer.indexer_compressor_kv,
+                layer.indexer_compressor_gate,
+                layer.indexer_compressor_ape,
+                layer.indexer_compressor_norm,
+                scratch.attn_norm as &const f32,
+                cache.index_state_kv,
+                cache.index_state_score,
+                model.config.indexer_head_dim,
+                ratio,
+                pos,
+                layer_index,
+                scratch,
+            ) {
+                if !flash_cache_push_comp(cache.index_comp_kv, &cache.n_index_comp, cache.comp_cap, model.config.indexer_head_dim, scratch.index_comp as &const f32) {
+                    return false;
+                }
+            }
+            comp_allowed = flash_indexer_allowed(model, layer, scratch.attn_norm as &const f32, scratch.qr_norm as &const f32, cache.index_comp_kv as &const f32, cache.n_index_comp, pos, layer_index, scratch);
+        }
+    }
+
+    if !flash_attention_mixed(
+        scratch.heads,
+        model,
+        layer,
+        scratch.q as &const f32,
+        cache.raw_kv as &const f32,
+        cache.n_raw,
+        cache.attn_comp_kv as &const f32,
+        cache.n_comp,
+        comp_allowed,
+        scratch.attn_score,
+        scratch.attn_score_cap,
+    ) {
+        return false;
+    }
+    flash_rope_tail_inplace(scratch.heads, model.config.n_head, model.config.head_dim, model.config.rope_dim, pos, layer_index, true);
+    if !flash_grouped_out(scratch.attn_out, model, layer, scratch.heads as &const f32, scratch.attn_low, scratch) {
+        return false;
+    }
+    return flash_hc_post_one(out_hc, scratch.attn_out as &const f32, scratch.attn_residual as &const f32, &post[0] as &const f32, &comb[0] as &const f32, model.config.n_embd, model.config.n_hc);
+}
+
+fn flash_ffn_layer(out_hc: &f32, model: &FlashModel, layer: &FlashLayerWeights, inp_hc: &const f32, token_id: u64, scratch: &FlashScratch) bool {
+    var post: [f32: 4] = [];
+    var comb: [f32: 16] = [];
+    if !flash_hc_pre_from_state_one(
+        scratch.ffn_cur,
+        &post[0],
+        &comb[0],
+        layer.hc_ffn_fn,
+        layer.hc_ffn_scale,
+        layer.hc_ffn_base,
+        inp_hc,
+        model.config.n_embd,
+        model.config.n_hc,
+        model.config.hc_eps,
+        scratch.hc_flat,
+        scratch.hc_mix,
+        scratch.hc_split,
+        scratch.hc_sinkhorn,
+    ) {
+        return false;
+    }
+    if !flash_rms_norm_weight(scratch.ffn_norm, scratch.ffn_cur as &const f32, layer.ffn_norm, model.config.n_embd, model.config.rms_eps) {
+        return false;
+    }
+    var moe_config: MoeConfig = moe_config_init(model.config.n_embd, model.config.n_expert, model.config.n_expert_used, model.config.n_ff_exp);
+    moe_config.expert_weight_scale = FLASH_EXPERT_WEIGHT_SCALE;
+    moe_config.swiglu_clamp = FLASH_SWIGLU_CLAMP;
+    if !moe_layer_weights_validate(&layer.moe, &moe_config) ||
+        !moe_forward_one_scratch(scratch.ffn_out, &layer.moe, &moe_config, scratch.ffn_norm as &const f32, token_id, &scratch.moe_scratch) {
+        return false;
+    }
+    return flash_hc_post_one(out_hc, scratch.ffn_out as &const f32, inp_hc, &post[0] as &const f32, &comb[0] as &const f32, model.config.n_embd, model.config.n_hc);
+}
+
+fn flash_output_logits(logits: &f32, model: &FlashModel, inp_hc: &const f32, scratch: &FlashScratch) bool {
+    const hc_dim: u64 = model.config.n_hc * model.config.n_embd;
+    flash_model_rms_norm_no_weight(scratch.output_flat, inp_hc, hc_dim, model.config.rms_eps);
+    if !moe_matvec(scratch.output_pre, model.weights.output_hc_fn, scratch.output_flat as &const f32, model.config.n_hc, hc_dim) {
+        return false;
+    }
+    const scale: f32 = flash_read_view_f32(model.weights.output_hc_scale, 0);
+    var i: u64 = 0;
+    while i < model.config.n_hc {
+        scratch.output_weights[i as usize] = flash_model_sigmoid(scratch.output_pre[i as usize] * scale + flash_read_view_f32(model.weights.output_hc_base, i)) + model.config.hc_eps;
+        i = i + 1;
+    }
+    if !flash_hc_weighted_sum_one(scratch.output_embd, inp_hc, scratch.output_weights as &const f32, model.config.n_embd, model.config.n_hc) {
+        return false;
+    }
+    if !flash_rms_norm_weight(scratch.output_norm, scratch.output_embd as &const f32, model.weights.output_norm, model.config.n_embd, model.config.rms_eps) {
+        return false;
+    }
+    return flash_matvec_with_scratch(logits, model.weights.output, scratch.output_norm as &const f32, model.config.n_vocab, model.config.n_embd, scratch);
+}
+
+export fn flash_forward_token(model: &FlashModel, state: &FlashState, token_id: u64, pos: u64, logits: &f32) bool {
+    if !flash_model_validate(model) || state == null || !state.loaded ||
+        token_id >= model.config.n_vocab || pos >= state.ctx_size || logits == null {
+        return false;
+    }
+    if !flash_copy_embedding(state.scratch.plain, model.weights.token_embd, token_id, model.config.n_embd) {
+        return false;
+    }
+    flash_hc_from_plain(state.scratch.cur, state.scratch.plain as &const f32, model.config.n_embd, model.config.n_hc);
+
+    var cur: &f32 = state.scratch.cur;
+    var next: &f32 = state.scratch.next;
+    var layer_index: u64 = 0;
+    while layer_index < model.config.n_layer {
+        const layer: &FlashLayerWeights = &model.weights.layers[layer_index as usize];
+        const cache: &FlashLayerState = &state.layers[layer_index as usize];
+        if !flash_attention_layer(state.scratch.after_attn_hc, model, layer, cache, cur as &const f32, layer_index, pos, &state.scratch) {
+            return false;
+        }
+        if !flash_ffn_layer(next, model, layer, state.scratch.after_attn_hc as &const f32, token_id, &state.scratch) {
+            return false;
+        }
+        const tmp: &f32 = cur;
+        cur = next;
+        next = tmp;
+        layer_index = layer_index + 1;
+    }
+
+    if !flash_output_logits(logits, model, cur as &const f32, &state.scratch) {
+        return false;
+    }
+    if pos >= state.next_pos {
+        state.next_pos = pos + 1;
+    }
+    return true;
+}
+
+export fn flash_prefill(model: &FlashModel, state: &FlashState, tokens: &const i32, n_tokens: u64, logits: &f32) bool {
+    if n_tokens == 0 || n_tokens > state.ctx_size || tokens == null {
+        return false;
+    }
+    flash_state_reset(state, &model.config);
+    var i: u64 = 0;
+    while i < n_tokens {
+        const token: i32 = tokens[i as usize];
+        if token < 0 || !flash_forward_token(model, state, token as u64, i, logits) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+export fn flash_generate(
+    model: &FlashModel,
+    state: &FlashState,
+    tokens: &i32,
+    n_prompt: u64,
+    token_cap: u64,
+    logits: &f32,
+    config: &GenerationConfig,
+    sampler_state: &SamplerState,
+    out_generated: &u64,
+) bool {
+    *out_generated = 0;
+    if !flash_model_validate(model) || state == null || tokens == null || logits == null ||
+        config == null || sampler_state == null {
+        return false;
+    }
+    if n_prompt == 0 || n_prompt > token_cap || config.max_new_tokens > token_cap - n_prompt {
+        return false;
+    }
+    if token_cap > state.ctx_size {
+        return false;
+    }
+    if !flash_prefill(model, state, tokens as &const i32, n_prompt, logits) {
+        return false;
+    }
+    var total: u64 = n_prompt;
+    while *out_generated < config.max_new_tokens {
+        const next_token: i32 = sampler_sample(logits as &const f32, model.config.n_vocab, tokens as &const i32, total, &config.sampler, sampler_state);
+        if next_token < 0 {
+            return false;
+        }
+        const pos: u64 = total;
+        tokens[total as usize] = next_token;
+        total = total + 1;
+        *out_generated = *out_generated + 1;
+        if config.stop_on_eos && next_token == config.eos_token {
+            return true;
+        }
+        if *out_generated >= config.max_new_tokens || total >= token_cap {
+            return true;
+        }
+        if !flash_forward_token(model, state, next_token as u64, pos, logits) {
+            return false;
+        }
+    }
+    return true;
+}
