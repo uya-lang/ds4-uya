@@ -1,6 +1,7 @@
 #include "../../vendor/ds4-ref/ds4.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -35,6 +36,28 @@ static int bridge_append(uya_flash_emit *ctx, const char *text, size_t len) {
         ctx->out[ctx->len] = '\0';
     }
     return 0;
+}
+
+static bool bridge_tokens_reserve(ds4_tokens *tokens, int additional) {
+    if (!tokens || additional <= 0) return true;
+    if (tokens->len > INT_MAX - additional) return false;
+    const int needed = tokens->len + additional;
+    if (needed <= tokens->cap) return true;
+
+    int cap = tokens->cap > 0 ? tokens->cap : 64;
+    while (cap < needed) {
+        if (cap > INT_MAX / 2) {
+            cap = needed;
+            break;
+        }
+        cap *= 2;
+    }
+
+    int *next = realloc(tokens->v, (size_t)cap * sizeof(tokens->v[0]));
+    if (!next) return false;
+    tokens->v = next;
+    tokens->cap = cap;
+    return true;
 }
 
 static void bridge_emit_token(void *ud, int token) {
@@ -151,6 +174,12 @@ int ds4_uya_flash_chat(const char *model_path, int max_new_tokens, int ctx_size)
 
         ds4_chat_append_message(engine, &transcript, "user", text);
         ds4_chat_append_assistant_prefix(engine, &transcript, DS4_THINK_NONE);
+        if (!bridge_tokens_reserve(&transcript, max_new_tokens)) {
+            ds4_tokens_free(&transcript);
+            ds4_engine_close(engine);
+            ds4_uya_ref_threads_shutdown();
+            return 2;
+        }
 
         uya_flash_emit emit;
         memset(&emit, 0, sizeof(emit));
